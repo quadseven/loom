@@ -3054,7 +3054,7 @@ class Station:
         name = tickets.ticket_name(repo, number, attempt)
         has_contract, checks = self._validation_checks(repo)
         text = tickets.render_brief(repo, issue, lane, attempt, fix, checks, has_contract,
-                                    self._earlier_branch(repo, comments, fix),
+                                    self._earlier_branch(repo, number, comments, fix),
                                     notes=tickets.operator_notes(
                                         comments, list(self.s.authors) + list(self.s.briefers)
                                         + list(self.s.owners)),
@@ -3119,19 +3119,21 @@ class Station:
         return tickets.linked_pulls(self.gh.rest(
             "GET", "/repos/%s/issues/%d/timeline?per_page=100" % (repo, number)).data)
 
-    def _earlier_branch(self, repo: str, comments: List[Any],
+    def _earlier_branch(self, repo: str, number: int, comments: List[Any],
                         fix: Optional[tickets.Fix]) -> Optional[tickets.KeptBranch]:
         """The side branch the brief's "Earlier attempt" section names: the
         newest kept branch, timed out or parked on a red final check
-        (tickets.kept_branch). A fix brief resumes only a timed-out branch,
-        as before. An -unvalidated- branch is offered only while it holds
-        commits the default branch lacks: a run with no commit names one
-        that holds only the base."""
+        (tickets.kept_branch), and only one of this ticket's own branches
+        (tickets.owned_branch). A fix brief resumes only a timed-out
+        branch, as before. An -unvalidated- branch is offered only while it
+        holds commits the default branch lacks: a run with no commit names
+        one that holds only the base."""
         if fix is not None:
             side = self._timedout_branch(comments)
-            return tickets.KeptBranch(side) if side else None
+            owned = side and tickets.owned_branch(side, number, fix.branch)
+            return tickets.KeptBranch(side) if owned else None
         texts = self._factory_texts(comments)
-        kept = tickets.kept_branch(texts) if texts is not None else None
+        kept = tickets.kept_branch(texts, number) if texts is not None else None
         if kept and kept.unvalidated and not self._side_has_edits(repo, kept.branch):
             return None
         return kept

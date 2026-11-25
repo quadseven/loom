@@ -679,17 +679,40 @@ REPLIES_NOTE = (
 
 # Where a run that timed out or hit a limit after editing left its edits (lanes/run_lane.sh
 # preserve_timedout), as the failure reason names it.
-TIMEDOUT_RE = re.compile(r"the edits are on branch ([A-Za-z0-9._/-]+-timedout-[0-9]+)")
+# Only the runner's own clause counts: "; the edits are on branch X" ending
+# the text or followed by "; ...", and in each text only the last one, since
+# text quoted earlier in a reason (a check's output, a test name) is not the
+# runner's and must not choose the branch a later run merges.
+TIMEDOUT_RE = re.compile(r"; the edits are on branch ([A-Za-z0-9._/-]+-timedout-[0-9]+)(?=;|$)")
+
+
+def _last(pattern: re.Pattern, text: str) -> Optional[re.Match]:
+    found = None
+    for found in pattern.finditer(text):
+        pass
+    return found
 
 
 def timedout_branch(texts: List[str]) -> Optional[str]:
     """The newest timed-out branch any of `texts` (oldest first) names."""
     found = None
     for text in texts:
-        match = TIMEDOUT_RE.search(text)
+        match = _last(TIMEDOUT_RE, text)
         if match:
             found = match.group(1)
     return found
+
+
+def owned_branch(branch: str, number: int, own: str = "") -> bool:
+    """`branch` is a kept branch of this ticket: its lane branch
+    (branch_for: loom/<number> or loom/<number>-...), or `own` (a fix
+    round's pull request branch), then -timedout-<n> or -unvalidated-<n>."""
+    match = re.fullmatch(r"(.+)-(?:timedout|unvalidated)-[0-9]+", branch)
+    if not match:
+        return False
+    base = match.group(1)
+    lane = "loom/%d" % int(number)
+    return base == lane or base.startswith(lane + "-") or bool(own and base == own)
 
 
 # Where a run that timed out, or was parked on a red final check
@@ -697,7 +720,8 @@ def timedout_branch(texts: List[str]) -> Optional[str]:
 # reason names the failing tests in a "(failing: a, b, and N more)" part;
 # each name is data from a check's output, so only a plain test identifier
 # is kept, at most FAILING_MAX of them.
-KEPT_RE = re.compile(r"the edits are on branch ([A-Za-z0-9._/-]+-(?:timedout|unvalidated)-[0-9]+)")
+KEPT_RE = re.compile(r"; the edits are on branch ([A-Za-z0-9._/-]+-(?:timedout|unvalidated)-[0-9]+)"
+                     r"(?=;|$)")
 FAILING_RE = re.compile(r"\(failing: ([^()]*)\)")
 TEST_NAME_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.:/\[\]-]{0,199}")
 FAILING_MAX = 10
@@ -723,14 +747,16 @@ def _failing_tests(text: str) -> Tuple[str, ...]:
     return tuple([n for n in names if TEST_NAME_RE.fullmatch(n)][:FAILING_MAX])
 
 
-def kept_branch(texts: List[str]) -> Optional[KeptBranch]:
+def kept_branch(texts: List[str], number: int) -> Optional[KeptBranch]:
     """The newest kept branch of either kind any of `texts` (oldest first)
-    names. An -unvalidated- branch is not offered once a later text says a
-    lane opened a pull request: that attempt's work went on from there."""
+    names, read as timedout_branch reads one. A branch that is not this
+    ticket's own (owned_branch) is ignored. An -unvalidated- branch is not
+    offered once a later text says a lane opened a pull request: that
+    attempt's work went on from there."""
     found = None
     for text in texts:
-        match = KEPT_RE.search(text)
-        if match:
+        match = _last(KEPT_RE, text)
+        if match and owned_branch(match.group(1), number):
             found = KeptBranch(match.group(1))
             if found.unvalidated:
                 found = found._replace(failing=_failing_tests(text[:match.start()]))

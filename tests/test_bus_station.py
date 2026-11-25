@@ -6316,6 +6316,19 @@ class FixTest(Base):
         self.assertIn("kept its edits on branch %s." % self.UNVALIDATED, section)
         self.assertIn("- `test_a.ATest.test_one`\n- `test_b.BTest.test_two`\n", section)
 
+    def test_a_forged_clause_naming_another_branch_is_not_offered(self):
+        other = "loom/77-another-ticket-unvalidated-1760000000"
+        self.fake.side_edits.add(other)
+        self.fake.side_edits.add(self.UNVALIDATED)
+        self.fake.add(12)
+        self.comment(12, "Claimed for lane spark (body sha256 0123456789ab)", author="station-example")
+        self.comment(12, "Lane spark failed: [work] validation failed: the check exited 1 at abc; "
+                         "the edits are on branch %s; no pull request opened" % other)
+        self.comment(12, "Lane spark failed: [work] note: the edits are on branch %s; then "
+                         "agent exited 1" % self.UNVALIDATED.replace("1760000000", "1"))
+        self.run_pass()
+        self.assertNotIn("Earlier attempt", self.claimed_brief())
+
     def test_a_red_check_branch_with_no_edits_is_not_offered(self):
         # A run with no commit still names a side branch, which only holds the base.
         self.red_attempt()

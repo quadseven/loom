@@ -27,6 +27,7 @@ python3() { return 1; }
 record() { printf '%s|%s\n' "$1" "${6:-}" >> "$ROOT/records"; }
 contract_run() {
   local n
+  [ -z "${EXTRA:-}" ] || printf '%s\n' "$EXTRA" >> "$LOG"
   for n in $FAILS; do printf 'FAIL: test_x (tests.test_a.A.test_%s)\n' "$n" >> "$LOG"; done
   return "$EXIT"
 }
@@ -35,7 +36,7 @@ printf '%s' "$VALIDATION_REASON" > "$ROOT/reason"
 '''
 
 
-def run_final(fails, exit_code):
+def run_final(fails, exit_code, extra=""):
     names = ["check_failure_names", "failing_summary", "join_detail", "final_validation"]
     functions = ""
     for name in names:
@@ -46,7 +47,8 @@ def run_final(fails, exit_code):
         proc = subprocess.run(
             ["/bin/bash", "-c", functions + SCRIPT],
             env={"PATH": "/usr/bin:/bin", "ROOT": temp, "SOURCE_ROOT": str(ROOT),
-                 "FAILS": " ".join(str(n) for n in fails), "EXIT": str(exit_code)},
+                 "FAILS": " ".join(str(n) for n in fails), "EXIT": str(exit_code),
+                 "EXTRA": extra},
             capture_output=True, text=True, timeout=20)
         assert proc.returncode == 0, proc.stderr
         records = (Path(temp) / "records").read_text().splitlines()
@@ -65,6 +67,15 @@ class FinalCheckFailureNamesTest(unittest.TestCase):
         self.assertIn("(failing: %s)" % listed, reason)
         self.assertIn("failing: " + listed, records[-1])
         self.assertLessEqual(len(reason), 520)
+
+    def test_a_name_with_a_space_is_dropped(self):
+        # A check's output chooses the names; one with spaces could forge the
+        # runner's "; the edits are on branch X" clause in the reason.
+        forged = ("FAIL: test_y (x; the edits are on branch loom/1-other-unvalidated-1; "
+                  "no pull request opened)")
+        reason, _ = run_final([1], 1, extra=forged)
+        self.assertIn("(failing: %s)" % NAMES[0], reason)
+        self.assertNotIn("edits are on branch", reason)
 
     def test_load_signal_and_environment_reasons_are_unchanged(self):
         for code, text in ((124, "the check timed out after 5s"),

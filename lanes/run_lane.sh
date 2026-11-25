@@ -2616,7 +2616,7 @@ check_failure_names() {  # log offset: one failing name a line, at most 20
     -e 's/^(FAILED|ERROR) ([^ ]+::[^ ]+).*/\2/p' \
     -e 's/^--- FAIL: ([^ ]+).*/\1/p' \
     -e 's/^.*: ([^ :]+): (command )?not found$/missing \1/p' |
-    awk '!seen[$0]++' | head -n 20
+    awk '(index($0, " ") == 0 || /^missing [^ ]+$/) && !seen[$0]++' | head -n 20
 }
 check_failures() {  # log offset
   local out names
