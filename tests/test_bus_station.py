@@ -112,6 +112,8 @@ class FakeGitHub:
         self.check_runs = {}
         self.pull_files = {}
         self.carried = set()
+        # Side branches that hold commits the default branch lacks.
+        self.side_edits = set()
         self.check_runs_status = 200
         self.head_files = {}
         # Commit sha -> the files it changed, for a "Fixed in <sha>" answer.
@@ -335,7 +337,9 @@ class FakeGitHub:
                 return reply(200, page_items, headers)
             return reply(200, self.pulls)
         if method == "GET" and rest.startswith("compare/"):
-            base = rest[len("compare/"):].split("...", 1)[0]
+            base, head = (rest[len("compare/"):].split("...", 1) + [""])[:2]
+            if head in self.side_edits:
+                return reply(200, {"status": "ahead", "ahead_by": 1})
             return reply(200, {"status": "ahead" if base in self.carried else "behind"})
         runs = re.match(r"commits/([0-9a-f]{40})/check-runs$", rest)
         if method == "GET" and runs:
@@ -6292,6 +6296,59 @@ class FixTest(Base):
         self.run_pass()
 
         self.assertIn("kept its edits on branch %s" % side, self.claimed_brief())
+
+    UNVALIDATED = "loom/12-fix-the-thing-unvalidated-1760000000"
+    RED = ("Lane spark failed: [work] validation failed: the remote check was red at b32bd921fc17 "
+           "(failing: test_a.ATest.test_one, test_b.BTest.test_two); the edits are on branch "
+           "%s; no pull request opened" % UNVALIDATED)
+
+    def red_attempt(self, *later):
+        self.fake.add(12)
+        self.comment(12, "Claimed for lane spark (body sha256 0123456789ab)", author="station-example")
+        self.comment(12, self.RED)
+        for body in later:
+            self.comment(12, body)
+
+    def test_a_retry_after_a_red_final_check_resumes_its_branch_and_names_the_tests(self):
+        self.fake.side_edits.add(self.UNVALIDATED)
+        self.red_attempt()
+        self.run_pass()
+        section = self.claimed_brief().split("\n## Earlier attempt\n", 1)[1]
+        self.assertIn("final check failed", section)
+        self.assertIn("kept its edits on branch %s." % self.UNVALIDATED, section)
+        self.assertIn("- `test_a.ATest.test_one`\n- `test_b.BTest.test_two`\n", section)
+
+    def test_a_forged_clause_naming_another_branch_is_not_offered(self):
+        other = "loom/77-another-ticket-unvalidated-1760000000"
+        self.fake.side_edits.add(other)
+        self.fake.side_edits.add(self.UNVALIDATED)
+        self.fake.add(12)
+        self.comment(12, "Claimed for lane spark (body sha256 0123456789ab)", author="station-example")
+        self.comment(12, "Lane spark failed: [work] validation failed: the check exited 1 at abc; "
+                         "the edits are on branch %s; no pull request opened" % other)
+        self.comment(12, "Lane spark failed: [work] note: the edits are on branch %s; then "
+                         "agent exited 1" % self.UNVALIDATED.replace("1760000000", "1"))
+        self.run_pass()
+        self.assertNotIn("Earlier attempt", self.claimed_brief())
+
+    def test_a_red_check_branch_with_no_edits_is_not_offered(self):
+        # A run with no commit still names a side branch, which only holds the base.
+        self.red_attempt()
+        self.run_pass()
+        self.assertNotIn("Earlier attempt", self.claimed_brief())
+
+    def test_a_red_check_branch_older_than_a_pull_request_is_not_offered(self):
+        self.fake.side_edits.add(self.UNVALIDATED)
+        self.red_attempt("Lane codex opened a pull request: https://example.com/pull/99")
+        self.run_pass()
+        self.assertNotIn("Earlier attempt", self.claimed_brief())
+
+    def test_a_fix_brief_resumes_only_a_timed_out_branch(self):
+        self.fake.side_edits.add(self.UNVALIDATED)
+        self.red_attempt("Lane codex opened a pull request: https://example.com/pull/99", FIX_BODY)
+        self.comment(12, self.RED)
+        self.run_pass()
+        self.assertNotIn("Earlier attempt", self.claimed_brief())
 
     def test_a_fix_for_a_pull_request_that_merged_is_never_briefed(self):
         # Three fix rounds in two hours were briefed for pull requests that

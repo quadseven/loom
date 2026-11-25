@@ -256,7 +256,12 @@ unset variables.
   127 as `validation environment unavailable: ...`), opens no pull request
   and pushes nothing to the ticket's branch or an open pull request. The
   edits go to a side branch `<branch>-unvalidated-<time>` so they can be
-  recovered.
+  recovered. When that branch is ahead of the default branch and no later
+  attempt opened a pull request or kept a newer branch, the next new brief's
+  "Earlier attempt" section names it with the failing tests from the reason
+  (at most 10, plain test names only), and the runner merges it before the
+  agent starts, as it does a `-timedout-` branch. A fix brief resumes only a
+  `-timedout-` branch.
 - Every step runs like an API-lane agent: an emptied environment, a scratch
   HOME (`run/<lane>-check`), under `sandbox-exec`, with no access to the
   runner's HOME, but with the network and the writes outside HOME a step's
@@ -2561,6 +2566,29 @@ reply at 1,024 tokens. The runner checks the daily neuron meter before sending
 the request. Larger verify briefs stay eligible for other lanes. Cluster
 dispatch requires both provider parameter settings, and a successful cluster
 run refreshes the meter for its report.
+
+## tinker: the Tinker free tier
+
+- Tinker's OpenAI-compatible endpoint (`LOOM_TINKER_URL`, default Tinker's
+  `/oai/api/v1` base) through an opencode provider named `tinker`, with the key
+  named by `LOOM_TINKER_KEY_SSM`, handed to the agent as `TINKER_API_KEY`.
+- One model, `LOOM_TINKER_MODEL`, written `tinker/<id>`, for example
+  `tinker/thinkingmachines/Inkling-2-Mini:peft:65536:free`. Tinker serves an id
+  ending in `:free` at no charge, within a rate limit and only while a prepaid
+  account's balance is positive; every other id is billed against that balance.
+- Fail closed (`tinker_free_model` in lanes/agent_sandbox.sh): the lane does not
+  start, and its heartbeat says `REFUSED`, when `LOOM_TINKER_MODEL` is unset or
+  does not end in `:free`, when `LOOM_TINKER_MODELS` is set, or when the URL is
+  not https. A brief's `Model:` line is ignored: the lane runs its own model.
+  `opencode_config` checks the id again before every opencode run, so no other
+  id reaches the network.
+- An HTTP 429 or "too many requests" rests the lane for `LIMIT_WAIT` (an hour);
+  an HTTP 402 or "insufficient balance" rests it a day. Either is the usual
+  limit hold: the heartbeat is unavailable with a retry time, the brief is
+  parked as a limit and handed on, and the lane takes nothing until then.
+- A free lane (station `FREE_LANES`): public repos only, tried after openrouter
+  in `LANE_ORDER`. Its pull requests name lane `tinker`, so the scorecard counts
+  them on a row of their own.
 
 ## free provider slots on the spark-gateway
 
