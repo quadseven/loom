@@ -168,6 +168,18 @@ class RateLimited(GitHubError):
         self.until = until
 
 
+class GitHubOutage(RateLimited):
+    """GitHub is down, not refusing: a 5xx, a timeout or a dropped connection
+    that outlived the read retries, or the outage flag (`GitHub.outage`).
+    A RateLimited, so every step that ends the pass on a budget refusal ends
+    it on an outage too, and parks, fails or comments on nothing. The station
+    turns it on with `outage_aware`; other clients see the plain GitHubError
+    (loom#3567)."""
+
+    def __init__(self, message: str, status: int, body: str, until: int) -> None:
+        super().__init__(message, status, body, until)
+
+
 # GitHub's words for a budget refusal, primary or secondary, when the
 # x-ratelimit-remaining header alone does not say so.
 RATE_LIMIT_RE = re.compile(r"\b(?:secondary )?rate limit\b", re.I)
@@ -725,6 +737,11 @@ class GitHub:
         # Set by a budget refusal: until then every call fails at once with
         # RateLimited and spends nothing (loom#666).
         self.limited_until: Optional[int] = None
+        # A station sets outage_aware so a 5xx or a dead connection raises
+        # GitHubOutage; `outage` is the flag a detector sets while GitHub is
+        # down: every call then fails at once and spends nothing (loom#3567).
+        self.outage_aware = False
+        self.outage = False
 
     @property
     def counted(self) -> int:
@@ -1232,7 +1249,22 @@ class GitHub:
         if self.limited_until is not None and time.time() < self.limited_until:
             raise RateLimited("%s %s: GitHub budget exhausted until %s" % (
                 method, path, _utc(self.limited_until)), 403, "", self.limited_until)
-        status, raw_headers, raw = self._transport_with_retry(method, url, headers, payload, track_rate=True)
+        if self.outage_aware and self.outage:
+            raise GitHubOutage("%s %s: GitHub outage flag is set" % (method, path),
+                               0, "", int(time.time()))
+        try:
+            status, raw_headers, raw = self._transport_with_retry(
+                method, url, headers, payload, track_rate=True)
+        except GitHubError as err:
+            if (self.outage_aware and err.status == 0
+                    and not isinstance(err, (RateLimited, ShadowHeld))):
+                raise GitHubOutage("%s %s: GitHub unreachable: %s" % (method, path, err),
+                                   0, "", int(time.time())) from None
+            raise
+        if self.outage_aware and status >= 500:
+            self._count(method, url, status)
+            raise GitHubOutage("%s %s -> %d: GitHub outage" % (method, path, status),
+                               status, "", int(time.time()))
         resp_headers = {str(k).lower(): v for k, v in (raw_headers or {}).items()}
         # Read before any error is raised: a 403 at the limit carries them.
         self._note_rate(resp_headers)

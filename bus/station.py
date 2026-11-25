@@ -115,7 +115,7 @@ from . import lock
 from .brain import HUMAN_MARKER, LANES_REPUBLISH, human as brain_human
 from . import home_repo
 from . import brain
-from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, TargetReached,
+from .github import (GitHub, GitHubError, GitHubOutage, RateLimited, ShadowHeld, TargetReached,
                      _OPENER, _next_link, read_ssm, rest_login, secret_read_reason,
                      unreadable)
 from .journal import REPLY_RE
@@ -19273,6 +19273,8 @@ def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
             _say("another station is running: %s; standing by" % reason)
             return 0
         beat.stamp()
+    # A 5xx or a dead connection ends the pass on an outage (loom#3567).
+    gh.outage_aware = True
     st = Station(gh, settings, **hooks)
     st.priority_repos = list(priority)
     try:
@@ -19286,6 +19288,8 @@ def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
         st.run_pass()
         if outcome is not None:
             outcome["passed"] = True
+    except GitHubOutage as err:
+        _say("GitHub outage: %s; the pass paused, nothing parked or failed" % err)
     except (RateLimited, TargetReached) as err:
         _say("%s; the pass stopped there" % err)
     except (StateError, station_lease.LeaseLost) as err:

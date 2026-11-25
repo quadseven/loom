@@ -513,7 +513,7 @@ class FakeGitHub:
             return reply(200, {"data": {"repository": {"issue": {"timelineItems": page}}}})
         if "addPullRequestReviewThreadReply" in query:
             if variables["id"] in self.reply_fails:
-                return reply(502, {"message": "bad gateway"})
+                return reply(422, {"message": "unprocessable"})
             self.replies.append((variables["id"], variables["body"]))
             return reply(200, {"data": {"addPullRequestReviewThreadReply": {"comment": {"id": "c"}}}})
         if "resolveReviewThread" in query:
@@ -14255,7 +14255,7 @@ class VerifyDispatchTest(Base):
     def test_a_search_zero_with_an_unreadable_tree_flags_nothing(self):
         self.fake.issues.pop(1)
         self.fake.code_absent = {"daily status ready"}
-        self.fake.tree_status = 502
+        self.fake.tree_status = 422
         self.run_pass()
         self.assertTrue(any("-2-verify-" in n for n in self.briefs()), self.briefs())
         self.assertEqual(self.fake.comments[2], [])
@@ -15124,13 +15124,13 @@ class VerifyResultTest(Base):
     def test_a_proof_whose_pull_request_facts_cannot_be_read_is_not_applied(self):
         # Unread facts could hide the neutral check: no close on prose alone.
         self.merged_with_neutral_guard()
-        self.fake.check_runs_status = 500
+        self.fake.check_runs_status = 422
         self.result(self.good())
         with mock.patch("bus.station._say") as say:
             self.run_pass()
         self.assertIn("loom:shipped", self.fake.names(5))
         self.assertEqual(self.proofs(), [])
-        self.assertIn("could not read the merged pull requests (status 500)",
+        self.assertIn("could not read the merged pull requests (status 422)",
                       " ".join(str(c) for c in say.call_args_list))
 
     def test_the_proof_comment_carries_the_facts_the_station_checked(self):
