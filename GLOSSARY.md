@@ -119,3 +119,21 @@ _Avoid_: log, summary
 **Workhorse**:
 An agent that works a backlog in counted batches and reports by overwriting its own journal issue in place rather than commenting; the brain decides, the workhorse does the counted work.
 _Avoid_: batch brain, sweeper
+
+## Tenants
+
+**Tenant**:
+A walled-off owner of work and data, such as the operator's own organisation or a business; each tenant has its own Loom with its own engines, bots, secrets and state, and no tenant's Loom reads or discusses another's work.
+_Avoid_: org, workspace, account, customer
+
+**Surface**:
+One place messages reach a tenant's Loom from, such as one Discord server, one Google Chat workspace or one Slack team; every surface belongs to exactly one tenant, and a message from a surface no tenant has registered is refused.
+_Avoid_: channel, platform, integration
+
+**Engine**:
+An inference backend a tenant's Loom may run models on, such as a subscription, a free provider or owned hardware; each tenant names its own engines and uses no others.
+_Avoid_: provider, backend, model
+
+**Bot**:
+A named identity inside one tenant that people address on its surfaces, such as the tenant's Loom or a specialist like research; a bot never speaks for another tenant.
+_Avoid_: agent, persona, assistant
