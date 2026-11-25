@@ -147,6 +147,7 @@ bwrap_profile() {
   printf '%s\n' --bind "$tree" "$tree"
   [ -e "$tree/.git" ] && printf '%s\n' --ro-bind "$tree/.git" "$tree/.git"
   printf '%s\n' --bind "$agent_home" "$agent_home"
+  [ -z "${uv_shared:-}" ] || printf '%s\n' --bind "$uv_shared" "$uv_shared"
   for p in "$cli_root" "$cli_link" ${skills:+"$skills"} ${jobs_bin:+"$jobs_bin"} $uv_files; do
     printf '%s\n' --ro-bind "$p" "$p"
   done
@@ -360,6 +361,20 @@ sandbox_profile() {
       uv_files="$uv_files $uv_real"
     done
   fi
+  # The check profile also lets a contract write the host's shared uv
+  # directory (CHECK_UV_SHARED; CHECK_UV_DIR in lanes/run_lane.sh): the one
+  # uv cache and managed-Python directory every slot's check uses
+  # (loom#3591). It sits in the loom home, under HOME, which the profile
+  # otherwise hides. An agent run never gets it.
+  local uv_shared=""
+  if [ "${3:-}" = check ] && [ -n "${CHECK_UV_SHARED:-}" ]; then
+    uv_shared="$(cd "$CHECK_UV_SHARED" 2>/dev/null && pwd -P)" && [ -n "$uv_shared" ] ||
+      { echo "refusing sandbox: shared uv directory $CHECK_UV_SHARED is missing" >&2; return 1; }
+    # shellcheck disable=SC1003 # matching a literal backslash
+    case "$uv_shared" in *'"'*|*'\'*|*$'\n'*)
+      echo "refusing sandbox: unsafe path $uv_shared" >&2; return 1 ;; esac
+    allow_rw="$allow_rw (subpath \"$uv_shared\")"
+  fi
   # The skill snapshot: readable, never writable, wherever LOOM_HOME lives.
   [ -n "$skills" ] && skills_rules="(allow file-read* (subpath \"$skills\"))
 (deny file-write* (subpath \"$skills\"))
@@ -373,14 +388,14 @@ sandbox_profile() {
     # A bind at or above HOME would hand the agent all of HOME (the loom
     # home, the copied SSM values): writable for the tree or scratch home,
     # readable for the rest. Every bind must sit below HOME or beside it.
-    for p in "$tree" "$agent_home" "$cli_root" ${skills:+"$skills"} ${jobs_bin:+"$jobs_bin"} $uv_files; do
+    for p in "$tree" "$agent_home" "$cli_root" ${skills:+"$skills"} ${jobs_bin:+"$jobs_bin"} $uv_files ${uv_shared:+"$uv_shared"}; do
       case "$p" in /) echo "refusing sandbox: $p is the root" >&2; return 1 ;; esac
       case "$home/" in "$p"/*) echo "refusing sandbox: $p sits at or above HOME" >&2; return 1 ;; esac
     done
     bwrap_profile
     return 0
   fi
-  for p in "$tree" "$AGENT_HOME" "$cli_root" "$cli_link" ${skills:+"$skills"} ${jobs_bin:+"$jobs_bin"} $uv_files; do
+  for p in "$tree" "$AGENT_HOME" "$cli_root" "$cli_link" ${skills:+"$skills"} ${jobs_bin:+"$jobs_bin"} $uv_files ${uv_shared:+"$uv_shared"}; do
     p="$(dirname "$p")"
     while [ "${p#"$home"}" != "$p" ] && [ "$p" != "/" ]; do
       meta="$meta (literal \"$p\")"

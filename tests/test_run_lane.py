@@ -7942,6 +7942,53 @@ exit %d
         self.assertTrue((self.inbox / "failed" / "T043-fix-the-thing.md").exists())
         self.assertFalse(any(c.startswith("codex") for c in self.calls()))
 
+    def bound_check_uv_cache(self, max_mb, size_kb, shrink=False, uv=True):
+        """Run bound_check_uv_cache alone on a shared cache of size_kb, with
+        a stand-in uv (on PATH when uv) that logs each call and, for prune,
+        drops the bulk when shrink. Returns the uv calls and the cache."""
+        text = RUNNER.read_text()
+        funcs = "".join(re.search(r"^%s\(\) \{[^\n]*\n.*?^\}\n" % name, text, re.S | re.M).group(0)
+                        for name in ("runner_uv", "check_uv_cache_over", "bound_check_uv_cache"))
+        tmp = Path(self._tmp.name)
+        shared = tmp / "run" / "uv-shared"
+        cache = shared / "cache"
+        cache.mkdir(parents=True)
+        (cache / "bulk").write_bytes(b"x" * size_kb * 1024)
+        calls = tmp / "uv-calls"
+        fakebin = tmp / "uvbin"
+        self.write_tool(fakebin / "uv", (
+            '#!/bin/sh\nprintf "%%s cache=%%s\\n" "$*" "$UV_CACHE_DIR" >> "%s"\n'
+            '[ "$2" = prune ] && [ -n "$SHRINK" ] && rm -f "$UV_CACHE_DIR/bulk"\n'
+            '[ "$2" = clean ] && rm -rf "$UV_CACHE_DIR"\nexit 0\n') % calls)
+        env = {"PATH": ("%s:/usr/bin:/bin" % fakebin) if uv else "/usr/bin:/bin",
+               "HOME": str(tmp / "nohome"), "SHRINK": "1" if shrink else "",
+               "LOOM_CHECK_UV_CACHE_MB": str(max_mb)}
+        script = 'CHECK_UV_DIR="$1" LOG="$2"\nbound_check_uv_cache\n'
+        result = subprocess.run(["bash", "-c", funcs + script, "test", str(shared), str(tmp / "lane.log")],
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return (calls.read_text().splitlines() if calls.exists() else []), cache
+
+    def test_the_shared_uv_cache_under_its_bound_is_left_alone(self):
+        calls, cache = self.bound_check_uv_cache(max_mb=4, size_kb=1024)
+        self.assertEqual(calls, [])
+        self.assertTrue((cache / "bulk").exists())
+
+    def test_the_shared_uv_cache_over_its_bound_is_pruned(self):
+        calls, cache = self.bound_check_uv_cache(max_mb=1, size_kb=2048, shrink=True)
+        self.assertEqual(calls, ["cache prune cache=%s" % cache])
+        self.assertTrue(cache.is_dir())
+
+    def test_the_shared_uv_cache_still_over_its_bound_after_a_prune_is_cleaned(self):
+        calls, cache = self.bound_check_uv_cache(max_mb=1, size_kb=2048)
+        self.assertEqual(calls, ["cache prune cache=%s" % cache, "cache clean cache=%s" % cache])
+        self.assertFalse(cache.exists())
+
+    def test_without_a_runner_uv_the_shared_uv_cache_over_its_bound_is_removed(self):
+        calls, cache = self.bound_check_uv_cache(max_mb=1, size_kb=2048, uv=False)
+        self.assertEqual(calls, [])
+        self.assertFalse(cache.exists())
+
     def test_a_base_verdict_write_prunes_expired_verdicts_and_keeps_fresh_ones(self):
         text = RUNNER.read_text()
         funcs = re.search(r"^base_verdict_write\(\) \{[^\n]*\n.*?^\}\n", text, re.S | re.M).group(0)
@@ -8217,20 +8264,81 @@ exit %d
         # The check's scratch home is gone once the run is over (loom#643).
         self.assertFalse((self.loom / "run" / "codex-check").exists())
 
+    def uv_check(self):
+        """A contract whose check leaves a package in uv's cache and a Python
+        in uv's install directory, wherever the runner points them, and
+        appends its HOME and both uv directories to uv-record.txt beside the
+        loom home (outside HOME, where a check may write)."""
+        record = Path(self._tmp.name) / "uv-record.txt"
+        return record, CONTRACT.replace("check: ", (
+            "check: loom-test-python -c 'import os; e = os.environ; c, p = e[\"UV_CACHE_DIR\"], "
+            "e[\"UV_PYTHON_INSTALL_DIR\"]; os.makedirs(c, exist_ok=True); os.makedirs(p, exist_ok=True); "
+            "open(c + \"/pkg\", \"w\").write(\"cached\"); open(p + \"/py\", \"w\").write(\"py\"); "
+            "open(\"%s\", \"a\").write(\" \".join((e[\"HOME\"], c, p)) + \"\\n\")' && " % record))
+
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
-    def test_a_codex_agent_runs_uv_offline_from_a_copy_of_the_base_checks_cache(self):
+    def test_two_slots_checks_share_one_uv_cache_and_python_directory(self):
+        # loom#3591: each slot's check pointed uv at its own scratch home, so
+        # every check downloaded a managed Python and every wheel again, and
+        # three codex slots filled the pod's run/ volume until the pod was
+        # evicted. Two slots' checks now use the same two directories under
+        # run/uv-shared, the check sandbox lets them write there, and the
+        # check homes hold neither.
+        record, contract = self.uv_check()
+        self.contract_repo(contract)
+        self.write_tool(self.bin / "codex", FAKE_AGENT.replace("cat > /dev/null\n", (
+            "cat > /dev/null\n"
+            'for d in "$LOOM_HOME"/run/*-check; do\n'
+            '  printf "check-home %s uv-cache=%s uv-python=%s\\n" "$(basename "$d")" '
+            '"$([ -e "$d/.cache/uv" ] && echo yes || echo no)" '
+            '"$([ -e "$d/.local/share/uv" ] && echo yes || echo no)" >> "$FAKE_LOG"\n'
+            "done\n"), 1))
+        shared = self.loom / "run" / "uv-shared"
+        for slot, ticket in (("codex", "T042"), ("codex-3", "T043")):
+            inbox = self.loom / "briefs" / slot
+            inbox.mkdir(parents=True, exist_ok=True)
+            (inbox / ("%s-fix-the-thing.md" % ticket)).write_text(BRIEF.replace("T042", ticket))
+            result = self.run_contract_lane(lane=slot)
+            log = self.loom / "logs" / slot / ("%s-fix-the-thing.log" % ticket)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((inbox / "done" / ("%s-fix-the-thing.md" % ticket)).exists(), log.read_text())
+        rows = [line.split() for line in record.read_text().splitlines()]
+        self.assertEqual({Path(row[0]).name for row in rows}, {"codex-check", "codex-3-check"}, rows)
+        self.assertEqual({(row[1], row[2]) for row in rows},
+                         {(str(shared / "cache"), str(shared / "python"))})
+        self.assertEqual((shared / "cache" / "pkg").read_text(), "cached")
+        self.assertEqual((shared / "python" / "py").read_text(), "py")
+        # After the base check, before the agent, neither check home holds
+        # a uv cache or a Python install.
+        seen = [c for c in self.calls() if c.startswith("check-home ")]
+        self.assertIn("check-home codex-check uv-cache=no uv-python=no", seen)
+        self.assertIn("check-home codex-3-check uv-cache=no uv-python=no", seen)
+        self.assertFalse([c for c in seen if "=yes" in c], seen)
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_check_that_leaves_the_shared_uv_cache_over_its_bound_prunes_it(self):
+        # The shared cache is bounded: after a check, a cache larger than
+        # LOOM_CHECK_UV_CACHE_MB is pruned with the runner's uv.
+        _, contract = self.uv_check()
+        self.contract_repo(contract)
+        self.write_tool(self.bin / "uv", '#!/bin/sh\nprintf "uv %s cache=%s\\n" "$*" "$UV_CACHE_DIR" >> "$FAKE_LOG"\n')
+        self.drop_brief()
+        result = self.run_contract_lane(LOOM_CHECK_UV_CACHE_MB="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        cache = self.loom / "run" / "uv-shared" / "cache"
+        self.assertIn("uv cache prune cache=%s" % cache, self.calls())
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_codex_agent_runs_uv_offline_from_the_shared_check_cache(self):
         # loom#1665: a codex agent has no network, so uv could not fetch the
         # packages its tests need ("dns error" from the package index) while
         # the base check, outside the agent's sandbox, had downloaded them.
-        # The base check here leaves a uv cache entry; the agent must get a
-        # writable copy of it, uv's offline settings and that one extra
-        # writable directory, and its writes must not reach the check's cache.
-        # The check fails when it finds the agent's write in its own cache.
-        self.contract_repo(CONTRACT.replace("check: ", (
-            "check: loom-test-python -c 'import os; d = os.path.expanduser(\"~/.cache/uv\"); "
-            "os.makedirs(d, exist_ok=True); p = d + \"/pkg\"; "
-            "assert not os.path.exists(p) or open(p).read() == \"cached\"; "
-            "open(p, \"w\").write(\"cached\")' && ")))
+        # The agent gets the checks' shared uv directory (loom#3591; it was a
+        # per-run copy of the check home's cache, a second full copy on a
+        # pod's disk), uv's offline settings and that one extra writable
+        # directory.
+        _, contract = self.uv_check()
+        self.contract_repo(contract)
         self.drop_brief()
         self.write_tool(self.bin / "codex", FAKE_AGENT.replace("cat > /dev/null\n", (
             "cat > /dev/null\n"
@@ -8238,24 +8346,22 @@ exit %d
             '"${UV_CACHE_DIR:-unset}" "${UV_PYTHON_INSTALL_DIR:-unset}" "${UV_OFFLINE:-unset}" '
             '"${UV_MANAGED_PYTHON:-unset}" "${PIP_NO_INDEX:-unset}" >> "$FAKE_LOG"\n'
             ': "${UV_CACHE_DIR:?missing uv cache}"\n'
-            'printf "uv-pkg %s\\n" "$(cat "$UV_CACHE_DIR/pkg" 2>&1)" >> "$FAKE_LOG"\n'
-            'echo agent > "$UV_CACHE_DIR/pkg"\n'), 1))
+            'printf "uv-pkg %s\\n" "$(cat "$UV_CACHE_DIR/pkg" 2>&1)" >> "$FAKE_LOG"\n'), 1))
         result = self.run_contract_lane()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists(), self.lane_log())
-        check_home = self.loom / "run" / "codex-check"
+        shared = self.loom / "run" / "uv-shared"
         calls = self.calls()
         agent = [c for c in calls if c.startswith("codex exec")]
         self.assertEqual(len(agent), 1, calls)
-        self.assertIn("--sandbox workspace-write --add-dir %s/agent-uv --model" % check_home, agent[0])
-        self.assertIn("uv-env cache=%s/agent-uv/cache python=%s/.local/share/uv/python "
-                      "offline=1 managed=1 pip=1" % (check_home, check_home), calls)
+        self.assertIn("--sandbox workspace-write --add-dir %s --model" % shared, agent[0])
+        self.assertIn("uv-env cache=%s/cache python=%s/python offline=1 managed=1 pip=1"
+                      % (shared, shared), calls)
         self.assertIn("uv-pkg cached", calls)
-        # The final check read its own cache, not the agent's copy.
         self.assertEqual([(r["phase"], r["ok"]) for r in self.records()][-1], ("final", True))
 
-        # The green verdict outlives the scratch home. The next agent still
-        # needs the base check's packages even though the revision is unchanged.
+        # The green verdict outlives the check home; the next agent still
+        # finds the base check's packages in the shared cache.
         self.drop_brief("T043-fix-the-thing.md", BRIEF.replace("T042", "T043"))
         result = self.run_contract_lane()
         self.assertEqual(result.returncode, 0, result.stderr)

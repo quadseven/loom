@@ -13,11 +13,11 @@
 # its own checkout, so its agent gets the network and skips every prompt.
 # Neither reads the keychain: both CLIs keep their sign-in in a file.
 # A codex lane run has no network, so uv could not fetch the packages a test
-# needs and the run failed on a DNS error (loom#1665). When the runner left
-# the agent a copy of the base check's uv cache (AGENT_UV_DIR, with the
-# check's Pythons in AGENT_UV_PYTHON), uv runs offline from it: the copy is
-# the one extra directory codex may write (uv locks its cache), and the
-# network stays closed.
+# needs and the run failed on a DNS error (loom#1665). When the runner names
+# the checks' shared uv directory (AGENT_UV_DIR, its cache/ and, in
+# AGENT_UV_PYTHON, its managed Pythons; loom#3591), uv runs offline from it:
+# that directory is the one extra directory codex may write (uv locks its
+# cache), and the network stays closed.
 # A codex lane run writes its final message to AGENT_LAST_MESSAGE when the
 # runner names one: the reason a run that committed nothing quotes
 # (loom#1799), instead of whatever the agent printed last.

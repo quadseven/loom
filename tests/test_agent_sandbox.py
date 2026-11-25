@@ -425,6 +425,42 @@ class AgentSandboxTest(unittest.TestCase):
         self.assertEqual(result.stdout.split(),
                          ["net=denied", "security=denied"])
 
+    def shared_uv(self):
+        """The host's shared uv directory for checks, under HOME as in the
+        runner ($LOOM_HOME/run/uv-shared, loom#3591)."""
+        shared = self.home / "loom" / "run" / "uv-shared"
+        shared.mkdir(parents=True)
+        return shared
+
+    def test_a_check_profile_lets_the_check_write_the_shared_uv_directory(self):
+        # loom#3591: every slot's check shares one uv cache and one
+        # managed-Python directory under HOME, which the profile otherwise
+        # hides. The check profile opens that one directory; an agent's
+        # profile never does, whatever the environment says.
+        shared = self.shared_uv()
+        profile = self.profile("check", CHECK_UV_SHARED=str(shared))
+        allow_rw = next(line for line in profile.splitlines()
+                        if line.startswith("(allow file-read* file-write* "))
+        self.assertIn('(subpath "%s")' % shared, allow_rw)
+        self.assertIn('(literal "%s")' % shared.parent, profile)
+        self.assertNotIn('(subpath "%s")' % shared.parent, profile)
+        self.assertNotIn(str(shared), self.profile("api", CHECK_UV_SHARED=str(shared)))
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_inside_the_check_profile_the_shared_uv_directory_takes_writes(self):
+        shared = self.shared_uv()
+        beside = shared.parent / "codex-home"
+        beside.mkdir()
+        probe = ('mkdir -p "$1/cache" "$1/python" && echo pkg > "$1/cache/pkg" && echo py > "$1/python/py"'
+                 ' && echo shared=written || echo shared=denied\n'
+                 'echo x > "$2/x" 2> /dev/null && echo beside=written || echo beside=denied\n')
+        result = self.bash('p="$(sandbox_profile "$1" bash check)" || exit 9\n'
+                           'sandbox-exec -p "$p" /bin/bash -c "$2" probe "$3" "$4"',
+                           probe, str(shared), str(beside), CHECK_UV_SHARED=str(shared))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.split(), ["shared=written", "beside=denied"])
+        self.assertEqual((shared / "cache" / "pkg").read_text(), "pkg\n")
+
     def test_an_unknown_mode_is_refused(self):
         result = self.bash('sandbox_profile "$1" bash agent')
         self.assertEqual(result.returncode, 1)
@@ -531,6 +567,19 @@ class BwrapSandboxTest(unittest.TestCase):
         lines = self.profile("check", CHECK_UV_BINS=str(uv))
         self.assert_confined_root(lines)
         self.assertIn((str(uv), str(uv)), self.pairs(lines, "--ro-bind"))
+
+    def test_a_validation_run_also_writes_the_shared_uv_directory(self):
+        # loom#3591: the pod's one uv cache and managed-Python directory,
+        # shared by every slot's check, is bound writable for a check and
+        # for nothing else.
+        shared = self.home / "loom" / "run" / "uv-shared"
+        shared.mkdir(parents=True)
+        lines = self.profile("check", CHECK_UV_SHARED=str(shared))
+        self.assertEqual(self.pairs(lines, "--bind"),
+                         [(str(self.tree), str(self.tree)), (str(self.scratch), str(self.scratch)),
+                          (str(shared), str(shared))])
+        self.assertLess(lines.index(str(shared)), lines.index("--remount-ro"))
+        self.assert_confined_root(self.profile("api", CHECK_UV_SHARED=str(shared)))
 
     def test_a_cli_under_home_is_bound_back_read_only(self):
         cli = self.home / ".opencode" / "bin" / "opencode"
