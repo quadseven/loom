@@ -4200,6 +4200,30 @@ preserve_timedout() {
   push_side HEAD "$BRANCH-timedout-$(date +%s)"
 }
 
+# A lane pod that is stopping (lanes/k8s/pod.sh) marks
+# run/<slot>.drain: the runner takes no new brief, and an agent the pod then
+# stops is not a failure. run/ goes with the pod, so the mark never outlives it.
+pod_draining() { [ -e "$LOOM_HOME/run/$SLOT.drain" ]; }
+
+# The run a drain stopped: its edits go to a -timedout- branch as a timeout's
+# do, the brief names that branch in an "Earlier attempt" section, and the
+# brief stays in the inbox. The loom home outlives the pod, so the next pod's
+# runner takes the same brief, merges the branch (resume_earlier_attempt) and
+# carries on; the station sees the brief and keeps the ticket running.
+keep_drained_run() {
+  local tree_status tree_head note="" side=""
+  if tree_status="$(safe_git status --porcelain 2>> "$LOG")" &&
+     tree_head="$(safe_git rev-parse HEAD 2>> "$LOG")" &&
+     { [ -n "$tree_status" ] || [ "$tree_head" != "$BASE" ]; }; then
+    note="$(preserve_timedout)"
+    side="$(printf '%s' "$note" | sed -nE 's#^the edits are on branch ([A-Za-z0-9._/-]+-timedout-[0-9]+)$#\1#p')"
+  fi
+  if [ -n "$side" ]; then
+    printf '\n## Earlier attempt\n\nA lane pod restart stopped the last run of this brief, which kept its edits on branch %s. The runner merges them into this tree before you start: check what is there and finish the ticket instead of starting over.\n' "$side" >> "$BRIEF"
+  fi
+  echo "[$(date -u +%FT%TZ)] $TICKET stopped by a lane pod restart; the brief stays in the inbox${note:+ ($note)}" >> "$LOG"
+}
+
 # The next attempt merges the kept branch, and its commit is refused for any
 # file the brief does not allow, so those files are left off the branch.
 # A scope check that cannot run keeps every file: nothing is known wrong, and
@@ -4478,7 +4502,9 @@ resume_earlier_attempt() {
   local side
   # Only the station's "## Earlier attempt" section names the branch: the
   # ticket body above it is the author's text, never a branch to merge.
-  side="$(section 'Earlier attempt' "$BRIEF" | grep -oE 'kept its edits on branch [A-Za-z0-9._/-]+-timedout-[0-9]+' | head -1 | awk '{print $NF}')"
+  # The newest kept branch wins: a drained run (keep_drained_run) appends its
+  # own after the station's, built on a tree that already merged the older one.
+  side="$(section 'Earlier attempt' "$BRIEF" | grep -oE 'kept its edits on branch [A-Za-z0-9._/-]+-timedout-[0-9]+' | tail -n 1 | awk '{print $NF}')"
   [ -n "$side" ] || return 0
   if [ -n "$CONFLICTS" ]; then
     echo "[$(date -u +%FT%TZ)] $TICKET: could not merge the earlier attempt's branch $side while the default branch merge conflicts; the agent starts without it" >> "$LOG"
@@ -4955,6 +4981,10 @@ fi
 
 for BRIEF in "$INBOX"/*.md; do
   [ -e "$BRIEF" ] || continue
+  if pod_draining; then
+    echo "[$(date -u +%FT%TZ)] the lane pod is stopping: no new brief this pass" >&2
+    break
+  fi
   drop_build_output
   drop_run_scratch
   AGENT_GH_CALLS=""
@@ -5341,6 +5371,10 @@ for BRIEF in "$INBOX"/*.md; do
     break
   fi
   if [ "$TOKEN_READY" = 0 ]; then park "$BRIEF" "$APP_TOKEN_WHY" transient; continue; fi
+  # A lane pod that is stopping stopped this agent: keep the run for the next
+  # pod rather than fail it (keep_drained_run). The loop's next turn sees the
+  # drain and ends the pass.
+  if [ "$STATUS" -ne 0 ] && pod_draining; then keep_drained_run; continue; fi
   # A spark run that ended because the box went hot is a limit, not a failure.
   if [ "$STATUS" -ne 0 ] && { [ "$LANE" = spark ] || [ "$LANE" = free ]; } && { spark_probe; [ $? -eq 1 ]; }; then
     mark_limit
