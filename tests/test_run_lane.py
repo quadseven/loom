@@ -3257,6 +3257,82 @@ exec /usr/bin/git "$@"
                                capture_output=True, text=True, check=True).stdout
         self.assertNotIn("-timedout-", heads)
 
+    # A lane pod that is stopping (lanes/k8s/pod.sh) marks run/<slot>.drain
+    # and then stops each agent still running. The fake agent
+    # here marks the drain itself, then ends as a stopped agent does.
+    def drained_agent(self, edit=True):
+        marker = self.loom / "run" / "codex.drain"
+        self.write_tool(self.bin / "codex", FAKE_AGENT.replace(
+            "cat > /dev/null\n",
+            "cat > /dev/null\n%s: > '%s'\nexit 143\n"
+            % ("echo partial > fix.txt; " if edit else "", marker), 1))
+        return marker
+
+    def side_branches(self):
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        return [h.split("refs/heads/")[1] for h in heads.splitlines() if "-timedout-" in h]
+
+    def test_a_run_a_pod_drain_stops_keeps_its_edits_and_its_brief_for_the_next_pod(self):
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        self.drained_agent()
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        side = self.side_branches()
+        self.assertEqual(len(side), 1, side)
+        self.assertTrue(side[0].startswith("loom/T042-fix-the-thing-timedout-"), side)
+        # Not parked: the brief waits in the inbox, so the station keeps the
+        # ticket running, and it names the kept branch for the next run.
+        brief = (self.inbox / "T042-fix-the-thing.md").read_text()
+        self.assertTrue(brief.startswith(BRIEF), brief)
+        self.assertIn("## Earlier attempt", brief[len(BRIEF):])
+        self.assertIn("kept its edits on branch %s." % side[0], brief)
+        self.assertFalse((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        log = self.run_log()
+        self.assertNotIn(" failed: ", log)
+        self.assertIn("stopped by a lane pod restart; the brief stays in the inbox", log)
+
+    def test_the_next_pod_merges_the_kept_branch_of_a_drained_run(self):
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        marker = self.drained_agent()
+        self.run_lane()
+        side = self.side_branches()[0]
+        marker.unlink()
+        self.write_tool(self.bin / "codex", FAKE_AGENT)
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("merged the earlier attempt's branch %s" % side, self.run_log())
+
+    def test_the_newest_kept_branch_is_the_one_merged(self):
+        # A station brief may already name an older kept branch; a drained
+        # run of it appends its own, built on top of that one.
+        old, new = "loom/T042-fix-the-thing-timedout-1", "loom/T042-fix-the-thing-timedout-2"
+        self.drop_brief("T042-fix-the-thing.md", BRIEF
+                        + "\n## Earlier attempt\n\nAn earlier attempt kept its edits on branch %s.\n" % old
+                        + "\n## Earlier attempt\n\nA lane pod restart kept its edits on branch %s.\n" % new)
+        self.run_lane()
+        log = self.run_log()
+        self.assertIn(new, log)
+        self.assertNotIn(old, log)
+
+    def test_a_drained_run_that_edited_nothing_leaves_its_brief_as_it_was(self):
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        self.drained_agent(edit=False)
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.side_branches(), [])
+        self.assertEqual((self.inbox / "T042-fix-the-thing.md").read_text(), BRIEF)
+        self.assertNotIn(" failed: ", self.run_log())
+
+    def test_a_draining_pod_takes_no_new_brief(self):
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        (self.loom / "run").mkdir(parents=True, exist_ok=True)
+        (self.loom / "run" / "codex.drain").touch()
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(c.startswith("codex ") for c in self.calls()))
+        self.assertEqual((self.inbox / "T042-fix-the-thing.md").read_text(), BRIEF)
+
     def test_a_non_limit_pattern_is_still_read_from_the_short_tail(self):
         # loom#934: the auth and transient (network) patterns still read the
         # short tail, not the whole output. A key-expiry line buried in the

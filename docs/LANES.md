@@ -2779,6 +2779,16 @@ What changes in a pod:
 - `LOOM_DROP_TREES=1`: each run's tree, the runner's files beside it and the
   scratch homes are removed when the run ends, whatever its outcome
   (`drop_run_scratch`). Logs and the brief stay under `LOOM_HOME`.
+- A drain on SIGTERM: a stopping pod starts no runner and marks
+  `run/<slot>.drain`, so each runner takes no new brief. It waits
+  `LOOM_POD_DRAIN_SECONDS` (default 240) for the runs in flight, then stops
+  each agent still running and waits `LOOM_POD_PRESERVE_SECONDS` (default
+  90) while its runner keeps the run (`keep_drained_run`): the edits go to a
+  `-timedout-` branch, the brief gains an "Earlier attempt" section naming
+  it, and the brief stays in the inbox. With `LOOM_HOME` on a volume that
+  outlives the pod, the next pod's runner takes the same brief and merges the
+  branch, and the station keeps the ticket running. The pod's termination
+  grace period must cover both waits.
 - `LOOM_SSM_DIR`: a folder under HOME holding a copy of each SSM parameter
   the pod reads, at the parameter's name (`/a/b` is `$LOOM_SSM_DIR/a/b`),
   kept in step with SSM by the cluster. `ssm_value` reads the file and makes

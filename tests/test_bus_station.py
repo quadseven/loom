@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from unittest import mock
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -6014,6 +6015,46 @@ class ClaimTest(Base):
         st = station.Station(GitHub("token", transport=self.fake), self.settings)
         self.assertFalse(st._heartbeat_ok("spark"))
         self.assertTrue(st._heartbeat_ok("codex"))
+
+    def test_queued_work_prefers_a_lane_with_unspent_weekly_allowance(self):
+        self.settings.factory_on = True
+        self.heartbeat("spark")
+        now = int(time.time())
+
+        def reading(window, used, reset_in, age=0):
+            def stamp(at):
+                return datetime.fromtimestamp(at, timezone.utc).isoformat()
+
+            return {"lanes": ["codex"], "window": window, "used_pct": used,
+                    "resets_at": stamp(now + reset_in), "observed_at": stamp(now - age)}
+
+        weekly = reading("weekly", 49, 3600)
+        short_at_limit = reading("5-hour", 100, 1800)
+        short_at_limit["as_of"] = short_at_limit.pop("observed_at")
+        for number, (difficulty, rows, available, chosen) in enumerate((
+                ("medium", [weekly], True, "codex"),
+                ("medium", [weekly, short_at_limit], True, "spark"),
+                ("medium", [weekly], False, "spark"),
+                ("medium", [reading("weekly", 50, 3600)], True, "spark"),
+                ("medium", [reading("weekly", 49, 86400)], True, "spark"),
+                ("medium", [reading("weekly", 49, -1)], True, "spark"),
+                ("medium", [reading("weekly", 49, 3600, 7201)], True, "spark"),
+                # Lanes are chosen by cost whatever the Difficulty: line, so the
+                # unspent allowance is preferred for an easy ticket too.
+                ("easy", [weekly], True, "codex"),
+        ), start=20):
+            with self.subTest(number=number):
+                self.heartbeat("codex", available=available)
+                station.usage.write(self.home, rows)
+                self.fake.add(number, state="queued",
+                              body="Difficulty: %s\n\n## Why\nx\n\n## Acceptance criteria\n\n- [ ] x\n"
+                              % difficulty)
+                self.fake.issues[number]["labels"].pop()
+                st = station.Station(GitHub("token", transport=self.fake), self.settings, now=now)
+                st.assign_queued()
+                names = self.fake.names(number)
+                del self.fake.issues[number]
+                self.assertIn("lane:" + chosen, names)
 
     def test_a_half_done_claim_is_dropped_when_the_ticket_is_no_longer_trusted(self):
         self.fake.add(12, editor="stranger")

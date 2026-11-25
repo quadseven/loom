@@ -17204,6 +17204,7 @@ class Station:
         """Give ready queued tickets a free lane after this pass's claims."""
         if self.s.factory_on:
             runner = self._load_factory()
+            runner.preferred_lanes = usage.preferred_weekly_lanes(usage.read_snapshot(self.s.home), self.now)
             runner.assign_queued()
             self._record_waits(runner.waits, runner.settled)
 
@@ -19310,7 +19311,12 @@ def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
         from .github import app_auth_from_env
         gh = GitHub(app_auth_from_env())
         gh.status_in_body = True
-        hooks.setdefault("operator_reader", operator_budget.read_core)
+        # The operator budget is read only with an operator credential the
+        # environment names. An App-only station has none, and each read
+        # failed and logged a line every retry (loom#3304).
+        if any(os.environ.get(name, "").strip()
+               for name in ("LOOM_GITHUB_TOKEN", "GITHUB_TOKEN")):
+            hooks.setdefault("operator_reader", operator_budget.read_core)
     if gh.cache_dir is None:
         # Every GET is conditional: a list re-read each pass costs a 304.
         gh.cache_dir = os.path.join(state, "station", "etags")
