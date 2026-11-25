@@ -1772,12 +1772,17 @@ def _live_check_rows(gh: GitHub, repo: str, tickets: List[Dict[str, Any]]
     return list(zip(_read_each(read, waiting), waiting, strict=True))
 
 
-def verify_due(gh: GitHub, repo: str, tickets: List[Dict[str, Any]], now: datetime
+def verify_due(gh: GitHub, repo: str, tickets: List[Dict[str, Any]], now: datetime,
+               env: Optional[Dict[str, str]] = None
                ) -> List[Tuple[datetime, Dict[str, Any]]]:
     """Open loom:shipped tickets, oldest ship first. A verified ticket carries
     loom:verified instead, so it never appears. A ticket carrying the
     verify-handoff label is itself a lane verify ticket. Its body links the
-    source ticket, which is omitted from this list while that handoff is open."""
+    source ticket, which is omitted from this list while that handoff is open.
+    When `env` is given and names no evidence command (`LOOM_EVIDENCE_CMDS`),
+    tickets whose Live criterion needs a log read are left out: a brain without
+    evidence endpoint access cannot verify them (a `resume` pass run by such a
+    brain stops handing them out)."""
     handoff_sources = {source for issue in tickets
                        for source in [verify_handoff_source(issue)] if source is not None}
     shipped = [issue for issue in tickets
@@ -1785,11 +1790,38 @@ def verify_due(gh: GitHub, repo: str, tickets: List[Dict[str, Any]], now: dateti
                and WAIT_LIVE_EVENT not in _labels(issue)
                and verify_handoff_source(issue) is None
                and int(issue.get("number") or 0) not in handoff_sources]
+    if env is not None and not _evidence_access(env):
+        shipped = [issue for issue in shipped if not _live_needs_log_read(issue)]
     # One events read per ticket, in parallel: 93 in a row took 36 s of a
     # 68 s status on 2026-10-15.
     stamps = _read_each(lambda issue: _shipped_at(gh, repo, issue), shipped)
     due = [(stamp or now, issue) for stamp, issue in zip(stamps, shipped, strict=True)]
     return sorted(due, key=lambda x: (x[0], int(x[1]["number"])))
+
+
+def _evidence_access(env: Optional[Dict[str, str]]) -> bool:
+    """Whether the acting environment names an evidence command, so a brain can
+    read the read-only evidence endpoint (`docs/EVIDENCE.md`) for station logs."""
+    return bool(env and env.get("LOOM_EVIDENCE_CMDS"))
+
+
+def _live_needs_log_read(issue: Dict[str, Any]) -> bool:
+    """Whether a shipped ticket's Live criterion needs the evidence endpoint:
+    a quoted log string or an absence over a window, or a `log:` adapter step.
+    A `url`, `gh`, `kubectl` or `query` criterion does not."""
+    from . import evidence, live_proof
+    live = live_criterion(issue.get("body"), limit=None)
+    if live == "(no Live criterion on the ticket)":
+        return False
+    form = live_proof.runnable_form(live)
+    if form == "log window":
+        return True
+    if form == "adapter":
+        step, _why = live_proof.step_of(live)
+        return step is not None and step.kind == live_proof.LOG and not step.source
+    # A non-runnable Live criterion (for example `step check_invariants`) needs
+    # a manual log read that the evidence endpoint alone can supply.
+    return form == ""
 
 
 def _since(shipped: datetime, now: datetime) -> str:
@@ -8481,20 +8513,22 @@ def _freshness_line(peers: List[Dict[str, Any]]) -> str:
                 window, handoff.journal_holder(newest) or "unnamed", newest.get("at") or "unknown time"))
 
 
-def _verify_due_in(gh: GitHub, repo: str, now: datetime
+def _verify_due_in(gh: GitHub, repo: str, now: datetime,
+                   env: Optional[Dict[str, str]] = None
                    ) -> List[Tuple[datetime, str, Dict[str, Any]]]:
     """(shipped at, repo, ticket) for each of the repo's shipped tickets."""
     tickets = [i for i in _issues(gh, repo) if "loom:ticket" in _labels(i)]
-    return [(at, repo, issue) for at, issue in verify_due(gh, repo, tickets, now)]
+    return [(at, repo, issue) for at, issue in verify_due(gh, repo, tickets, now, env=env)]
 
 
 def _verify_resume_lines(gh: GitHub, repos: Sequence[str], now: datetime,
-                         due: Optional[List[Tuple[datetime, str, Dict[str, Any]]]] = None
+                         due: Optional[List[Tuple[datetime, str, Dict[str, Any]]]] = None,
+                         env: Optional[Dict[str, str]] = None
                          ) -> List[str]:
     """Hand unclaimed live gaps to the acting brain before a day passes,
     then fill the ordinary verify slots oldest ship first."""
     if due is None:
-        due = [item for repo in repos for item in _verify_due_in(gh, repo, now)]
+        due = [item for repo in repos for item in _verify_due_in(gh, repo, now, env=env)]
     due = list(due)
     due.sort(key=lambda x: (x[0], x[1], int(x[2]["number"])))
     urgent, ordinary = [], []
@@ -8742,7 +8776,8 @@ def _sit_out_rate_limits(read: Callable[[], Any], stop: float, who: str = "resum
 
 
 def _resume_one(gh: GitHub, repo: str, authors: Sequence[str], shared: _ResumePass,
-                now: datetime, check: str, trusted: Sequence[str], stop: float
+                now: datetime, check: str, trusted: Sequence[str], stop: float,
+                env: Optional[Dict[str, str]] = None
                 ) -> Tuple[Any, ...]:
     """One repo's whole resume read, so its goals print as soon as it is done:
     ("read", its goals, its parts, the handoff items GitHub answered with a
@@ -8860,7 +8895,7 @@ def _resume_pass(gh: GitHub, repos: List[str], holder: str, authors: Sequence[st
 
     def gather(repo: str) -> Tuple[Any, ...]:
         _progress("resume: reading %s (requests: %d)" % (repo, getattr(gh, "requests", 0)))
-        return _resume_one(reads, repo, authors, shared, now, check, trusted, stop)
+        return _resume_one(reads, repo, authors, shared, now, check, trusted, stop, env=env)
 
     # The lightest repos are read first, as status reads them (lightest_first):
     # in the order given, the heaviest repos shared the link from the start,
@@ -8938,7 +8973,8 @@ def _resume_repo(gh: GitHub, repo: str, goals: Sequence[GoalJournals],
                  gone: Dict[str, str], now: datetime, check: str,
                  trusted: Sequence[str],
                  sensitive: Optional[List[Dict[str, Any]]] = None,
-                 faults: Optional[Dict[Tuple[str, int], str]] = None) -> Dict[str, Any]:
+                 faults: Optional[Dict[Tuple[str, int], str]] = None,
+                 env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """One repo's resume reads: its goals' resume lines, printed as the repo
     finishes, and its share of each cross-repo section. `sensitive`, when
     given, is the repo's ready sensitive pull requests already read by
@@ -8965,7 +9001,7 @@ def _resume_repo(gh: GitHub, repo: str, goals: Sequence[GoalJournals],
         ("lines", goal_lines),
         ("sensitive", lambda: _ready_sensitive_in(gh, repo, now, check) if sensitive is None else sensitive),
         ("epics", lambda: _finished_epic_lines(gh, [(r, i) for r, i, _, _ in mine])),
-        ("verify", lambda: _verify_due_in(gh, repo, now)),
+        ("verify", lambda: _verify_due_in(gh, repo, now, env=env)),
         ("audit", lambda: audit.due(gh, [repo], trusted, now.timestamp()))]
     answers = _side_by_side([part for _, part in parts], len(parts))
     return {key: answer.get() for (key, _), answer in zip(parts, answers, strict=True)}
@@ -8979,7 +9015,7 @@ def _resume_tail(gh: GitHub, repos: Sequence[str], read: Dict[str, Dict[str, Any
         return [x for r in repos for x in read[r][key]]
     return (_sensitive_resume_lines(gh, repos, now, env, joined("sensitive"))
             + _finished_epic_resume_lines(gh, [], joined("epics"))
-            + _verify_resume_lines(gh, repos, now, joined("verify"))
+            + _verify_resume_lines(gh, repos, now, joined("verify"), env)
             + _audit_resume_lines(gh, repos, now, env, joined("audit")))
 
 
@@ -9842,7 +9878,8 @@ def _cmd_resume(gh: GitHub, args: argparse.Namespace) -> int:
     _print_clock(gh, _repo(args.lock_repo))
     missed: List[str] = []
     resume(gh, _repos(args.repos), args.holder, _repo(args.lock_repo),
-           emit=_flushed, budget=args.repo_budget, deadline=args.deadline, missed=missed)
+           emit=_flushed, budget=args.repo_budget, deadline=args.deadline,
+           env=os.environ, missed=missed)
     if not missed:
         return 0
     print("resume partial: not read this run: %s" % " ".join(missed), file=sys.stderr)

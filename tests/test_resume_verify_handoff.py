@@ -199,6 +199,20 @@ class VerifyHandoffTest(unittest.TestCase):
         pool, _ = self.station._verify_pool({}, queued_holds=False)
         self.assertEqual([issue["number"] for _, issue in pool], [handoff["number"]])
 
+    def test_verify_due_omits_live_items_that_need_a_log_read_without_evidence(self):
+        # The source's Live criterion names `ready`: a log read the lane-machine
+        # brain tick cannot make without LOOM_EVIDENCE_CMDS, so verify_due
+        # leaves it out when the environment names no evidence command.
+        self.station._create_verify_handoff_ticket(REPO, self.source, self.shipped_at)
+        due = brain.verify_due(self.gh, REPO, [self.source], brain._stamp(stamp(T0)), env={})
+        self.assertEqual(due, [])
+        # With evidence access named, or with no env given, it is verify-due.
+        due = brain.verify_due(self.gh, REPO, [self.source], brain._stamp(stamp(T0)),
+                               env={"LOOM_EVIDENCE_CMDS": '{"%s":"echo"}' % REPO})
+        self.assertEqual([issue["number"] for _, issue in due], [self.source["number"]])
+        due = brain.verify_due(self.gh, REPO, [self.source], brain._stamp(stamp(T0)))
+        self.assertEqual([issue["number"] for _, issue in due], [self.source["number"]])
+
     def test_lane_proof_is_applied_to_the_source_ticket(self):
         self.station._create_verify_handoff_ticket(REPO, self.source, self.shipped_at)
         handoff = self.handoffs()[0]
