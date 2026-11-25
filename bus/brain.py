@@ -5844,6 +5844,37 @@ def _pr_contributors(gh: GitHub, repo: str, number: int, pr: Dict[str, Any]) -> 
     return [x for x in logins if x]
 
 
+def _head_pushers(gh: GitHub, repo: str, ref: str, head: str) -> List[str]:
+    """The login of everyone who pushed to the head branch, from the
+    repository's push activity (commit author and committer are client-set,
+    the pusher is not). Raises ValueError when the activity cannot be read,
+    when a push has no actor login, and when no push to the branch ends at
+    `head`, since then the pusher of the head is unknown (loom#3548)."""
+    if not ref:
+        raise ValueError("blocked: pull request has no head branch, so its pushers cannot "
+                         "be kept from approving it")
+    try:
+        pushes = gh.paginate("/repos/%s/activity?ref=%s&activity_type=push&per_page=100"
+                             % (repo, quote("refs/heads/" + ref, safe="")))
+    except GitHubError as err:
+        raise ValueError("blocked: push activity unreadable, so the pushers of the pull "
+                         "request cannot be kept from approving it (%s)" % err) from err
+    logins: List[str] = []
+    seen_head = False
+    for push in pushes:
+        push = push if isinstance(push, dict) else {}
+        login = str((push.get("actor") or {}).get("login") or "")
+        if not login:
+            raise ValueError("blocked: a push to the head branch has no GitHub login, so "
+                             "its pusher is unknown")
+        logins.append(login)
+        seen_head = seen_head or str(push.get("after") or "") == head
+    if not seen_head:
+        raise ValueError("blocked: no push to the head branch ends at head %s, so the "
+                         "pusher of the head is unknown" % head[:10])
+    return logins
+
+
 def _refuse_unapproved_head(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
                             details: Dict[str, Any], env: Optional[Dict[str, str]]) -> None:
     """Refuse the merge unless head_approval approves the current head. A
@@ -5863,6 +5894,11 @@ def _refuse_unapproved_head(gh: GitHub, repo: str, number: int, pr: Dict[str, An
     contributors = _pr_contributors(gh, repo, number, pr)
     automation = hold_logins(env) + [settings.get("LOOM_GITHUB_LOGIN", "").strip()]
     why = head_approval(reviews, comments, head, bot, contributors, automation)
+    if not why and head_approval(reviews, [], head, bot, contributors, automation):
+        # approved by a person's marker, not by the review bot: bar the pushers
+        ref = str(details.get("headRefName") or (pr.get("head") or {}).get("ref") or "")
+        pushers = _head_pushers(gh, repo, ref, head)
+        why = head_approval(reviews, comments, head, bot, contributors + pushers, automation)
     if why:
         raise ValueError("blocked: " + why)
 
