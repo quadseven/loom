@@ -1713,8 +1713,8 @@ class InvariantTest(unittest.TestCase):
         limit = invariants.WAIT_LIMIT
         rung = "on lane agy, at a limit: no free lane in its rung"
         waits = [Wait(Ref("%s#%d" % (REPO, n), "#%d" % n), rung, T0 - limit - n * 600) for n in (1, 2)]
-        waits.append(Wait(Ref("%s#3" % REPO, "#3"), "no free lane in tier medium", T0 - limit - 60))
-        waits.append(Wait(Ref("%s#4" % REPO, "#4"), "no free lane in tier hard", T0 - limit + 600))
+        waits.append(Wait(Ref("%s#3" % REPO, "#3"), "no free lane", T0 - limit - 60))
+        waits.append(Wait(Ref("%s#4" % REPO, "#4"), "no free lane", T0 - limit + 600))
         (b,) = invariants.ticket_waiting(Facts(T0, waits=waits))
         self.assertEqual((b.invariant, b.subject, b.rolling),
                          ("ticket-waiting", invariants.TICKETS_SUBJECT, True))
@@ -1727,7 +1727,7 @@ class InvariantTest(unittest.TestCase):
 
     def test_no_long_wait_is_no_breach(self):
         self.assertEqual(invariants.ticket_waiting(Facts(T0)), [])
-        short = [Wait(Ref("%s#1" % REPO, "#1"), "no free lane in tier medium", T0 - 60)]
+        short = [Wait(Ref("%s#1" % REPO, "#1"), "no free lane", T0 - 60)]
         self.assertEqual(invariants.ticket_waiting(Facts(T0, waits=short)), [])
 
     def test_an_incident_open_a_day_with_no_base_check_run_is_named(self):

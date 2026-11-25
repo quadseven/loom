@@ -247,12 +247,8 @@ def _rejection_reason(item: Any, lane: str) -> Optional[str]:
     split = brief_check.split_verdict(str(item.get("body") or ""))
     if split is not None:
         return split.reason
-    # The factory's reading (its default tier for a ticket with no
-    # Difficulty: line), so a ticket it reserved for this lane is one the
-    # lane takes (a reserved ticket sat unclaimed under four Muse lanes).
-    from .factory import difficulty_of
-    if difficulty_of(item) not in REMOTE_LANES[lane]["tiers"]:
-        return "difficulty outside the lane's tiers"
+    # No difficulty check: every lane takes every ticket (loom#3550), so a
+    # ticket the factory reserved for this lane is one the lane takes.
     return None
 
 
