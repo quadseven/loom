@@ -1,14 +1,34 @@
-"""A private repo's incident alias, derived from a shared key, is the same on
-every host, so any host names the incident the same way and can close it."""
+"""A private repo's incident alias is derived from the repo's GitHub id, so
+every host names the incident the same way and any host can close it
+(loom#3573: the shared key the alias once came from never existed, so a
+cluster lane could not find and close an incident another host filed)."""
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
-RUNNER = Path(__file__).resolve().parent.parent / "lanes" / "run_lane.sh"
+from bus import incident_probe
+
+ROOT = Path(__file__).resolve().parent.parent
+RUNNER = ROOT / "lanes" / "run_lane.sh"
+REPO = "example/repo"
+FACTORY = "example/factory"
+REPO_ID = 4242
+
+# A gh stand-in: the repo read answers the id (or fails), the incident list
+# answers $LISTED when the title asked for is $WANT, and every call is logged.
+FAKE_GH = """#!/bin/sh
+printf 'gh %s\\n' "$*" >> "$CALLS"
+case "$1 $2" in
+  "api repos/"*) [ -n "$REPO_ID" ] || exit 1; printf '%s\\n' "$REPO_ID" ;;
+  "issue list") [ "$TITLE" = "$WANT" ] && printf '%s\\n' "$LISTED" ;;
+esac
+exit 0
+"""
 
 
 def functions(*names: str) -> str:
@@ -17,70 +37,89 @@ def functions(*names: str) -> str:
                    for n in names)
 
 
-class IncidentAliasSharedKey(unittest.TestCase):
-    def subject(self, host_dir: Path, ssm_dir: Path, repo="example/repo", *,
-                trace=False, shared_only=False) -> subprocess.CompletedProcess:
-        script = ('set -o pipefail\n. "$1"\nshift\n' + functions("incident_subject")
-                  + 'repo_is_public() { false; }\n')
-        if trace:
-            script += 'python3() { [ -z "${KEY+x}" ] || return 90; command python3 "$@"; }\n'
-        script += 'incident_subject "$@"\n'
-        env = {"PATH": "/usr/bin:/bin", "REPO": repo, "INCIDENT_DIR": str(host_dir),
-               "LOOM_SSM_DIR": str(ssm_dir), "NET_TIMEOUT": "5"}
-        args = ["bash", "-xc" if trace else "-c", script, "bash",
-                str(RUNNER.with_name("agent_sandbox.sh"))]
-        if shared_only:
-            args.append("shared-only")
-        return subprocess.run(args, env=env, capture_output=True, text=True)
+class IncidentAliasDerived(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        bin_dir = self.tmp / "bin"
+        bin_dir.mkdir()
+        gh = bin_dir / "gh"
+        gh.write_text(FAKE_GH)
+        gh.chmod(0o755)
+        self.calls = self.tmp / "calls"
+        self.calls.touch()
+        self.log = self.tmp / "lane.log"
+        self.log.touch()
 
-    def write_key(self, ssm: Path, value: str):
-        param = ssm / "loom" / "incident-alias-key"
-        param.parent.mkdir(parents=True, exist_ok=True)
-        param.write_text(value)
+    def run_shell(self, body: str, host: str = "host", repo_id=REPO_ID, listed="",
+                  want="") -> subprocess.CompletedProcess:
+        script = (functions("derived_repo_alias", "incident_subject", "shared_incident_number",
+                            "resolve_factory_incidents")
+                  + 'repo_is_public() { false; }\n'
+                  + 'incident_file() { printf "%s/%s-%s" "$INCIDENT_DIR" '
+                    '"$(printf "%s" "$REPO" | tr "/" "_")" "$1"; }\n'
+                  + 'incident_ticket() { printf "a private repo ticket"; }\n'
+                  + 'sign_tail() { :; }\n'
+                  # The shadow guard is not under test here; the alias is.
+                  + 'python3() { case "$*" in *bus.shadow*) return 0 ;; esac; '
+                    'command python3 "$@"; }\n'
+                  + body)
+        env = {"PATH": "%s:%s" % (self.tmp / "bin", os.environ.get("PATH", "/usr/bin:/bin")),
+               "REPO": REPO, "FACTORY_REPO": FACTORY, "LOOM_ROOT": str(ROOT),
+               "INCIDENT_DIR": str(self.tmp / host), "NET_TIMEOUT": "5",
+               "INCIDENT_MARKER": incident_probe.INCIDENT_MARKER,
+               "LOG": str(self.log), "CALLS": str(self.calls),
+               "REPO_ID": "" if repo_id is None else str(repo_id),
+               "LISTED": listed, "WANT": want, "PWD": str(self.tmp)}
+        return subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True,
+                              cwd=str(self.tmp))
 
-    def test_two_hosts_with_one_key_name_the_same_repo_identically(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp = Path(tmp)
-            self.write_key(tmp / "ssm", "shared-test-key")
-            a = self.subject(tmp / "host-a", tmp / "ssm")
-            b = self.subject(tmp / "host-b", tmp / "ssm")
-            self.assertEqual(a.returncode, 0, a.stderr)
-            self.assertEqual(a.stdout, b.stdout)
-            self.assertRegex(a.stdout, r"^private repo [0-9a-f]{8}$")
+    def test_two_hosts_name_the_repo_identically_and_as_the_station_does(self):
+        a = self.run_shell("incident_subject\n", host="host-a")
+        b = self.run_shell("incident_subject\n", host="host-b")
+        self.assertEqual(a.returncode, 0, a.stderr)
+        self.assertEqual(a.stdout, b.stdout)
+        self.assertEqual(a.stdout, "private repo %s" % incident_probe.repo_alias(REPO_ID))
+        self.assertIn("private repo %s" % incident_probe.repo_alias(REPO_ID),
+                      incident_probe.subjects(REPO, REPO_ID))
 
     def test_another_repo_gets_another_alias(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp = Path(tmp)
-            self.write_key(tmp / "ssm", "shared-test-key")
-            a = self.subject(tmp / "h", tmp / "ssm", "example/one")
-            b = self.subject(tmp / "h", tmp / "ssm", "example/two")
-            self.assertNotEqual(a.stdout, b.stdout)
+        a = self.run_shell("incident_subject\n", repo_id=1)
+        b = self.run_shell("incident_subject\n", repo_id=2)
+        self.assertNotEqual(a.stdout, b.stdout)
 
-    def test_signing_keeps_the_key_out_of_the_process_environment_and_trace(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp = Path(tmp)
-            self.write_key(tmp / "ssm", "shared-test-key\n\n")
-            result = self.subject(tmp / "host", tmp / "ssm", trace=True)
-            self.assertNotIn("shared-test-key", result.stderr)
-            self.assertEqual(result.returncode, 0)
-            self.assertEqual(result.stdout, "private repo 9111c25b")
+    def test_a_pass_on_a_host_with_no_state_file_closes_another_hosts_incident(self):
+        title = "Factory incident: private repo %s validation base-check" % (
+            incident_probe.repo_alias(REPO_ID))
+        result = self.run_shell('mkdir -p "$INCIDENT_DIR"\nresolve_factory_incidents base-check\n',
+                                listed="77", want=title)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls.read_text()
+        self.assertIn("gh issue list --repo %s --state open" % FACTORY, calls)
+        self.assertIn("gh issue close --repo %s 77" % FACTORY, calls)
 
-    def test_with_no_key_each_host_keeps_its_own_random_alias(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp = Path(tmp)
-            a = self.subject(tmp / "host-a", tmp / "none")
-            b = self.subject(tmp / "host-b", tmp / "none")
-            self.assertRegex(a.stdout, r"^private repo [0-9a-f]{8}$")
-            self.assertNotEqual(a.stdout, b.stdout)
+    def test_no_open_incident_is_logged(self):
+        result = self.run_shell('mkdir -p "$INCIDENT_DIR"\nresolve_factory_incidents base-check\n')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("issue close", self.calls.read_text())
+        self.assertIn("found no open base-check incident for this repo", self.log.read_text())
 
-    def test_cross_host_lookup_requires_a_shared_alias(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp = Path(tmp)
-            host = tmp / "host"
-            result = self.subject(host, tmp / "ssm", shared_only=True)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertEqual(result.stdout, "")
-            self.assertFalse(host.exists())
+    def test_an_unreadable_repo_id_is_logged_and_looks_nothing_up(self):
+        result = self.run_shell('mkdir -p "$INCIDENT_DIR"\nresolve_factory_incidents base-check\n',
+                                repo_id=None)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("issue list", self.calls.read_text())
+        log = self.log.read_text()
+        self.assertIn("could not derive this private repo's incident alias", log)
+        self.assertIn("could not name this repo's base-check incident", log)
+
+    def test_with_no_repo_id_a_filing_falls_back_to_this_hosts_own_alias(self):
+        a = self.run_shell("incident_subject\n", host="host-a", repo_id=None)
+        b = self.run_shell("incident_subject\n", host="host-b", repo_id=None)
+        self.assertRegex(a.stdout, r"^private repo [0-9a-f]{8}$")
+        self.assertNotEqual(a.stdout, b.stdout)
+        self.assertIn("using this host's own alias", self.log.read_text())
 
 
 if __name__ == "__main__":

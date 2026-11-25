@@ -669,15 +669,42 @@ def held_on(found: List[Dict[str, Any]], issues: List[Dict[str, Any]],
 
 
 def held_lines(held: Dict[int, List[tickets.After]],
-               found: List[Dict[str, Any]]) -> List[str]:
-    """The Held tickets section: what each waiting ticket waits for."""
+               found: List[Dict[str, Any]], unrecorded: int = 0) -> List[str]:
+    """The Held tickets section: what each waiting ticket waits for, and how
+    many queued wait:incident tickets the station's hold ledger does not
+    know (unrecorded_incident_holds)."""
     lines = [HELD_HEADING]
     titles = {int(i["number"]): i.get("title", "") for i in found}
     for number, waiting in sorted(held.items()):
         lines.append("- #%d %s - waits for %s" % (
             number, titles.get(number, ""),
             ", ".join("%s (%s)" % (a.short, a.why) for a in waiting)))
-    return lines if held else lines + ["- none"]
+    if unrecorded:
+        lines.append("- %d queued wait:incident ticket(s) with no entry in the station's "
+                     "hold ledger" % unrecorded)
+    return lines if held or unrecorded else lines + ["- none"]
+
+
+def unrecorded_incident_holds(repo: str, found: List[Dict[str, Any]],
+                              env: Optional[Dict[str, str]] = None) -> int:
+    """How many of the repo's open queued wait:incident tickets have no entry
+    in the station's factory_held.json (loom#3573). The station releases them
+    from GitHub's labels; a count that stays up names a stalled queue before
+    it stalls for days. No ledger file counts every such ticket."""
+    env = os.environ if env is None else env
+    home = env.get("LOOM_HOME") or os.path.join(os.path.expanduser("~"), "loom")
+    try:
+        with open(os.path.join(home, "state", "station", "factory_held.json"),
+                  encoding="utf-8") as fh:
+            ledger = json.load(fh)
+    except (OSError, ValueError):
+        ledger = {}
+    if not isinstance(ledger, dict):
+        ledger = {}
+    return sum(1 for i in found
+               if i.get("state", "open") == "open"
+               and {"loom:queued", "wait:incident"} <= set(_labels(i))
+               and "%s#%s" % (repo, i.get("number")) not in ledger)
 
 
 def merge_ready(node: Optional[Dict[str, Any]], bot: str) -> str:
@@ -1626,7 +1653,7 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     lines += runaway_lines(tickets) + [""]
     lines += _ticket_lines(tickets, now, _stuck_marks(histories, skipped,
                                                       person_claims(tickets))) + [""]
-    lines += held_lines(held, tickets)
+    lines += held_lines(held, tickets, unrecorded_incident_holds(repo, tickets))
     lines += [""] + _pull_request_lines(gh, repo, prs, data, bot, authors or (), check, caps,
                                         now, hold)
     lines += [""] + _sensitive_pr_lines(prs, gh, repo)
@@ -4325,11 +4352,21 @@ def _repairs_header_for(gh: GitHub, repo: str, body: str, given: Optional[int],
     numbers = sorted({int(m.group(2)) for m in _REPO_NUMBER.finditer(body)
                       if m.group(1).lower() == factory.lower()})
     subjects = _incident_subjects(repo, env)
+    derived = False
     named = []
     for number in numbers:
         issue = gh.rest("GET", "/repos/%s/issues/%d" % (factory, number), ok=(404,)).data
-        if incident_probe.open_base_check(issue) and any(
-                "Repo: %s" % x in str(issue.get("body") or "").splitlines() for x in subjects):
+        if not incident_probe.open_base_check(issue):
+            continue
+        lines = str(issue.get("body") or "").splitlines()
+        if not derived and not any("Repo: %s" % x in lines for x in subjects) \
+                and any(line.startswith("Repo: private repo ") for line in lines):
+            # The alias every lane host derives from the repo id (loom#3573),
+            # read only when a private repo's incident needs it.
+            raw = (gh.rest("GET", "/repos/%s" % repo).data or {}).get("id")
+            subjects += incident_probe.subjects(repo, raw if isinstance(raw, int) else None)[1:]
+            derived = True
+        if any("Repo: %s" % x in lines for x in subjects):
             named.append(number)
     if not named or given in named:
         return given
@@ -5844,6 +5881,37 @@ def _pr_contributors(gh: GitHub, repo: str, number: int, pr: Dict[str, Any]) -> 
     return [x for x in logins if x]
 
 
+def _head_pushers(gh: GitHub, repo: str, ref: str, head: str) -> List[str]:
+    """The login of everyone who pushed to the head branch, from the
+    repository's push activity (commit author and committer are client-set,
+    the pusher is not). Raises ValueError when the activity cannot be read,
+    when a push has no actor login, and when no push to the branch ends at
+    `head`, since then the pusher of the head is unknown (loom#3548)."""
+    if not ref:
+        raise ValueError("blocked: pull request has no head branch, so its pushers cannot "
+                         "be kept from approving it")
+    try:
+        pushes = gh.paginate("/repos/%s/activity?ref=%s&activity_type=push&per_page=100"
+                             % (repo, quote("refs/heads/" + ref, safe="")))
+    except GitHubError as err:
+        raise ValueError("blocked: push activity unreadable, so the pushers of the pull "
+                         "request cannot be kept from approving it (%s)" % err) from err
+    logins: List[str] = []
+    seen_head = False
+    for push in pushes:
+        push = push if isinstance(push, dict) else {}
+        login = str((push.get("actor") or {}).get("login") or "")
+        if not login:
+            raise ValueError("blocked: a push to the head branch has no GitHub login, so "
+                             "its pusher is unknown")
+        logins.append(login)
+        seen_head = seen_head or str(push.get("after") or "") == head
+    if not seen_head:
+        raise ValueError("blocked: no push to the head branch ends at head %s, so the "
+                         "pusher of the head is unknown" % head[:10])
+    return logins
+
+
 def _refuse_unapproved_head(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
                             details: Dict[str, Any], env: Optional[Dict[str, str]]) -> None:
     """Refuse the merge unless head_approval approves the current head. A
@@ -5863,6 +5931,11 @@ def _refuse_unapproved_head(gh: GitHub, repo: str, number: int, pr: Dict[str, An
     contributors = _pr_contributors(gh, repo, number, pr)
     automation = hold_logins(env) + [settings.get("LOOM_GITHUB_LOGIN", "").strip()]
     why = head_approval(reviews, comments, head, bot, contributors, automation)
+    if not why and head_approval(reviews, [], head, bot, contributors, automation):
+        # approved by a person's marker, not by the review bot: bar the pushers
+        ref = str(details.get("headRefName") or (pr.get("head") or {}).get("ref") or "")
+        pushers = _head_pushers(gh, repo, ref, head)
+        why = head_approval(reviews, comments, head, bot, contributors + pushers, automation)
     if why:
         raise ValueError("blocked: " + why)
 

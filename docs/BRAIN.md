@@ -1502,8 +1502,9 @@ that fails posts nothing, so a bad API answer cannot start a second comment.
   `<!-- loom:key-repeat v1 -->` comment on the open issue: a running count, the
   first and last time, the tickets (or lanes) seen, and the latest detail.
 - A factory incident is filed on the public factory repo, so it names only a
-  repo known to be public. Any other repo is `private repo <alias>` (a random
-  id the lane machine keeps per repo), and its ticket and failing line are
+  repo known to be public. Any other repo is `private repo <alias>` (8 hex
+  digits every host derives from the repo's GitHub id; a host that cannot
+  read the id falls back to a random one it keeps), and its ticket and failing line are
   withheld; they stay in the lane log and on the ticket. A public repo's
   detail that fails the public repo leak scan is withheld the same way.
 
@@ -1989,8 +1990,11 @@ for the head. Nobody who opened the pull request or authored or committed
 any of its commits approves it, the review bot included. Commit author and
 committer are client-set, so a commit whose author or committer has no
 GitHub login (an unknown writer) refuses, and so does a pull request of 250
-or more commits, past what GitHub lists. No automation login
-approves by marker: `LOOM_GITHUB_LOGIN`, `LOOM_BRIEF_AUTHORS`,
+or more commits, past what GitHub lists. A marker approval also bars
+whoever pushed to the head branch, read from the repository's push activity
+(the pusher is set by GitHub, not the client); activity that cannot be read,
+a push with no login, or no push ending at the head refuses (loom#3548). No
+automation login approves by marker: `LOOM_GITHUB_LOGIN`, `LOOM_BRIEF_AUTHORS`,
 `LOOM_TRUSTED_BRIEFERS`, any `agent-` login, any App and the check bots
 (github-actions, copilot, dependabot, renovate). A review check that
 concluded success, neutral or skipped is no approval, an approval on an

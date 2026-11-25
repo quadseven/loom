@@ -613,6 +613,9 @@ HELD_FOR_RE = re.compile(r"factory incident ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([
 # has nothing that can close it, so the station releases it after this long:
 # the ticket is not held forever.
 HELD_NO_INCIDENT_FOR = 2 * 3600
+# How often the station reads GitHub for wait:incident holds its ledger does
+# not know (loom#3573): one label list per repo, so not every pass.
+UNRECORDED_HOLDS_EVERY = 900
 # The brain's lane order for a retry, after the failed lane's own provider.
 # claude is never chosen: it spends the operator's own subscription.
 RETRY_ORDER = ["anthropic", "anthropic-2", "anthropic-3", "anthropic-4",
@@ -2557,6 +2560,7 @@ class Station:
         self._claimed_rereviews: Dict[str, Any] = {}
         self._claimed_writes = 0
         self._branch_cache: Dict[str, str] = {}
+        self._repo_cache: Dict[str, Dict[str, Any]] = {}
         self._area_cache: Dict[str, List[str]] = {}
         self._stale_asks_withdrawn = 0
         # Per pass: each path-scoped repo's workflow filters, and its deploy runs.
@@ -7551,9 +7555,15 @@ class Station:
     def _default_branch(self, repo: str) -> str:
         """The repo's default branch, cached for the pass."""
         if repo not in self._branch_cache:
-            data = self.gh.rest("GET", "/repos/%s" % repo).data or {}
-            self._branch_cache[repo] = str(data.get("default_branch") or "")
+            self._branch_cache[repo] = str(self._repo_data(repo).get("default_branch") or "")
         return self._branch_cache[repo]
+
+    def _repo_data(self, repo: str) -> Dict[str, Any]:
+        """The repo's GitHub record, read once a pass."""
+        if repo not in self._repo_cache:
+            data = self.gh.rest("GET", "/repos/%s" % repo).data
+            self._repo_cache[repo] = data if isinstance(data, dict) else {}
+        return self._repo_cache[repo]
 
     def _hand_reverts(self, repo: str, pulls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """The hand-made revert pull requests among `pulls`, newest first."""
@@ -8491,8 +8501,13 @@ class Station:
         itself, so the release leaves it alone. A failed read of the
         incidents releases nothing this pass; the holds wait for the next."""
         held = self._held_tickets()
-        if not held:
-            return
+        if held:
+            self._release_ledger_holds(held)
+        self._release_unrecorded_holds()
+
+    def _release_ledger_holds(self, held: Dict[str, Any]) -> None:
+        """Walk the station's own hold ledger from where the last pass
+        stopped, releasing each hold whose incident cleared."""
         cursor_path = os.path.join(self.state, "factory_held_cursor.json")
         cursor = _read_json(cursor_path, {}, strict=False)
         start = cursor.get("next", 0) if isinstance(cursor, dict) else 0
@@ -8657,7 +8672,121 @@ class Station:
                 or run.get("conclusion") != "success" for run in runs):
             return False
         status_data = self.gh.rest("GET", "/repos/%s/commits/%s/status" % (repo, sha)).data or {}
-        return isinstance(status_data, dict) and status_data.get("state") == "success"
+        # GitHub answers "pending" with total_count 0 for a commit no status
+        # was ever posted on, so a repo gated by check runs alone read as
+        # never green (loom#3573).
+        return isinstance(status_data, dict) and (
+            status_data.get("state") == "success" or status_data.get("total_count") == 0)
+
+    # -- holds with no ledger entry (loom#3573) -----------------------------
+    def _release_unrecorded_holds(self) -> None:
+        """Release each queued wait:incident ticket the ledger does not know.
+        The label outlives the ledger: the cluster station started with no
+        factory_held.json, so 64 tickets the desktop station had held were
+        never released. GitHub's labels are the holds; one with no ledger
+        entry goes back to its lane once its repo has no open base-check or
+        contract incident, the incident its status names (if any) is closed,
+        and the default branch's CI is green, the rule the no-incident hold
+        already uses. A failed read releases nothing in that repo this pass.
+        It reads one label list per repo, so it runs at most once every
+        UNRECORDED_HOLDS_EVERY seconds."""
+        stamp_path = os.path.join(self.state, "unrecorded_holds.json")
+        stamp = _read_json(stamp_path, {}, strict=False)
+        last = stamp.get("at") if isinstance(stamp, dict) else None
+        if self._num(last) and 0 <= self.now - last < UNRECORDED_HOLDS_EVERY:
+            return
+        _write_json(stamp_path, {"at": self.now})
+        self._open_incidents: Optional[List[Dict[str, Any]]] = None
+        self._named_incidents: Dict[str, Optional[Dict[str, Any]]] = {}
+        for repo in self.scan_repos():
+            try:
+                self._release_repo_unrecorded(repo)
+            except RateLimited:
+                raise
+            except GitHubError as err:
+                _say("factory release: could not check the unrecorded holds of %s: %s"
+                     % (repo, err))
+
+    def _unrecorded_holds(self, repo: str) -> List[Dict[str, Any]]:
+        """The repo's open queued wait:incident tickets with no ledger entry."""
+        held = self._held_tickets()
+        found = self._paginate("/repos/%s/issues?labels=loom:queued,%sincident"
+                               "&state=open&per_page=100" % (repo, WAIT))
+        return [i for i in found if isinstance(i, dict) and "pull_request" not in i
+                and str(i.get("number") or "").isdigit() and self._incident_held(i)
+                and "%s#%d" % (repo, int(i["number"])) not in held]
+
+    def _release_repo_unrecorded(self, repo: str) -> None:
+        orphans = self._unrecorded_holds(repo)
+        if not orphans:
+            return
+        open_ref = self._repo_open_incident(repo)
+        if open_ref:
+            _say("factory release: %d unrecorded wait:incident hold(s) in %s stay: "
+                 "incident %s is open" % (len(orphans), repo, open_ref))
+            return
+        head = self._default_head(repo)
+        if not head or not self._default_commit_checks_green(repo, head):
+            _say("factory release: %d unrecorded wait:incident hold(s) in %s stay: "
+                 "default-branch CI is not green" % (len(orphans), repo))
+            return
+        mine = {a.lower() for a in self.s.authors}
+        for issue in orphans:
+            number = int(issue["number"])
+            key = "%s#%d" % (repo, number)
+            if set(tickets.claimed_by(issue)) & mine:
+                _say("factory release: %s kept: an operator session holds it" % key)
+                continue
+            named = self._named_open_incident(issue)
+            if named:
+                _say("factory release: %s kept: incident %s it names is open" % (key, named))
+                continue
+            cleared = RUNAWAY in _label_names(issue)
+            self._release_one(key, repo, number, issue, cleared,
+                              "held: this station has no record of the incident hold; the "
+                              "repo has no open base-check incident and its default-branch "
+                              "CI is green, so the ticket is back on its lane")
+            _say("factory release: %s re-queued: unrecorded hold, no open incident, "
+                 "default-branch CI green" % key)
+
+    def _repo_subjects(self, repo: str) -> List[str]:
+        """How an incident's Repo: line names `repo` (incident_probe.subjects)."""
+        data = self._repo_data(repo)
+        raw = data.get("id")
+        return incident_probe.subjects(repo, raw if isinstance(raw, int) else None)
+
+    def _repo_open_incident(self, repo: str) -> str:
+        """The ref of an open base-check or contract incident of `repo` on the
+        factory repo, "" when it has none. The factory repo's open incidents
+        are read once a pass."""
+        if self._open_incidents is None:
+            found = self._paginate("/repos/%s/issues?labels=loom:factory&state=open"
+                                   "&per_page=100" % FACTORY_REPO)
+            self._open_incidents = [i for i in found if isinstance(i, dict)]
+        names = self._repo_subjects(repo)
+        for issue in self._open_incidents:
+            if incident_probe.holds_repo(issue, names):
+                return "%s#%s" % (FACTORY_REPO, issue.get("number"))
+        return ""
+
+    def _named_open_incident(self, issue: Dict[str, Any]) -> str:
+        """The factory incident the ticket's newest hold event names, when it
+        is still open; "" when it names none or that one is closed."""
+        for _, text in status.body_events(issue.get("body")):
+            match = HELD_FOR_RE.search(text)
+            if not match:
+                continue
+            ref = "%s#%s" % (match.group(1), match.group(2))
+            if ref not in self._named_incidents:
+                found = self.gh.rest("GET", "/repos/%s/issues/%s"
+                                     % (match.group(1), match.group(2)), ok=(404,))
+                data = found.data if found.status != 404 else None
+                self._named_incidents[ref] = data if isinstance(data, dict) else None
+            data = self._named_incidents[ref]
+            open_incident = (isinstance(data, dict) and data.get("state") == "open"
+                             and INCIDENT_MARKER in str(data.get("body") or "").splitlines())
+            return ref if open_incident else ""
+        return ""
 
     def _release_one(self, key: str, repo: str, number: int, issue: Dict[str, Any],
                      cleared: bool, text: str) -> None:
