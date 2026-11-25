@@ -1,5 +1,6 @@
 """Offline acceptance tests for operator REST budget sampling."""
 import json
+import os
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -280,6 +281,7 @@ class IntegrationTests(unittest.TestCase):
             with mock.patch.object(station, "Station") as constructor, \
                  mock.patch.object(station, "_trust_app_login"), \
                  mock.patch.object(station, "GitHub", return_value=gh), \
+                 mock.patch.dict("os.environ", {"LOOM_GITHUB_TOKEN": "synthetic-operator"}), \
                  mock.patch("bus.github.app_auth_from_env", return_value="synthetic-test-credential") as auth:
                 station._locked_pass(settings, "unused", gh if supplied else None, {})
                 if supplied:
@@ -288,6 +290,22 @@ class IntegrationTests(unittest.TestCase):
                 else:
                     self.assertIs(constructor.call_args.kwargs["operator_reader"], budget.read_core)
                     auth.assert_called_once_with()
+
+    def test_an_app_only_station_has_no_operator_reader(self):
+        # loom#3304: the cluster station holds only App keys, so read_core
+        # failed and logged a line every RETRY. With no operator credential
+        # in its environment, the station does not sample at all.
+        from bus import station
+        gh = SimpleNamespace(cache_dir="unused", app=None)
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("LOOM_GITHUB_TOKEN", "GITHUB_TOKEN")}
+        with mock.patch.object(station, "Station") as constructor, \
+             mock.patch.object(station, "_trust_app_login"), \
+             mock.patch.object(station, "GitHub", return_value=gh), \
+             mock.patch.dict("os.environ", env, clear=True), \
+             mock.patch("bus.github.app_auth_from_env", return_value="synthetic-test-credential"):
+            station._locked_pass(SimpleNamespace(status_repo=""), "unused", None, {})
+        self.assertNotIn("operator_reader", constructor.call_args.kwargs)
 
     def test_operator_sample_precedes_app_trust_failure(self):
         from bus import station
