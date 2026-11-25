@@ -177,14 +177,15 @@ class ProbeFailsThenPassesTest(ProbeCase):
 
         # The same failure, read again, and a later failure alert nobody again.
         self.watch(gh, alerts, record.at + 65).tend()
-        self.assertEqual(self.probe("fail").returncode, 0)
+        # Give each later probe its own scheduled timestamp. CLI records use
+        # whole seconds, so back-to-back calls can look like the same probe.
+        signin.record(str(self.home), "fail", record.slots, record.error, now=record.at + 1800)
         self.watch(gh, alerts, record.at + 1900).tend()
         self.assertEqual(len(alerts), 1)
         self.assertEqual([w for w in gh.writes if w[0] == "create"], [(kind, number)])
         self.assertEqual(gh.issues[number]["state"], "open")
 
-        self.assertEqual(self.probe("pass").returncode, 0)
-        self.assertEqual(signin.read(str(self.home))["codex"].result, "pass")
+        signin.record(str(self.home), "pass", record.slots, "", now=record.at + 3600)
         self.watch(gh, alerts, record.at + 3800).tend()
         self.assertEqual(len(alerts), 2)
         self.assertIn("lane codex (codex codex-2) signs in again", alerts[1])
