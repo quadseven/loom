@@ -728,7 +728,12 @@ token. The station mints before its deploy step and reuses its
 `state/station/app-token.json` (`bus app token --cache-file`). Its Python pass
 refuses to start without the App settings, and a pass whose mint fails reads
 nothing from GitHub. A brain tick mints before it takes the lock and again
-once it holds it. Two reads still use the operator's own token on purpose:
+once it holds it. A lane run mints when it takes a brief and again after its
+agent. An installation token lasts an hour, so each late GitHub write (filing
+or closing a factory incident, a park note, an answer, a push) first mints
+again once the token is older than `LOOM_APP_TOKEN_MAX_AGE` seconds (default
+2700); an incident whose filing fails after a failed mint names the mint, not
+the 401 (loom#3571). Two reads still use the operator's own token on purpose:
 the pin pass (`bus/pin.py`, loom#612) and the operator budget sample
 (`bus/operator_budget.py`). Each reads `LOOM_GITHUB_TOKEN` from its own
 environment, since the wrapper refuses `gh auth token`.
