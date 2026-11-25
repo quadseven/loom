@@ -5328,7 +5328,7 @@ class Factory:
             return
         if lane is None:
             wait = "on lane %s, %s: %s" % (old, why, "no free lane in its rung" if rung
-                                           else "no other " + NO_FREE_LANE)
+                                           else "no other free lane")
             self._waiting(repo, number, wait)
             _say("%s#%d waits %s" % (repo, number, wait))
             return
