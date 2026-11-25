@@ -110,11 +110,14 @@ def print_manifest(owner: str, org: bool, name: Optional[str], as_form: bool,
 
 def print_token(out: TextIO, env: Optional[Dict[str, str]] = None,
                 transport: Optional[Transport] = None,
-                sign: Callable[[bytes, str], bytes] = openssl_sign) -> int:
+                sign: Callable[[bytes, str], bytes] = openssl_sign,
+                cache_file: Optional[str] = None) -> int:
     """Print the installation token of the App the LOOM_GITHUB_APP_* settings
     name, for a lane's or the brain's `gh` and `git` (loom#1142). Without
     those settings it prints nothing and fails: a writer that should post as
-    its App never falls back to the operator's personal token."""
+    its App never falls back to the operator's personal token. cache_file,
+    when given, is the private file a still-fresh token is reused from and a
+    new one kept in (the station's, loom#3083)."""
     env = os.environ if env is None else env
     transport = transport or urllib_transport
     env = _with_installation(env, transport, sign)
@@ -126,6 +129,7 @@ def print_token(out: TextIO, env: Optional[Dict[str, str]] = None,
         return 2
     gh = GitHub(AppToken(found.app_id, found.installation_id, _key_reader(env), sign=sign),
                 transport=transport)
+    gh.app.state_file = cache_file
     out.write(gh.app_token() + "\n")
     return 0
 
