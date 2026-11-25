@@ -279,6 +279,26 @@ class LaneJobTest(unittest.TestCase):
         self.assertEqual(capture.read_text(), "oauth-placeholder")
         self.assertNotIn("oauth-placeholder", result.stdout + result.stderr)
 
+    def test_the_cluster_claude_lane_hands_the_brief_over_stdin(self):
+        # --allowedTools takes a list, so a brief written after it was read as
+        # one more tool name and the CLI exited "Input must be provided either
+        # through stdin or as a prompt argument" on every cluster run.
+        token_file = self.job / "home" / "run" / "claude-oauth-token"
+        token_file.parent.mkdir(parents=True, exist_ok=True)
+        token_file.write_text("oauth-placeholder\n")
+        seen_in, seen_args = self.tmp / "stdin", self.tmp / "args"
+        cli = self.bin / "claude"
+        cli.write_text("#!/bin/sh\ncat > \"$SEEN_IN\"\nprintf '%s\\n' \"$@\" > \"$SEEN_ARGS\"\n")
+        cli.chmod(0o755)
+        script = '. "$1"; MODEL=test AGENT_TIMEOUT=5; agent_cli claude lane "fix the widget"'
+        env = dict(os.environ, PATH=str(self.bin) + ":" + os.environ["PATH"],
+                   LOOM_CLAUDE_AUTH_FILE=str(token_file), SEEN_IN=str(seen_in), SEEN_ARGS=str(seen_args))
+        result = subprocess.run(["bash", "-c", script, "bash", str(ROOT / "lanes" / "agent_cli.sh")],
+                                env=env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(seen_in.read_text(), "fix the widget")
+        self.assertNotIn("fix the widget", seen_args.read_text())
+
     def test_the_request_is_signed_as_aws_signs_it(self):
         # Pinned from botocore's SigV4Auth for the same request (checked when
         # this was written): the image has no AWS CLI, so the job signs.
