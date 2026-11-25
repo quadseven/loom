@@ -5680,7 +5680,19 @@ for BRIEF in "$INBOX"/*.md; do
   if [ -n "$HAS_CONTRACT" ] && [ -z "$FIX_PR" ] && [ "$COMMITTED" -eq 1 ] && remote_checks_on; then
     REMOTE_FINAL=1
   fi
-  if [ -n "$HAS_CONTRACT" ] && ! final_validation; then
+  # A new run that committed nothing has the base as its tree, and the base
+  # check (or GitHub's checks on the base) already covered that. A second run
+  # of the whole suite says nothing about the agent, holds a check slot, and
+  # where the suite outlasts the timeout it parked four no-commit runs in a
+  # day as "[transient] the check timed out", each retried on another lane
+  # (loom#3576). The no-commit handling below records what the agent said.
+  SKIP_FINAL=""
+  if [ -n "$HAS_CONTRACT" ] && [ -z "$FIX_PR" ] && [ "$COMMITTED" -eq 0 ]; then
+    SKIP_FINAL=1
+    echo "[$(date -u +%FT%TZ)] $TICKET: no commit on the lane branch: the final check is not run" >> "$LOG"
+    drop_check_home
+  fi
+  if [ -n "$HAS_CONTRACT" ] && [ -z "$SKIP_FINAL" ] && ! final_validation; then
     HANDOFF="no pull request opened"
     [ -n "$FIX_PR" ] && HANDOFF="nothing pushed to #$FIX_PR"
     park "$BRIEF" "$VALIDATION_REASON; $(preserve_unvalidated); $HANDOFF" "$PARK_CLASS"; continue
