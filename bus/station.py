@@ -618,7 +618,7 @@ HELD_NO_INCIDENT_FOR = 2 * 3600
 RETRY_ORDER = ["anthropic", "anthropic-2", "anthropic-3", "anthropic-4",
                "codex", "codex-2", "opencode-go", "agy"]
 # Free lanes take only easy tickets on public repos.
-FREE_LANES = ["openrouter", "zen", "zai", "workersai"]
+FREE_LANES = ["openrouter", "tinker", "zen", "zai", "workersai"]
 # The model families each lane's runner accepts (lanes/run_lane.sh); codex
 # takes any model outside the claude family. agy takes gemini-3.8-flash only:
 # its runner drops any other gemini, claude or gpt-oss pin and runs flash
@@ -629,6 +629,8 @@ LANE_MODELS = {
     "claude": CLAUDE_MODELS,
     "anthropic": ["claude*"],
     "openrouter": ["openrouter/*:free"],
+    # Tinker bills every id without :free (lanes/agent_sandbox.sh tinker_free_model).
+    "tinker": ["tinker/*:free"],
     # Only the allow-listed models (tickets.OPENCODE_GO_MODELS) and free models,
     # so a pin to a low-allowance Go model is never routed to an opencode-go lane.
     "opencode-go": list(tickets.OPENCODE_GO_MODELS) + ["opencode-go/*-free"],
