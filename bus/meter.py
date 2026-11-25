@@ -232,9 +232,74 @@ def write(path: str, record: Dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
+CLAUDE_WINDOWS = {"five_hour": ("5-hour", 300), "seven_day": ("weekly", 10080)}
+
+
+def _claude_windows(info: Dict[str, Any], now: float) -> Dict[str, Dict[str, Any]]:
+    unified = info.get("unifiedWindows")
+    buckets = dict(unified) if isinstance(unified, dict) else {}
+    kind = info.get("rateLimitType")
+    if isinstance(kind, str) and kind in CLAUDE_WINDOWS and kind not in buckets:
+        buckets[kind] = info
+    windows = {}
+    for kind, (window, minutes) in CLAUDE_WINDOWS.items():
+        bucket = buckets.get(kind)
+        if not isinstance(bucket, dict):
+            continue
+        used, reset = _number(bucket.get("utilization")), _number(bucket.get("resetsAt"))
+        if bucket.get("status") == "rejected":
+            used = 1.0
+        if used is not None and 0 <= used <= 1 and reset is not None and reset > 0:
+            windows[window] = {"window": window, "window_minutes": minutes, "unit": "percent",
+                               "used_pct": used * 100, "resets_at": reset, "at": now}
+    return windows
+
+
+# AI-REVIEW 2026-11-24 [automated review] 4685384543 (PR #3539):
+# Separate result output from the stream loop to reduce branching there.
+def _print_claude_result(event: Dict[str, Any]) -> None:
+    result = event.get("result")
+    if isinstance(result, str):
+        print(result, flush=True)
+    errors = event.get("errors")
+    if isinstance(errors, list):
+        for error in errors:
+            if isinstance(error, str):
+                print(error, flush=True)
+
+
+def _claude_stream(path: str, stdin: Any, now: Callable[[], float]) -> None:
+    """Keep only allowance figures, forwarding the result as normal CLI text."""
+    windows: Dict[str, Dict[str, Any]] = {}
+    for line in stdin:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            print(line, end="", flush=True)
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "result":
+            _print_claude_result(event)
+        info = event.get("rate_limit_info")
+        if event.get("type") != "rate_limit_event" or not isinstance(info, dict):
+            continue
+        at = now()
+        added = _claude_windows(info, at)
+        if added:
+            windows.update(added)
+            try:
+                write(path, {"at": at, "source": "Claude CLI", "windows": list(windows.values())})
+            except OSError as err:
+                print("could not record Claude usage (%s)" % type(err).__name__, file=sys.stderr)
+
+
 def main(argv: Optional[List[str]] = None, stdin: Any = None, now: Optional[float] = None,
          fetch: Fetch = _urlopen) -> int:
     args = sys.argv[1:] if argv is None else argv
+    if len(args) == 2 and args[0] == "--claude-stream":
+        _claude_stream(args[1], stdin or sys.stdin, time.time if now is None else lambda: now)
+        return 0
     refresh = args[-1:] == ["--refresh"]
     if refresh:
         args = args[:-1]
