@@ -38,7 +38,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from . import closing, notify, state_store, sticky, text
 from .github import GitHubError, RateLimited
@@ -168,12 +168,21 @@ def cell(probe: Optional[Probe]) -> str:
     return "-" if probe is None else "%s %s" % (probe.result, _utc(probe.at))
 
 
-def lanes_of_ask(body: str, comments: Sequence[Any]) -> List[str]:
-    """The slots a key-ask names: its own lane line and its repeat comment's list."""
+def login_of(item: Any) -> str:
+    """The lowercased login that wrote an issue or comment, "" when unknown."""
+    user = item.get("user") if isinstance(item, dict) else None
+    return str(user.get("login") or "").lower() if isinstance(user, dict) else ""
+
+
+def lanes_of_ask(body: str, comments: Sequence[Any], trusted: Iterable[str]) -> List[str]:
+    """The slots a key-ask names: its own lane line and the "Lanes seen" list
+    of a repeat comment written by a trusted login. Anyone can comment on a
+    public ticket, so a marker in anyone else's comment is data, not a list."""
+    allowed = {t.lower() for t in trusted if t}
     found = ASK_LANE_RE.findall(body or "")
     for c in comments:
         b = str(c.get("body") or "") if isinstance(c, dict) else ""
-        if b.startswith(KEY_REPEAT_MARKER):
+        if b.startswith(KEY_REPEAT_MARKER) and login_of(c) in allowed:
             for m in SEEN_RE.findall(b):
                 found += [s.strip() for s in m.split(",")]
     return sorted({s for s in found if SLOT_RE.fullmatch(s)})
@@ -184,15 +193,23 @@ class Watch:
 
     `alert(line)` sends one line to the alert channel and says whether it
     went. `last_beat(slot)` is the slot's latest heartbeat (unix time) or
-    None; `remote(slot)` says the station cannot see the slot's heartbeat."""
+    None; `remote(slot)` says the station cannot see the slot's heartbeat.
+
+    `own` is the station's own login: only a repeat comment it wrote is
+    merged into and edited. `trusted` adds Loom's other writers (the lanes
+    App files asks and repeat comments too): only an ask one of them wrote
+    is counted on or closed, and only their repeat comments name its lanes."""
 
     def __init__(self, gh: Any, repo: str, home: str, state_dir: str, now: float,
                  alert: Callable[[str], bool], say: Callable[[str], None],
                  last_beat: Callable[[str], Optional[float]],
-                 remote: Callable[[str], bool] = lambda _slot: False) -> None:
+                 remote: Callable[[str], bool] = lambda _slot: False,
+                 own: str = "", trusted: Iterable[str] = ()) -> None:
         self.gh, self.repo, self.home, self.now = gh, repo, home, now
         self.path = os.path.join(state_dir, LEDGER_FILE)
         self.alert, self.say, self.last_beat, self.remote = alert, say, last_beat, remote
+        self.own = own.lower()
+        self.trusted = {t.lower() for t in trusted if t} | ({self.own} if self.own else set())
         self._asks: Optional[List[Dict[str, Any]]] = None
 
     # -- ledger -------------------------------------------------------------
@@ -270,8 +287,10 @@ class Watch:
         if self._asks is None:
             found = self.gh.rest("GET", "/repos/%s/issues?labels=%s&state=open&per_page=100"
                                  % (self.repo, HUMAN)).data
+            # Only an ask Loom wrote: anyone can open an issue with that title.
             self._asks = [i for i in found if isinstance(i, dict) and "pull_request" not in i
-                          and "number" in i] if isinstance(found, list) else []
+                          and "number" in i and login_of(i) in self.trusted
+                          ] if isinstance(found, list) else []
         return self._asks
 
     def _asks_for(self, lane: str) -> List[Dict[str, Any]]:
@@ -301,10 +320,13 @@ class Watch:
         return int(made["number"])
 
     def _repeat(self, number: int, probe: Probe) -> None:
-        """Count the failure on the ask's one repeat comment, as a lane does."""
+        """Count the failure on the ask's one repeat comment, as a lane does.
+        Only a comment the station wrote itself is merged into and edited: a
+        marker in anyone else's comment is ignored, and the station writes
+        its own."""
         comments = self._comments(number)
-        old = next((c for c in comments if str(c.get("body") or "").startswith(KEY_REPEAT_MARKER)),
-                   None)
+        old = next((c for c in comments if self.own and login_of(c) == self.own
+                    and str(c.get("body") or "").startswith(KEY_REPEAT_MARKER)), None)
         body = sticky.merge_repeat(str(old.get("body") or "") if old else "", KEY_REPEAT_MARKER,
                                    REPEAT_HEADLINE, "Lanes seen", probe.key, "",
                                    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.now)))
@@ -343,7 +365,8 @@ class Watch:
             asks = [i for i in self._open_asks() if KEY_ASK_MARKER in str(i.get("body") or "")]
             for ask in asks:
                 number = int(ask["number"])
-                slots = lanes_of_ask(str(ask.get("body") or ""), self._comments(number))
+                slots = lanes_of_ask(str(ask.get("body") or ""), self._comments(number),
+                                     self.trusted)
                 if not slots or not all(self._off(s) for s in slots) \
                         or {lane_of(s) for s in slots} & failing:
                     continue

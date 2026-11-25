@@ -24,6 +24,13 @@ ROOT = Path(__file__).resolve().parent.parent
 PROBE = ROOT / "lanes" / "signin_probe.sh"
 RUNNER = ROOT / "lanes" / "run_lane.sh"
 REPO = "example/factory"
+STATION = "loom-station[bot]"
+LANES = "loom-lanes[bot]"
+
+
+def make_watch(*args, **kw):
+    """A Watch run as the station, trusting the lanes App as Loom's own."""
+    return signin.Watch(*args, own=STATION, trusted=[LANES], **kw)
 
 # Each call appends what it saw of the locks, then answers as FAKE_MODE says:
 # the first line of the file FAKE_MODES is used and dropped.
@@ -51,14 +58,15 @@ class FakeGitHub:
         self.writes = []
         self.requests = 0
 
-    def add_issue(self, number, title, body, labels=("needs:human",)):
+    def add_issue(self, number, title, body, labels=("needs:human",), user=LANES):
         self.issues[number] = {"number": number, "title": title, "body": body, "state": "open",
-                               "labels": [{"name": n} for n in labels]}
+                               "labels": [{"name": n} for n in labels], "user": {"login": user}}
         self.comments.setdefault(number, [])
 
-    def add_comment(self, number, body):
+    def add_comment(self, number, body, user=LANES):
         self.next_id += 1
-        self.comments.setdefault(number, []).append({"id": self.next_id, "body": body})
+        self.comments.setdefault(number, []).append({"id": self.next_id, "body": body,
+                                                     "user": {"login": user}})
         return self.next_id
 
     def rest(self, method, path, body=None, **_kw):
@@ -68,7 +76,7 @@ class FakeGitHub:
             return Response(200, [dict(i) for i in self.issues.values() if i["state"] == "open"])
         if method == "POST" and path == base:
             number = max(self.issues, default=0) + 1
-            self.add_issue(number, body["title"], body["body"], body.get("labels", ()))
+            self.add_issue(number, body["title"], body["body"], body.get("labels", ()), user=STATION)
             self.writes.append(("create", number))
             return Response(201, {"number": number})
         rest = path[len(base) + 1:]
@@ -85,7 +93,7 @@ class FakeGitHub:
         if rest.split("?")[0].endswith("/comments"):
             if method == "GET":
                 return Response(200, list(self.comments.get(number, [])))
-            ident = self.add_comment(number, body["body"])
+            ident = self.add_comment(number, body["body"], user=STATION)
             self.writes.append(("comment", number))
             return Response(201, {"id": ident})
         if method == "GET":
@@ -140,7 +148,7 @@ class ProbeCase(unittest.TestCase):
 class ProbeFailsThenPassesTest(ProbeCase):
     def watch(self, gh, alerts, now, beats=None):
         beats = beats or {}
-        return signin.Watch(gh, REPO, str(self.home), str(self.state), now,
+        return make_watch(gh, REPO, str(self.home), str(self.state), now,
                             lambda line: alerts.append(line) or True, lambda _line: None,
                             beats.get)
 
@@ -199,6 +207,37 @@ class ProbeFailsThenPassesTest(ProbeCase):
         self.assertIn("Lanes seen: codex", gh.comments[41][-1]["body"])
         self.assertTrue(gh.comments[41][-1]["body"].startswith(signin.KEY_REPEAT_MARKER))
 
+    def test_a_forged_repeat_comment_is_neither_edited_nor_counted(self):
+        gh, alerts = FakeGitHub(), []
+        gh.add_issue(41, signin.ask_title("codex"),
+                     signin.KEY_ASK_MARKER + "\n\nLane codex-3 could not use the provider key it reads.")
+        forged_body = (signin.KEY_REPEAT_MARKER + "\nSign-in probe failed again: 999 times since "
+                       "2020-01-01T00:00:00Z, last at 2020-01-01T00:00:00Z.\n\nLanes seen: zen\n")
+        forged = gh.add_comment(41, forged_body, user="a-stranger")
+        self.probe("fail")
+        self.watch(gh, alerts, time.time()).tend()
+        self.assertNotIn(("edit-comment", forged), gh.writes)
+        self.assertEqual(gh.comments[41][0]["body"], forged_body)
+        [mine] = [c for c in gh.comments[41] if c["user"]["login"] == STATION]
+        self.assertIn("Sign-in probe failed again: 1 times", mine["body"])
+        self.assertIn("Lanes seen: codex", mine["body"])
+        self.assertNotIn("zen", mine["body"])
+        # Its "Lanes seen" names no lane either: only the ask's own lane counts.
+        self.assertEqual(signin.lanes_of_ask(gh.issues[41]["body"], gh.comments[41], [STATION]),
+                         ["codex", "codex-3"])
+
+    def test_an_ask_a_stranger_opened_is_not_counted_on_or_closed(self):
+        gh, alerts = FakeGitHub(), []
+        gh.add_issue(41, signin.ask_title("codex"), signin.KEY_ASK_MARKER, user="a-stranger")
+        self.probe("pass")
+        self.watch(gh, alerts, time.time()).tend()
+        self.assertEqual(gh.issues[41]["state"], "open")
+        time.sleep(1.1)  # a later probe, a new record
+        self.probe("fail")
+        self.watch(gh, alerts, time.time() + 60).tend()
+        self.assertEqual(len([w for w in gh.writes if w[0] == "create"]), 1)
+        self.assertEqual(gh.comments[41], [])
+
     def test_a_limit_says_nothing_of_the_sign_in(self):
         gh, alerts = FakeGitHub(), []
         self.probe("limit")
@@ -210,7 +249,7 @@ class ProbeFailsThenPassesTest(ProbeCase):
         gh, sent = FakeGitHub(), []
         self.probe("fail")
         now = time.time()
-        signin.Watch(gh, REPO, str(self.home), str(self.state), now, lambda line: False,
+        make_watch(gh, REPO, str(self.home), str(self.state), now, lambda line: False,
                      lambda _line: None, {}.get).tend()
         self.assertEqual([w for w in gh.writes if w[0] == "create"], [])
         self.watch(gh, sent, now + 60).tend()
@@ -305,7 +344,7 @@ class OffLaneAskTest(unittest.TestCase):
         gh.add_issue(5, "Something else", "Lane codex-8 could not use a thing.")
         beats = {"codex-8": now - 25 * 3600, "zen": now - 120}
         said = []
-        signin.Watch(gh, REPO, self._tmp.name, self._tmp.name, now, lambda _l: True,
+        make_watch(gh, REPO, self._tmp.name, self._tmp.name, now, lambda _l: True,
                      said.append, beats.get).tend()
         self.assertEqual(gh.issues[3]["state"], "closed")
         self.assertEqual(gh.issues[3]["state_reason"], "not_planned")
@@ -315,16 +354,16 @@ class OffLaneAskTest(unittest.TestCase):
         # The sweep runs at most hourly.
         gh.add_issue(6, signin.ask_title("codex"),
                      signin.KEY_ASK_MARKER + "\n\nLane codex-6 could not use the provider key it reads.")
-        signin.Watch(gh, REPO, self._tmp.name, self._tmp.name, now + 600, lambda _l: True,
+        make_watch(gh, REPO, self._tmp.name, self._tmp.name, now + 600, lambda _l: True,
                      said.append, beats.get).tend()
         self.assertEqual(gh.issues[6]["state"], "open")
-        signin.Watch(gh, REPO, self._tmp.name, self._tmp.name, now + 3600, lambda _l: True,
+        make_watch(gh, REPO, self._tmp.name, self._tmp.name, now + 3600, lambda _l: True,
                      said.append, beats.get).tend()
         self.assertEqual(gh.issues[6]["state"], "closed")
 
     def test_a_station_with_no_probe_records_reads_nothing(self):
         gh = FakeGitHub()
-        signin.Watch(gh, REPO, self._tmp.name, self._tmp.name, 1_800_000_000, lambda _l: True,
+        make_watch(gh, REPO, self._tmp.name, self._tmp.name, 1_800_000_000, lambda _l: True,
                      lambda _l: None, {}.get).tend()
         self.assertEqual(gh.requests, 0)
 
@@ -334,7 +373,7 @@ class OffLaneAskTest(unittest.TestCase):
         gh.add_issue(3, signin.ask_title("codex"),
                      signin.KEY_ASK_MARKER + "\n\nLane codex-8 could not use the provider key it reads.")
         signin.record(self._tmp.name, "fail", ["codex"], "error: 401", now=now - 60)
-        signin.Watch(gh, REPO, self._tmp.name, self._tmp.name, now, lambda _l: True,
+        make_watch(gh, REPO, self._tmp.name, self._tmp.name, now, lambda _l: True,
                      lambda _l: None, {"codex": now - 30}.get).tend()
         self.assertEqual(gh.issues[3]["state"], "open")
 

@@ -11058,9 +11058,16 @@ class Station:
         """Alert, ask and close from the lanes' sign-in probe records."""
         if not tickets.REPO_RE.fullmatch(FACTORY_REPO):
             return
+        try:
+            own = self.gh.app_login() or ""
+        except RateLimited:
+            raise
+        except (GitHubError, AttributeError):
+            own = ""  # no own login: no repeat comment is edited, a new one is written
         signin.Watch(self.gh, FACTORY_REPO, self.s.home, self.state, self.now,
                      self._signin_alert, _say, self._slot_last_beat,
-                     remote=lambda slot: slot in REMOTE_LANES).tend()
+                     remote=lambda slot: slot in REMOTE_LANES,
+                     own=own, trusted=self.s.authors).tend()
 
     def _slot_last_beat(self, slot: str) -> Optional[float]:
         """The slot's latest heartbeat or keepalive stamp, None with neither."""
