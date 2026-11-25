@@ -3831,7 +3831,7 @@ contract_autoformat() {
   safe_git checkout -q -- . >> "$LOG" 2>&1
   after="$(safe_git ls-files --others --exclude-standard 2>> "$LOG")"
   while IFS= read -r path; do
-    [ -z "$path" ] || grep -Fxq -- "$path" <<< "$before" || rm -f -- "$TREE/$path"
+    if [ -n "$path" ] && ! grep -Fxq -- "$path" <<< "$before"; then rm -f -- "$TREE/$path"; fi
   done <<< "$after"
   if [ "$rc" -ne 0 ]; then
     echo "autoformat: the formatter exited $rc; files restored, run goes on unformatted" >> "$LOG"
