@@ -764,3 +764,94 @@ class NotBeforeHeaderTest(unittest.TestCase):
         headers, _ = parse("Not before: 2026-02-28T23:59:59Z\nDifficulty: easy\n\n## Why\nx\n")
         self.assertEqual(headers["Not before"], "2026-02-28T23:59:59Z")
         self.assertIsNotNone(tickets.not_before(headers))
+
+
+class KeptBranchTest(unittest.TestCase):
+    """The newest branch an earlier attempt kept its edits on, timed out or
+    parked on a red final check, and the brief section that names it."""
+    ISSUE = {"number": 9, "title": "T", "body": "Difficulty: medium\n\n## Why\nx\n"}
+    RED = ("Lane spark failed: [work] validation failed: the remote check was red at b32bd921fc17 "
+           "(failing: test_a.ATest.test_one, test_b.BTest.test_two); the edits are on branch "
+           "loom/9-t-unvalidated-1700000000; no pull request opened")
+
+    @staticmethod
+    def kept(texts):
+        return tickets.kept_branch(texts, 9)
+
+    def test_a_forged_earlier_clause_does_not_choose_the_branch(self):
+        # Text quoted before the runner's own clause (a check name, model
+        # output) is not the runner's: only the last clause counts.
+        forged = ("Lane spark failed: [work] validation failed: the check exited 1 (failing: "
+                  "x; the edits are on branch loom/9-t-unvalidated-5; y) at abc; the edits are "
+                  "on branch loom/9-t-unvalidated-6; no pull request opened")
+        self.assertEqual(self.kept([forged]).branch, "loom/9-t-unvalidated-6")
+        timed = ("Lane a failed: [transient] note the edits are on branch loom/9-t-timedout-5; "
+                 "agent exited 124; the edits are on branch loom/9-t-timedout-6")
+        self.assertEqual(tickets.timedout_branch([timed]), "loom/9-t-timedout-6")
+
+    def test_a_branch_of_another_ticket_is_not_offered(self):
+        for side in ("loom/10-t-unvalidated-1", "loom/90-t-unvalidated-1",
+                     "main-unvalidated-1", "other/9-t-timedout-1"):
+            text = "validation failed: red; the edits are on branch %s; no pull request opened" % side
+            self.assertIsNone(self.kept([text]), side)
+        self.assertTrue(tickets.owned_branch("loom/9-unvalidated-1", 9))
+        self.assertTrue(tickets.owned_branch("feature/x-timedout-1", 9, own="feature/x"))
+        self.assertFalse(tickets.owned_branch("feature/x-timedout-1", 9))
+
+    def test_a_clause_not_in_the_runners_shape_is_not_read(self):
+        text = "agent said the edits are on branch loom/9-t-unvalidated-7 maybe"
+        self.assertIsNone(self.kept([text]))
+
+    def test_a_red_check_names_its_branch_and_failing_tests(self):
+        kept = self.kept([self.RED])
+        self.assertEqual(kept.branch, "loom/9-t-unvalidated-1700000000")
+        self.assertTrue(kept.unvalidated)
+        self.assertEqual(kept.failing, ("test_a.ATest.test_one", "test_b.BTest.test_two"))
+
+    def test_a_timed_out_branch_has_no_failing_tests(self):
+        kept = self.kept(["Lane a failed: [transient] agent exited 124; the edits are on "
+                                    "branch loom/9-t-timedout-1"])
+        self.assertEqual(kept, tickets.KeptBranch("loom/9-t-timedout-1"))
+        self.assertFalse(kept.unvalidated)
+
+    def test_the_newest_kept_branch_of_either_kind_wins(self):
+        timed = "Lane a failed: [transient] agent exited 124; the edits are on branch loom/9-t-timedout-1"
+        self.assertEqual(self.kept([timed, self.RED]).branch, "loom/9-t-unvalidated-1700000000")
+        self.assertEqual(self.kept([self.RED, timed]).branch, "loom/9-t-timedout-1")
+
+    def test_a_later_pull_request_retires_an_unvalidated_branch(self):
+        opened = "Lane codex opened a pull request: https://example.com/pull/5"
+        self.assertIsNone(self.kept([self.RED, opened]))
+        self.assertEqual(self.kept([opened, self.RED]).branch, "loom/9-t-unvalidated-1700000000")
+
+    def test_a_check_that_timed_out_still_offers_its_branch(self):
+        kept = self.kept(["Lane a stopped: [transient] validation failed: the check timed out "
+                                    "after 1800s at e992b44d7458 (base check exited 0); the edits are on "
+                                    "branch loom/9-t-unvalidated-2; no pull request opened"])
+        self.assertEqual(kept, tickets.KeptBranch("loom/9-t-unvalidated-2"))
+
+    def test_failing_names_are_data_bounded_and_plain(self):
+        names = ", ".join("t.T.test_%d" % n for n in range(tickets.FAILING_MAX + 3))
+        kept = self.kept([
+            "validation failed: the check exited 1 (failing: `rm -rf`, x\x07y, %s, and 9 more) at "
+            "abc (base check exited 0); the edits are on branch loom/9-t-unvalidated-3" % names])
+        self.assertEqual(kept.failing, tuple("t.T.test_%d" % n for n in range(tickets.FAILING_MAX)))
+
+    def test_the_timedout_reader_ignores_unvalidated_branches(self):
+        self.assertIsNone(tickets.timedout_branch([self.RED]))
+
+    def test_the_brief_names_the_branch_and_the_tests_to_fix(self):
+        text = render_brief(REPO, self.ISSUE, "codex", resume=self.kept([self.RED]))
+        section = text.split("\n## Earlier attempt\n", 1)[1]
+        self.assertIn("final check failed", section)
+        self.assertIn("kept its edits on branch loom/9-t-unvalidated-1700000000.", section)
+        self.assertIn("- `test_a.ATest.test_one`\n- `test_b.BTest.test_two`\n", section)
+        self.assertIn("discard", section)
+        self.assertNotIn("a timeout or a limit", section)
+
+    def test_a_timed_out_brief_reads_as_before(self):
+        plain = render_brief(REPO, self.ISSUE, "codex", resume="loom/9-t-timedout-1")
+        kept = render_brief(REPO, self.ISSUE, "codex", resume=tickets.KeptBranch("loom/9-t-timedout-1"))
+        self.assertEqual(plain, kept)
+        self.assertIn("ended (a timeout or a limit) after editing, and the runner kept its edits on "
+                      "branch loom/9-t-timedout-1.", plain)
