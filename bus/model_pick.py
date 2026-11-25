@@ -565,7 +565,16 @@ def pick(lane: str, slot: str, private: bool, key: str, home: Path, now: float,
         return False
 
     def run_paid() -> Optional[Pick]:
-        stop = plan_stop(read_usage(key, env, opener), now) if paid else None
+        limits = read_usage(key, env, opener) if paid else None
+        if limits:
+            windows = [{"window": name, "used_pct": percent, "resets_at": reset, "unit": "percent"}
+                       for name, (percent, reset) in limits.items()]
+            try:
+                _write_json(usage_dir(home) / (slot + ".meter.json"),
+                            {"at": now, "source": "OpenCode Go plan", "windows": windows})
+            except OSError as err:
+                print("could not record OpenCode Go usage (%s)" % type(err).__name__, file=sys.stderr)
+        stop = plan_stop(limits, now) if paid else None
         if stop:
             skipped.append("paid models stop: %s" % stop[1])
             waits.append(stop[0])
