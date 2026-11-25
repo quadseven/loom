@@ -1990,8 +1990,11 @@ for the head. Nobody who opened the pull request or authored or committed
 any of its commits approves it, the review bot included. Commit author and
 committer are client-set, so a commit whose author or committer has no
 GitHub login (an unknown writer) refuses, and so does a pull request of 250
-or more commits, past what GitHub lists. No automation login
-approves by marker: `LOOM_GITHUB_LOGIN`, `LOOM_BRIEF_AUTHORS`,
+or more commits, past what GitHub lists. A marker approval also bars
+whoever pushed to the head branch, read from the repository's push activity
+(the pusher is set by GitHub, not the client); activity that cannot be read,
+a push with no login, or no push ending at the head refuses (loom#3548). No
+automation login approves by marker: `LOOM_GITHUB_LOGIN`, `LOOM_BRIEF_AUTHORS`,
 `LOOM_TRUSTED_BRIEFERS`, any `agent-` login, any App and the check bots
 (github-actions, copilot, dependabot, renovate). A review check that
 concluded success, neutral or skipped is no approval, an approval on an
