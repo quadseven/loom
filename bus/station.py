@@ -126,6 +126,9 @@ HEARTBEAT_MAX_AGE = lane_state.HEARTBEAT_MAX_AGE
 BRIEFED = "loom:briefed"
 RUNNING = "loom:running"
 RUNAWAY = "loom:runaway"
+# Work attempts since a ticket's last brief after which it is held as a runaway
+# (LOOM_FAILED_RUN_CAP sets it; 0 turns it off).
+FAILED_RUN_CAP = 8
 # How often the station moves tickets under no epic or a closed epic into an
 # open intake epic, matching the closed-epic invariant's check interval.
 OUTSIDE_EPIC_EVERY = invariants.CHECK_EVERY
@@ -9996,11 +9999,19 @@ class Station:
             return a == b or (factory.is_timeout(a) and factory.is_timeout(b))
         reason_repeat = bool(failures) and same(failures[-1], reason)
         recent = [a for a in work if a[0] >= self.now - 6 * 3600]
-        if not reason_repeat and len(recent) < 3:
+        # Failures that differ and spread over days trip neither test above: a
+        # ticket reached its fiftieth run that way. Work attempts since the
+        # last brief past the cap hold it; a new brief starts the count again.
+        cap = _int_or_default(os.environ.get("LOOM_FAILED_RUN_CAP", ""), FAILED_RUN_CAP)
+        since_brief = [a for a in history.attempts_since_brief(comments) if is_work(a[3])]
+        capped = 0 < cap <= len(since_brief)
+        if not reason_repeat and len(recent) < 3 and not capped:
             return False
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                      {"labels": sorted(set(_label_names(issue)) | {RUNAWAY})})
-        trigger = "repeated failure reason" if reason_repeat else "three attempts within six hours"
+        trigger = ("repeated failure reason" if reason_repeat
+                   else "three attempts within six hours" if len(recent) >= 3
+                   else "%d failed runs since the last brief" % len(since_brief))
         body = factory.runaway_comment(
             trigger, attempts, factory.issue_model(issue), factory.attempt_models(issue, comments),
             counted=is_work)

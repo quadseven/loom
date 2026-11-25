@@ -2081,6 +2081,10 @@ times (default 6, 0 is off) with no lane claiming it stops moving: it takes
 Repeated escalation to the same known model and lane counts as one move
 while that assignment stays in place.
 
+A ticket with `LOOM_FAILED_RUN_CAP` work attempts (default 8, 0 is off) since its
+last brief takes `loom:runaway` with one comment, however its failure reasons
+differ or how far apart the runs are. A new brief starts the count again.
+
 A `; not built:` reason that says the work is already there must cite code on
 the pull request's base branch: `<path>:<line>`, `<path>#L<line>`,
 `<path>::<symbol>`, or `` `<path>` `<symbol>` ``. Status prints
