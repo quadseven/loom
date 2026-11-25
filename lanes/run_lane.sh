@@ -1332,9 +1332,10 @@ fresh_app_token() {
   [[ "${APP_TOKEN_AT:-}" =~ ^[0-9]+$ ]] && [ $((now - APP_TOKEN_AT)) -lt "$max" ] && return 0
   lane_app_token && return 0
   [ -z "$old" ] || export GH_TOKEN="$old"
-  echo "[$(date -u +%FT%TZ)] ${TICKET:-run}: could not mint a fresh GitHub App token before a GitHub write" >> "$LOG"
+  echo "[$(date -u +%FT%TZ)] ${TICKET:-run}: $APP_TOKEN_STALE_WHY" >> "$LOG"
   return 1
 }
+APP_TOKEN_STALE_WHY="could not mint a fresh GitHub App token before a GitHub write"
 
 # The agent's own gh config directory (loom#665): a fresh one per run, holding
 # this run's App token in the hosts.yml gh reads, so the agent's gh calls bill
@@ -2852,6 +2853,8 @@ shared_incident_number() {  # kind
 resolve_factory_incidents() {
   local kind file number kinds="${1:-environment contract base-check}"
   local text="${2:-the check passed on the unmodified base in $(incident_ticket).}"
+  # It follows the base check, which can outlast the run's first token.
+  fresh_app_token || true
   for kind in $kinds; do
     file="$(incident_file "$kind")"
     if [ -f "$file" ]; then
@@ -2986,10 +2989,18 @@ file_factory_incident() {  # kind, detail
 # File or update the factory incident for the current failure, append its
 # reference to the named reason variable, and park the brief as [factory]
 # so the ticket keeps its rung. (Assigns via printf -v, never in a
-# subshell, so PARK_CLASS survives.)
+# subshell, so PARK_CLASS survives.) A setup or check can outlast the token
+# minted when the run began, so this mints again first, here and not in the
+# subshell that files, so the new token stays for the run (loom#3571: eight
+# incidents lost to a 401 after an hour-long setup). A filing that fails
+# after a failed mint names the mint, not the 401 that followed it.
 note_factory_incident() {  # kind, detail, reason_var_name
-  local ref
+  local ref minted=1
+  fresh_app_token || minted=0
   ref="$(file_factory_incident "$1" "$2")"
+  if [ "$minted" = 0 ] && [[ "$ref" == "factory incident filing failed"* ]]; then
+    ref="factory incident filing failed (token mint: $APP_TOKEN_STALE_WHY)"
+  fi
   PARK_CLASS=factory
   printf -v "$3" '%s; %s' "${!3}" "$ref"
 }
@@ -5569,6 +5580,8 @@ for BRIEF in "$INBOX"/*.md; do
       park "$BRIEF" "answer refused: $REASON"; continue
     fi
     rm -f "$LOGDIR/$TICKET.answer-error"
+    # The final checks can outlast the token minted after the agent.
+    fresh_app_token || true
     if ! timeout "$NET_TIMEOUT" gh issue comment "$ISSUE_NUMBER" -R "$REPO" --body "$(signed "$ANSWER_TEXT")" >> "$LOG" 2>&1; then
       park "$BRIEF" "answer comment failed" transient; continue
     fi
@@ -5680,7 +5693,19 @@ for BRIEF in "$INBOX"/*.md; do
   if [ -n "$HAS_CONTRACT" ] && [ -z "$FIX_PR" ] && [ "$COMMITTED" -eq 1 ] && remote_checks_on; then
     REMOTE_FINAL=1
   fi
-  if [ -n "$HAS_CONTRACT" ] && ! final_validation; then
+  # A new run that committed nothing has the base as its tree, and the base
+  # check (or GitHub's checks on the base) already covered that. A second run
+  # of the whole suite says nothing about the agent, holds a check slot, and
+  # where the suite outlasts the timeout it parked four no-commit runs in a
+  # day as "[transient] the check timed out", each retried on another lane
+  # (loom#3576). The no-commit handling below records what the agent said.
+  SKIP_FINAL=""
+  if [ -n "$HAS_CONTRACT" ] && [ -z "$FIX_PR" ] && [ "$COMMITTED" -eq 0 ]; then
+    SKIP_FINAL=1
+    echo "[$(date -u +%FT%TZ)] $TICKET: no commit on the lane branch: the final check is not run" >> "$LOG"
+    drop_check_home
+  fi
+  if [ -n "$HAS_CONTRACT" ] && [ -z "$SKIP_FINAL" ] && ! final_validation; then
     HANDOFF="no pull request opened"
     [ -n "$FIX_PR" ] && HANDOFF="nothing pushed to #$FIX_PR"
     park "$BRIEF" "$VALIDATION_REASON; $(preserve_unvalidated); $HANDOFF" "$PARK_CLASS"; continue
@@ -5879,6 +5904,8 @@ for BRIEF in "$INBOX"/*.md; do
     if [[ ! "$ISSUE_NUMBER" =~ ^[0-9]+$ ]]; then
       park "$BRIEF" "agent made no commit and its reason has no ticket number to go on"; continue
     fi
+    # Minted here, not in post_no_change's subshell, so the token stays.
+    fresh_app_token || true
     if ! WHY="$(post_no_change)"; then
       rm -f "$LOGDIR/$TICKET.answered.tmp"; park "$BRIEF" "$WHY" transient; continue
     fi
