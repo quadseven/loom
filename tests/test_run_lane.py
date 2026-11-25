@@ -655,6 +655,7 @@ def git(*args, cwd=None):
 class LaneRunnerTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
         root = Path(self._tmp.name)
         self.home = root / "home"
         self.loom = self.home / "loom"
@@ -689,7 +690,7 @@ class LaneRunnerTest(unittest.TestCase):
         self.write_tool(self.bin / "curl", FAKE_CURL)
         # The Lanes App's token (loom#3083): a lane calls GitHub with nothing else.
         self.default_mint = root / "default-app-token"
-        self.write_tool(self.default_mint, "#!/usr/bin/env bash\necho ghs_test\n")
+        self.write_tool(self.default_mint, "#!/usr/bin/bash\necho ghs_test\n")
         self.scanner = root / "check_private_leaks.py"
         self.scanner.write_text("""#!/usr/bin/env python3
 import os, re, subprocess, sys
@@ -763,9 +764,6 @@ for number, line in enumerate(text.splitlines(), 1):
 print('leak guard: clean (shape patterns only)')
 """)
         self.scanner.chmod(0o755)
-
-    def tearDown(self):
-        self._tmp.cleanup()
 
     @staticmethod
     def write_tool(path, text):
