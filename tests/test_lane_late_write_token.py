@@ -174,7 +174,9 @@ class LateWriteTokenRun(base.LaneRunnerTest):
         calls = self.calls()
         self.assertIn("interpreter loom-test-python is not on PATH", self.lane_log())
         gh_calls = [c for c in calls if c.startswith("gh ")]
-        used = dict(zip(range(len(gh_calls)), tokens.read_text().split()))
+        # One token line per gh call, in the same order.
+        used = tokens.read_text().split()
+        self.assertEqual(len(used), len(gh_calls), calls)
         creates = [i for i, c in enumerate(gh_calls) if c.startswith("gh issue create")]
         self.assertTrue(creates, calls)
         create_at = calls.index(gh_calls[creates[0]])
