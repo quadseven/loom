@@ -52,32 +52,37 @@ class Fake(base.FakeGitHub):
 
     def __call__(self, method, url, headers, body):
         parts = urlsplit(url)
-        query = unquote(parts.query)
-        if method == "GET" and parts.path == "/repos/%s/issues" % FACTORY:
+        answer = self._answer(parts.path, unquote(parts.query)) if method == "GET" else None
+        if answer is None:
+            return super().__call__(method, url, headers, body)
+        if "issues?" in answer[0]:
             self.calls.append((method, parts.path + "?" + parts.query))
-            if "state=open" in query:
-                return base.reply(200, [i for i in self.open_incidents if i["state"] == "open"])
-            return base.reply(200, [])
-        if method == "GET" and parts.path.startswith("/repos/%s/issues/" % FACTORY):
-            number = int(parts.path.rsplit("/", 1)[1])
-            found = self.named.get(number)
-            return base.reply(200, found) if found else base.reply(404, {"message": "Not Found"})
-        if method == "GET" and parts.path == "/repos/%s/issues" % REPO \
-                and "labels=loom:queued,wait:incident" in query:
-            self.calls.append((method, parts.path + "?" + parts.query))
-            return base.reply(200, [i for i in self.issues.values() if i["state"] == "open"
-                                    and {"loom:queued", "wait:incident"}
-                                    <= set(self.names(i["number"]))])
-        if method == "GET" and parts.path == "/repos/%s" % REPO:
-            return base.reply(200, {"full_name": REPO, "private": True, "id": REPO_ID,
-                                    "default_branch": "main"})
-        if method == "GET" and parts.path == "/repos/%s/commits/main" % REPO:
-            return base.reply(200, {"sha": SHA})
-        if method == "GET" and parts.path == "/repos/%s/commits/%s/check-runs" % (REPO, SHA):
-            return base.reply(200, {"total_count": len(self.runs), "check_runs": self.runs})
-        if method == "GET" and parts.path == "/repos/%s/commits/%s/status" % (REPO, SHA):
-            return base.reply(200, self.combined)
-        return super().__call__(method, url, headers, body)
+        return answer[1]
+
+    def _answer(self, path, query):
+        """(a label for the read, its reply) for a read this fake answers
+        itself; None hands the call to the station fake."""
+        if path.startswith("/repos/%s/issues/" % FACTORY):
+            found = self.named.get(int(path.rsplit("/", 1)[1]))
+            return "named", (base.reply(200, found) if found
+                             else base.reply(404, {"message": "Not Found"}))
+        if path == "/repos/%s/issues" % FACTORY:
+            return "factory issues?", base.reply(200, [
+                i for i in self.open_incidents if i["state"] == "open"]
+                if "state=open" in query else [])
+        if path == "/repos/%s/issues" % REPO and "labels=loom:queued,wait:incident" in query:
+            return "held issues?", base.reply(200, [
+                i for i in self.issues.values() if i["state"] == "open"
+                and {"loom:queued", "wait:incident"} <= set(self.names(i["number"]))])
+        fixed = {
+            "/repos/%s" % REPO: {"full_name": REPO, "private": True, "id": REPO_ID,
+                                 "default_branch": "main"},
+            "/repos/%s/commits/main" % REPO: {"sha": SHA},
+            "/repos/%s/commits/%s/check-runs" % (REPO, SHA):
+                {"total_count": len(self.runs), "check_runs": self.runs},
+            "/repos/%s/commits/%s/status" % (REPO, SHA): self.combined,
+        }
+        return ("fixed", base.reply(200, fixed[path])) if path in fixed else None
 
 
 class OrphanHoldTest(base.Base):
