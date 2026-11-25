@@ -764,3 +764,66 @@ class NotBeforeHeaderTest(unittest.TestCase):
         headers, _ = parse("Not before: 2026-02-28T23:59:59Z\nDifficulty: easy\n\n## Why\nx\n")
         self.assertEqual(headers["Not before"], "2026-02-28T23:59:59Z")
         self.assertIsNotNone(tickets.not_before(headers))
+
+
+class KeptBranchTest(unittest.TestCase):
+    """The newest branch an earlier attempt kept its edits on, timed out or
+    parked on a red final check, and the brief section that names it."""
+    ISSUE = {"number": 9, "title": "T", "body": "Difficulty: medium\n\n## Why\nx\n"}
+    RED = ("Lane spark failed: [work] validation failed: the remote check was red at b32bd921fc17 "
+           "(failing: test_a.ATest.test_one, test_b.BTest.test_two); the edits are on branch "
+           "loom/9-t-unvalidated-1700000000; no pull request opened")
+
+    def test_a_red_check_names_its_branch_and_failing_tests(self):
+        kept = tickets.kept_branch([self.RED])
+        self.assertEqual(kept.branch, "loom/9-t-unvalidated-1700000000")
+        self.assertTrue(kept.unvalidated)
+        self.assertEqual(kept.failing, ("test_a.ATest.test_one", "test_b.BTest.test_two"))
+
+    def test_a_timed_out_branch_has_no_failing_tests(self):
+        kept = tickets.kept_branch(["Lane a failed: [transient] agent exited 124; the edits are on "
+                                    "branch loom/9-t-timedout-1"])
+        self.assertEqual(kept, tickets.KeptBranch("loom/9-t-timedout-1"))
+        self.assertFalse(kept.unvalidated)
+
+    def test_the_newest_kept_branch_of_either_kind_wins(self):
+        timed = "Lane a failed: [transient] agent exited 124; the edits are on branch loom/9-t-timedout-1"
+        self.assertEqual(tickets.kept_branch([timed, self.RED]).branch, "loom/9-t-unvalidated-1700000000")
+        self.assertEqual(tickets.kept_branch([self.RED, timed]).branch, "loom/9-t-timedout-1")
+
+    def test_a_later_pull_request_retires_an_unvalidated_branch(self):
+        opened = "Lane codex opened a pull request: https://example.com/pull/5"
+        self.assertIsNone(tickets.kept_branch([self.RED, opened]))
+        self.assertEqual(tickets.kept_branch([opened, self.RED]).branch, "loom/9-t-unvalidated-1700000000")
+
+    def test_a_check_that_timed_out_still_offers_its_branch(self):
+        kept = tickets.kept_branch(["Lane a stopped: [transient] validation failed: the check timed out "
+                                    "after 1800s at e992b44d7458 (base check exited 0); the edits are on "
+                                    "branch loom/9-t-unvalidated-2; no pull request opened"])
+        self.assertEqual(kept, tickets.KeptBranch("loom/9-t-unvalidated-2"))
+
+    def test_failing_names_are_data_bounded_and_plain(self):
+        names = ", ".join("t.T.test_%d" % n for n in range(tickets.FAILING_MAX + 3))
+        kept = tickets.kept_branch([
+            "validation failed: the check exited 1 (failing: `rm -rf`, x\x07y, %s, and 9 more) at "
+            "abc (base check exited 0); the edits are on branch loom/9-t-unvalidated-3" % names])
+        self.assertEqual(kept.failing, tuple("t.T.test_%d" % n for n in range(tickets.FAILING_MAX)))
+
+    def test_the_timedout_reader_ignores_unvalidated_branches(self):
+        self.assertIsNone(tickets.timedout_branch([self.RED]))
+
+    def test_the_brief_names_the_branch_and_the_tests_to_fix(self):
+        text = render_brief(REPO, self.ISSUE, "codex", resume=tickets.kept_branch([self.RED]))
+        section = text.split("\n## Earlier attempt\n", 1)[1]
+        self.assertIn("final check failed", section)
+        self.assertIn("kept its edits on branch loom/9-t-unvalidated-1700000000.", section)
+        self.assertIn("- `test_a.ATest.test_one`\n- `test_b.BTest.test_two`\n", section)
+        self.assertIn("discard", section)
+        self.assertNotIn("a timeout or a limit", section)
+
+    def test_a_timed_out_brief_reads_as_before(self):
+        plain = render_brief(REPO, self.ISSUE, "codex", resume="loom/9-t-timedout-1")
+        kept = render_brief(REPO, self.ISSUE, "codex", resume=tickets.KeptBranch("loom/9-t-timedout-1"))
+        self.assertEqual(plain, kept)
+        self.assertIn("ended (a timeout or a limit) after editing, and the runner kept its edits on "
+                      "branch loom/9-t-timedout-1.", plain)

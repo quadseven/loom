@@ -4488,8 +4488,12 @@ update_fix_branch() {
   return 0
 }
 
-# An earlier attempt that timed out or hit a limit after editing kept its
-# edits on a side branch, which the brief's Earlier attempt section names. The agent cannot
+# An earlier attempt that timed out or hit a limit after editing, or was
+# parked on a red final check (preserve_unvalidated), kept its edits on a
+# side branch, which the brief's Earlier attempt section names. A timed-out
+# branch leaves out files outside the brief's paths (drop_stray_from_kept);
+# an -unvalidated- one holds none, since a commit with any is refused before
+# the final check runs. The agent cannot
 # fetch it: the sandbox keeps .git read-only, and two codex runs on one ticket
 # started over and ended with no commit (2026-10-21). So the runner merges it
 # into the tree before the agent starts, on a first build and on a fix round
@@ -4504,7 +4508,7 @@ resume_earlier_attempt() {
   # ticket body above it is the author's text, never a branch to merge.
   # The newest kept branch wins: a drained run (keep_drained_run) appends its
   # own after the station's, built on a tree that already merged the older one.
-  side="$(section 'Earlier attempt' "$BRIEF" | grep -oE 'kept its edits on branch [A-Za-z0-9._/-]+-timedout-[0-9]+' | tail -n 1 | awk '{print $NF}')"
+  side="$(section 'Earlier attempt' "$BRIEF" | grep -oE 'kept its edits on branch [A-Za-z0-9._/-]+-(timedout|unvalidated)-[0-9]+' | tail -n 1 | awk '{print $NF}')"
   [ -n "$side" ] || return 0
   if [ -n "$CONFLICTS" ]; then
     echo "[$(date -u +%FT%TZ)] $TICKET: could not merge the earlier attempt's branch $side while the default branch merge conflicts; the agent starts without it" >> "$LOG"

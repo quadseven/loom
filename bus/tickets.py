@@ -15,7 +15,7 @@ import json
 import re
 import time
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 from . import answer, human_claims, proof, status
 from .stale_claims import outside_hold
@@ -692,6 +692,72 @@ def timedout_branch(texts: List[str]) -> Optional[str]:
     return found
 
 
+# Where a run that timed out, or was parked on a red final check
+# (lanes/run_lane.sh preserve_unvalidated), left its edits. A red check's
+# reason names the failing tests in a "(failing: a, b, and N more)" part;
+# each name is data from a check's output, so only a plain test identifier
+# is kept, at most FAILING_MAX of them.
+KEPT_RE = re.compile(r"the edits are on branch ([A-Za-z0-9._/-]+-(?:timedout|unvalidated)-[0-9]+)")
+FAILING_RE = re.compile(r"\(failing: ([^()]*)\)")
+TEST_NAME_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.:/\[\]-]{0,199}")
+FAILING_MAX = 10
+PULL_OPENED_RE = re.compile(r"\bLane \S+ opened a pull request: ")
+
+
+class KeptBranch(NamedTuple):
+    """A side branch an earlier attempt kept its edits on, and the failing
+    tests its red final check named."""
+    branch: str
+    failing: Tuple[str, ...] = ()
+
+    @property
+    def unvalidated(self) -> bool:
+        return bool(re.search(r"-unvalidated-[0-9]+$", self.branch))
+
+
+def _failing_tests(text: str) -> Tuple[str, ...]:
+    match = FAILING_RE.search(text)
+    if not match:
+        return ()
+    names = [n.strip() for n in match.group(1).split(",")]
+    return tuple([n for n in names if TEST_NAME_RE.fullmatch(n)][:FAILING_MAX])
+
+
+def kept_branch(texts: List[str]) -> Optional[KeptBranch]:
+    """The newest kept branch of either kind any of `texts` (oldest first)
+    names. An -unvalidated- branch is not offered once a later text says a
+    lane opened a pull request: that attempt's work went on from there."""
+    found = None
+    for text in texts:
+        match = KEPT_RE.search(text)
+        if match:
+            found = KeptBranch(match.group(1))
+            if found.unvalidated:
+                found = found._replace(failing=_failing_tests(text[:match.start()]))
+        elif found and found.unvalidated and PULL_OPENED_RE.search(text):
+            found = None
+    return found
+
+
+def _earlier_attempt(kept: KeptBranch) -> str:
+    """The brief's "## Earlier attempt" section. lanes/run_lane.sh
+    (resume_earlier_attempt) merges the branch it finds after "kept its
+    edits on branch", so every form keeps those words."""
+    merge = ("The runner merges them into this tree before you start (the sandbox keeps .git "
+             "read-only, so never fetch)")
+    if not kept.unvalidated:
+        return ("\n## Earlier attempt\n\nAn earlier attempt ended (a timeout or a limit) after "
+                "editing, and the runner kept its edits on branch %s. %s: check what is there "
+                "and finish the ticket instead of starting over.\n" % (kept.branch, merge))
+    text = ("\n## Earlier attempt\n\nAn earlier attempt edited this ticket but its final check "
+            "failed, and the runner kept its edits on branch %s. %s.\n" % (kept.branch, merge))
+    if kept.failing:
+        text += "\nThe check named these failing tests:\n\n"
+        text += "".join("- `%s`\n" % name for name in kept.failing)
+    return text + ("\nFix what failed on top of those edits instead of starting over. Where an "
+                   "earlier edit is wrong, discard it and say so in the Intent summary.\n")
+
+
 # What a brief carries besides the ticket body (Station._claim): the newest
 # NOTES_MAX operator comments, each clipped to NOTE_CHARS, and up to
 # LINKED_MAX pull requests that reference the ticket. On one ticket the
@@ -852,7 +918,7 @@ def proof_checks(body: str) -> List[Tuple[str, str]]:
 def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
                   fix: Optional[Fix] = None,
                   ci_checks: Optional[List[Tuple[str, str]]] = None,
-                  has_contract: bool = True, resume: Optional[str] = None,
+                  has_contract: bool = True, resume: Optional[Union[str, KeptBranch]] = None,
                   notes: Sequence[Tuple[str, str, str]] = (),
                   linked: Sequence[str] = (), demoted_models: str = "",
                   claim: str = "", defaults: Sequence[str] = (), operator_review: bool = False) -> str:
@@ -910,10 +976,7 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
         text += "".join("> %s\n" % _CONTROL_RE.sub(" ", str(note)).replace("\n", " ")[:NOTE_CHARS]
                         for note in defaults)
     if resume:
-        text += ("\n## Earlier attempt\n\nAn earlier attempt ended (a timeout or a limit) after "
-                 "editing, and the runner kept its edits on branch %s. The runner merges them into this tree "
-                 "before you start (the sandbox keeps .git read-only, so never fetch): check "
-                 "what is there and finish the ticket instead of starting over.\n" % resume)
+        text += _earlier_attempt(resume if isinstance(resume, KeptBranch) else KeptBranch(resume))
     if fix:
         text += ("\n## Fix\n\nThis ticket already has pull request #%d on branch %s. "
                  "Fix what is listed below on that branch: change only what the findings "

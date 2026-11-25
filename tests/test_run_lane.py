@@ -3950,6 +3950,27 @@ exec /usr/bin/git "$@"
         self.assertIn("agent-saw-earlier", self.calls())
         self.assertIn("merged the earlier attempt's branch %s" % side, self.lane_log())
 
+    def test_an_earlier_red_check_attempts_edits_are_in_the_tree_before_the_agent(self):
+        # A run parked on a red final check keeps its edits on an
+        # -unvalidated- branch; the next attempt fixes them, not starts over.
+        side = "loom/T042-fix-the-thing-unvalidated-1792595837"
+        work = Path(self._tmp.name) / "side-work"
+        git("clone", "-q", str(self.remote), str(work))
+        git("checkout", "-q", "-b", side, cwd=work)
+        (work / "earlier.txt").write_text("from the red-check run\n")
+        git("add", "earlier.txt", cwd=work)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "WIP", cwd=work)
+        git("push", "-q", "origin", side, cwd=work)
+        self.drop_brief(text=BRIEF + "\n## Earlier attempt\n\nAn earlier attempt edited this ticket but "
+                        "its final check failed, and the runner kept its edits on branch %s.\n" % side)
+        self.write_tool(self.bin / "codex", FAKE_AGENT.replace(
+            "cat > /dev/null\n",
+            "cat > /dev/null\n[ -f earlier.txt ] && echo agent-saw-earlier >> \"$FAKE_LOG\"\n", 1))
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("agent-saw-earlier", self.calls())
+        self.assertIn("merged the earlier attempt's branch %s" % side, self.lane_log())
+
     def test_a_branch_named_in_the_ticket_body_is_not_merged_as_an_earlier_attempt(self):
         # The station writes the ticket body above its own "## Earlier
         # attempt" section, so the sentence in the body is the author's text,

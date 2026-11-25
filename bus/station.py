@@ -3054,7 +3054,7 @@ class Station:
         name = tickets.ticket_name(repo, number, attempt)
         has_contract, checks = self._validation_checks(repo)
         text = tickets.render_brief(repo, issue, lane, attempt, fix, checks, has_contract,
-                                    self._timedout_branch(comments),
+                                    self._earlier_branch(repo, comments, fix),
                                     notes=tickets.operator_notes(
                                         comments, list(self.s.authors) + list(self.s.briefers)
                                         + list(self.s.owners)),
@@ -3119,18 +3119,57 @@ class Station:
         return tickets.linked_pulls(self.gh.rest(
             "GET", "/repos/%s/issues/%d/timeline?per_page=100" % (repo, number)).data)
 
+    def _earlier_branch(self, repo: str, comments: List[Any],
+                        fix: Optional[tickets.Fix]) -> Optional[tickets.KeptBranch]:
+        """The side branch the brief's "Earlier attempt" section names: the
+        newest kept branch, timed out or parked on a red final check
+        (tickets.kept_branch). A fix brief resumes only a timed-out branch,
+        as before. An -unvalidated- branch is offered only while it holds
+        commits the default branch lacks: a run with no commit names one
+        that holds only the base."""
+        if fix is not None:
+            side = self._timedout_branch(comments)
+            return tickets.KeptBranch(side) if side else None
+        texts = self._factory_texts(comments)
+        kept = tickets.kept_branch(texts) if texts is not None else None
+        if kept and kept.unvalidated and not self._side_has_edits(repo, kept.branch):
+            return None
+        return kept
+
+    def _side_has_edits(self, repo: str, branch: str) -> bool:
+        """The side branch exists and is ahead of the default branch (the
+        compare API). An unreadable answer offers nothing: the next attempt
+        starts from the base, as it did before."""
+        base = self._default_branch(repo)
+        if not base:
+            return False
+        try:
+            resp = self.gh.rest("GET", "/repos/%s/compare/%s...%s" % (repo, base, branch), ok=(404,))
+        except GitHubError as err:
+            _say("could not compare %s with %s in %s: %s" % (branch, base, repo, err))
+            return False
+        data = resp.data if resp.status != 404 and isinstance(resp.data, dict) else {}
+        ahead = data.get("ahead_by")
+        return isinstance(ahead, int) and ahead > 0
+
     def _timedout_branch(self, comments: List[Any]) -> Optional[str]:
         """The side branch a timed-out attempt kept its edits on, as the
         factory's own status events name it; None when none did."""
+        texts = self._factory_texts(comments)
+        return tickets.timedout_branch(texts) if texts is not None else None
+
+    def _factory_texts(self, comments: List[Any]) -> Optional[List[str]]:
+        """The bodies of the factory's own comments and status events,
+        oldest first; None, said, when they cannot be read."""
         allowed = {a.lower() for a in self.s.authors}
         # The imported status module expands the factory's event comments.
         expanded = status.expand(comments, self.s.authors)
         if not isinstance(expanded, list):
-            _say("could not find timed-out branch: expanded issue comments are not a list")
+            _say("could not find a kept branch (a timed-out branch or an unvalidated one): "
+                 "expanded issue comments are not a list")
             return None
-        return tickets.timedout_branch(
-            [str(c.get("body") or "") for c in expanded
-             if isinstance(c, dict) and tickets._login(c.get("user")).lower() in allowed])
+        return [str(c.get("body") or "") for c in expanded
+                if isinstance(c, dict) and tickets._login(c.get("user")).lower() in allowed]
 
     def _fix_refusal(self, fix: Optional[tickets.Fix]) -> Optional[str]:
         """Why a fix brief cannot go out yet, or None when it can (no fix, or
