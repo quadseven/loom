@@ -3812,7 +3812,12 @@ contract_autoformat() {
     paths+=("$path")
   done < <(safe_git diff --name-only -z --diff-filter=d "$BASE" HEAD 2>> "$LOG")
   [ "${#paths[@]}" -gt 0 ] || return 0
-  before="$(safe_git ls-files --others --exclude-standard 2>> "$LOG")"
+  # An untracked file has no copy to restore from, so a formatter that
+  # touched one could not be undone: run only on a tree without any (what
+  # setup leaves is in .git/info/exclude, so it does not count).
+  before="$(safe_git ls-files --others --exclude-standard 2>> "$LOG")" ||
+    { echo "autoformat: skipped, could not list untracked files" >> "$LOG"; return 0; }
+  [ -z "$before" ] || { echo "autoformat: skipped, the tree has untracked files" >> "$LOG"; return 0; }
   cmd="$C_AUTOFORMAT"
   for path in "${paths[@]}"; do
     printf -v q '%q' "$path"
@@ -3826,12 +3831,12 @@ contract_autoformat() {
   if [ "$rc" -eq 0 ] && [ "$batch" -gt 0 ]; then contract_run "$cmd"; rc=$?; fi
   [ "$rc" -ne 0 ] || safe_git add -- "${paths[@]}" >> "$LOG" 2>&1 || rc=$?
   # Restore what is not kept: every tracked edit not staged above, and every
-  # untracked file the formatter left that was not there before it ran.
+  # untracked file the formatter left (there was none before it ran).
   [ "$rc" -eq 0 ] || safe_git reset -q >> "$LOG" 2>&1
   safe_git checkout -q -- . >> "$LOG" 2>&1
   after="$(safe_git ls-files --others --exclude-standard 2>> "$LOG")"
   while IFS= read -r path; do
-    if [ -n "$path" ] && ! grep -Fxq -- "$path" <<< "$before"; then rm -f -- "$TREE/$path"; fi
+    [ -z "$path" ] || rm -f -- "$TREE/$path"
   done <<< "$after"
   if [ "$rc" -ne 0 ]; then
     echo "autoformat: the formatter exited $rc; files restored, run goes on unformatted" >> "$LOG"
