@@ -123,9 +123,10 @@ class BrainTickTest(unittest.TestCase):
         self.root = self.tmp / "root"
         (self.root / "lanes" / "mac").mkdir(parents=True)
         shutil.copy(SCRIPT, self.root / "lanes" / "mac" / "brain.sh")
-        for shared in ("agent_cli.sh", "agent_sandbox.sh"):
+        for shared in ("agent_cli.sh", "agent_sandbox.sh", "github_auth.sh", "fleet-token"):
             if (LANES / shared).exists():
                 shutil.copy(LANES / shared, self.root / "lanes" / shared)
+        shutil.copytree(LANES / "github-bin", self.root / "lanes" / "github-bin")
         (self.root / "docs").mkdir()
         (self.root / "docs" / "MUSE.md").write_text("# Muse tick instructions\n")
         git("init", "-q", "-b", "main", cwd=self.root)
@@ -156,6 +157,9 @@ class BrainTickTest(unittest.TestCase):
             # No other brain's slot bounds these ticks; the slot tests below
             # set their own (loom#2469).
             "LOOM_BRAIN_YIELD_AT": "",
+            # The Brain App (loom#3083): every tick mints its token.
+            "LOOM_GITHUB_APP_ID": "123",
+            "FAKE_APP_TOKEN": "ghs_brain.tok-en",
         }
         # The claude lane's runner says it has usage, as on the lane machine.
         self.usage("claude", True)
@@ -367,8 +371,9 @@ class BrainTickTest(unittest.TestCase):
     def test_a_held_lock_skips_the_tick_before_any_model_call(self):
         run, calls = self.tick(FAKE_LOCK="1")
         self.assertEqual(0, run.returncode)
-        self.assertEqual(2, len(calls))
-        self.assertIn("-m bus lock example/loom --holder lane-machine --minutes 45", calls[0])
+        self.assertEqual(["python3 -m bus app token"], calls[:1])
+        self.assertEqual(3, len(calls))
+        self.assertIn("-m bus lock example/loom --holder lane-machine --minutes 45", calls[1])
         self.assertFalse(any(c.startswith("claude") for c in calls))
 
     # loom#2606: a stand-down for a peer's lock leaves its yield on that
@@ -416,9 +421,10 @@ class BrainTickTest(unittest.TestCase):
     def test_a_tick_runs_the_agent_in_a_fresh_checkout_then_unlocks(self):
         run, calls = self.tick()
         self.assertEqual(0, run.returncode)
-        self.assertIn("-m bus lock", calls[0])
+        self.assertEqual("python3 -m bus app token", calls[0])
+        self.assertIn("-m bus lock", calls[1])
         self.assertEqual("python3 -m bus.brain step lock --holder lane-machine "
-                         "--lock-repo example/loom --tick-minutes 40", calls[1])
+                         "--lock-repo example/loom --tick-minutes 40", calls[2])
         claude = [c for c in calls if c.startswith("claude ")]
         self.assertEqual(1, len(claude))
         self.assertIn("--model claude-opus-5-5", claude[0])
@@ -679,9 +685,9 @@ class BrainTickTest(unittest.TestCase):
         opencode = self.agent_calls(calls, "opencode")
         self.assertTrue(opencode[0].startswith("opencode run -m spark/coder "), opencode)
         self.assertIn("%s/brain/loom/docs/MUSE.md" % self.home, opencode[0])
-        # The token reaches the agent's environment, never its argv.
-        self.assertNotIn("gho_faketoken123", opencode[0])
-        self.assertIn("opencode env GH_TOKEN=gho_faketoken123 GITHUB_TOKEN=gho_faketoken123 "
+        # The App token reaches the agent's environment, never its argv.
+        self.assertNotIn("ghs_brain.tok-en", opencode[0])
+        self.assertIn("opencode env GH_TOKEN=ghs_brain.tok-en GITHUB_TOKEN=ghs_brain.tok-en "
                       "LOOM_REPOS=example/project HOME=%s/run/brain-home" % self.home, calls)
         last, _ = self.beat()
         self.assertEqual(("ok", "spark", "spark/coder"), (last["outcome"], last["lane"], last["model"]))
@@ -710,15 +716,34 @@ class BrainTickTest(unittest.TestCase):
                              FAKE_APP_LOGIN="loom-brain[bot]")
         self.assertIn("opencode login loom-brain[bot]", calls)
 
-    def test_a_tick_whose_app_token_cannot_be_minted_runs_no_rung(self):
+    def test_a_tick_whose_app_token_cannot_be_minted_calls_no_github(self):
+        # loom#3083: a tick with no App token takes no lock and runs no rung,
+        # so nothing reaches GitHub as anyone, a stored login least of all.
         self.usage("codex", True)
-        run, calls = self.tick(LOOM_BRAIN_LADDER="codex claude", LOOM_GITHUB_APP_ID="123",
-                               GITHUB_TOKEN="ghp_personal")
-        self.assertEqual([], self.agent_calls(calls, "codex") + self.agent_calls(calls, "claude"))
-        self.assertTrue(any(" unlock " in c for c in calls), calls)
-        last, ok = self.beat()
-        self.assertEqual("failed", last["outcome"])
-        self.assertFalse(ok)
+        for name, env in (("mint fails", dict(FAKE_APP_TOKEN="", GITHUB_TOKEN="ghp_personal")),
+                          ("no App", dict(LOOM_GITHUB_APP_ID="")),
+                          ("not an App token", dict(FAKE_APP_TOKEN="gho_personal"))):
+            with self.subTest(name):
+                self.log.write_text("")
+                run, calls = self.tick(LOOM_BRAIN_LADDER="codex claude", **env)
+                self.assertNotEqual(0, run.returncode)
+                self.assertEqual([], [c for c in calls if c != "python3 -m bus app token"])
+                last, ok = self.beat()
+                self.assertEqual("failed", last["outcome"])
+                self.assertFalse(ok)
+
+    def test_a_tick_with_an_ambient_gh_token_stops_before_github(self):
+        run, calls = self.tick(GH_TOKEN="gho_personal")
+        self.assertNotEqual(0, run.returncode)
+        self.assertEqual([], calls)
+        self.assertIn("ambient GH_TOKEN", run.stderr)
+        self.assertEqual("failed", self.beat()[0]["outcome"])
+
+    def test_every_rung_reaches_gh_through_the_wrapper(self):
+        _, calls = self.tick()
+        guard = self.home / "run" / "brain-bin" / "gh"
+        self.assertIn("gh-path-claude %s" % guard, calls)
+        self.assertIn(str(self.root / "lanes" / "github-bin" / "gh"), guard.read_text())
 
     def test_a_tick_longer_than_its_app_token_lasts_runs_no_rung(self):
         # An installation token lasts an hour; a 58-minute tick would outlive it.
@@ -745,7 +770,7 @@ class BrainTickTest(unittest.TestCase):
         self.assertIn("opencode setting LOOM_ASK_ANSWERERS=example-answerer", settings)
         self.assertIn("opencode setting LOOM_REPOS=example/project", settings)
         self.assertIn("opencode setting LOOM_BRIEF_AUTHORS=example-author", settings)
-        self.assertIn("opencode setting LOOM_GITHUB_TOKEN=gho_faketoken123", settings)
+        self.assertIn("opencode setting LOOM_GITHUB_TOKEN=ghs_brain.tok-en", settings)
         # TLS inside the sandbox, which denies the keychain server.
         self.assertIn("opencode setting SSL_CERT_FILE=/etc/ssl/cert.pem", settings)
         self.assertFalse(any("foo-secret-value" in c or "LOOM_FOO_TOKEN" in c for c in calls))
@@ -828,6 +853,13 @@ class BrainTickTest(unittest.TestCase):
         ledger = self.tmp / "ledger.jsonl"
         env = {k: v for k, v in self.env.items() if not k.startswith("LOOM_SHADOW")}
         env.update(PATH="%s:%s" % (real, self.env["PATH"]), LOOM_SHADOW_LEDGER=str(ledger))
+        # The guard hands on to the gh wrapper (loom#3083), which needs the
+        # tick's App token and its empty config directory.
+        self.assertIn(str(self.root / "lanes" / "github-bin" / "gh"), Path(guard).read_text())
+        config = self.tmp / "gh-config"
+        config.mkdir()
+        env.update(GH_TOKEN="ghs_brain.tok-en", GH_CONFIG_DIR=str(config),
+                   LOOM_REAL_GH=str(self.tmp / "bin" / "gh"))
 
         def gh(*args, **extra):
             run = subprocess.run([guard, *args], env={**env, **extra}, capture_output=True,
@@ -911,7 +943,7 @@ class BrainTickTest(unittest.TestCase):
     def test_settings_override_model_holder_and_minutes(self):
         _, calls = self.tick(LOOM_BRAIN_MODEL="claude-sonnet-5-5",
                              LOOM_BRAIN_HOLDER="night", LOOM_BRAIN_MINUTES="20")
-        self.assertIn("--holder night --minutes 25", calls[0])
+        self.assertIn("--holder night --minutes 25", calls[1])
         claude = [c for c in calls if c.startswith("claude ")][0]
         self.assertIn("--model claude-sonnet-5-5", claude)
         self.assertIn("stop within 15 minutes; you are cut off at 20", claude)

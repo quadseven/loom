@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Print this process's GitHub App installation token and nothing else
+# (loom#3083). The App is the one the LOOM_GITHUB_APP_* settings name; the
+# installer gives each job its own (lanes/mac/install.sh app_env). Every
+# failure exits 1 with empty stdout: no App named, a missing or empty
+# installation id or key, GitHub refusing the mint, or an answer that holds
+# no installation token. Arguments go to `python3 -m bus app token`.
+# LOOM_APP_TOKEN_CMD, when set, prints the token in place of that command.
+set -uo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit 1
+fail() { printf 'fleet-token: %s\n' "$*" >&2; exit 1; }
+
+[ -n "${LOOM_GITHUB_APP_ID:-}" ] || fail "LOOM_GITHUB_APP_ID names no GitHub App"
+if [ -n "${LOOM_APP_TOKEN_CMD:-}" ]; then
+  token="$("$LOOM_APP_TOKEN_CMD")" || fail "LOOM_APP_TOKEN_CMD minted no token"
+else
+  token="$(cd "$here/.." && python3 -m bus app token "$@")" || fail "GitHub minted no App token"
+fi
+# An installation token is ghs_ and a JWT-like body: letters, digits, _ . -
+[[ "$token" =~ ^ghs_[A-Za-z0-9_.-]+$ ]] || fail "the answer holds no installation token"
+printf '%s\n' "$token"

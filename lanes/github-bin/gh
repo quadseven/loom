@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# The gh every Loom process finds first on PATH (lanes/github_auth.sh,
+# loom#3083). It runs the real gh only with this process's App token and an
+# empty config directory, so gh has no stored login to fall back to, and it
+# refuses the commands that would store, switch or print a login.
+set -uo pipefail
+die() { printf 'gh (Loom): %s\n' "$*" >&2; exit 1; }
+
+previous=""
+for arg in "$@"; do
+  case "$previous:$arg" in
+    auth:login|auth:refresh|auth:setup-git|auth:switch|auth:token)
+      die "gh auth $arg is refused: Loom calls GitHub only with its App token" ;;
+  esac
+  previous="$arg"
+done
+
+[[ "${GH_TOKEN:-}" =~ ^ghs_[A-Za-z0-9_.-]+$ ]] || die "no GitHub App token; refusing to run gh"
+[ -n "${GH_CONFIG_DIR:-}" ] && [ -d "$GH_CONFIG_DIR" ] || die "GH_CONFIG_DIR names no config directory"
+[ -z "$(ls -A "$GH_CONFIG_DIR")" ] || die "GH_CONFIG_DIR holds a stored login; refusing to run gh"
+[ -n "${LOOM_REAL_GH:-}" ] && [ -x "$LOOM_REAL_GH" ] || die "the real gh is not installed"
+unset GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
+exec "$LOOM_REAL_GH" "$@"
