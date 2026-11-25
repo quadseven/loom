@@ -2465,7 +2465,12 @@ commit_msg() {
 #                               check, and a failure blocks the push the same
 #                               way. It runs the per-directory suites a repo's
 #                               path-scoped CI jobs run (loom#1773).
-# setup, check and affected run as shell commands, like the run: steps of a CI
+#   autoformat: <shell command> optional; runs once before the final check
+#                               with the lane's changed files appended, and
+#                               what it changes in them is committed as one
+#                               format: commit; a failure only skips it
+#                               (loom#3577, contract_autoformat).
+# setup, check, affected and autoformat run as shell commands, like the run: steps of a CI
 # workflow, so they are only ever read from the branch the pull request
 # merges into: the base revision of a new run, and the base branch (fetched
 # for it) of a fix run, whose own branch holds unmerged agent edits. Nothing
@@ -2473,11 +2478,11 @@ commit_msg() {
 # validated by the runner (its CI still is).
 CONTRACT_FILE=.loom/validation.conf
 # Read the key: value lines bus.contract printed into C_INTERP, C_SUBMODULES,
-# C_SETUP, C_CHECK and C_AFFECTED. Returns 1 with SETUP_REASON when a line, the check,
+# C_SETUP, C_CHECK, C_AFFECTED and C_AUTOFORMAT. Returns 1 with SETUP_REASON when a line, the check,
 # submodules, the interpreter or a command is unusable.
 parse_contract() {
   local canon="$1" line key val
-  C_INTERP="" C_SUBMODULES=no C_SETUP="" C_CHECK="" C_AFFECTED=""
+  C_INTERP="" C_SUBMODULES=no C_SETUP="" C_CHECK="" C_AFFECTED="" C_AUTOFORMAT=""
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in ''|'#'*) continue ;; esac
     key="${line%%:*}" val="${line#*:}"
@@ -2488,6 +2493,7 @@ parse_contract() {
       setup) C_SETUP="$val" ;;
       check) C_CHECK="$val" ;;
       affected) C_AFFECTED="$val" ;;
+      autoformat) C_AUTOFORMAT="$val" ;;
       *) SETUP_REASON="$CONTRACT_FILE has an unknown line '${line:0:40}'"; return 1 ;;
     esac
   done <<< "$canon"
@@ -2501,6 +2507,8 @@ parse_contract() {
   done
   contract_command_ok "$C_AFFECTED" ||
     { SETUP_REASON="$CONTRACT_FILE affected: must be printable ASCII, at most 1000 characters"; return 1; }
+  contract_command_ok "$C_AUTOFORMAT" ||
+    { SETUP_REASON="$CONTRACT_FILE autoformat: must be printable ASCII, at most 1000 characters"; return 1; }
 }
 
 # Read .loom/validation.conf from the already-fetched base branch when possible.
@@ -2522,7 +2530,7 @@ load_contract() {
   # A brief need not name a base, and the lane's clone has no origin/HEAD, so
   # a fix round falls back to the default branch update_fix_branch fetched.
   local rev="$BASE" mode canon base_ref="${BASE_BRANCH:-${FIX_DEFAULT:-HEAD}}"
-  HAS_CONTRACT="" C_INTERP="" C_SUBMODULES=no C_SETUP="" C_CHECK="" C_AFFECTED=""
+  HAS_CONTRACT="" C_INTERP="" C_SUBMODULES=no C_SETUP="" C_CHECK="" C_AFFECTED="" C_AUTOFORMAT=""
   if [ -n "$FIX_PR" ]; then
     if ! rev="$(safe_git rev-parse --verify -q "origin/$base_ref^{commit}")"; then
       if ! { fetch_base_for_contract &&
@@ -3772,6 +3780,74 @@ format_changed_files() {
   return 0
 }
 
+# The contract's autoformat command (loom#3577), once, after the scope and
+# contract checks and before the final check, host or remote: a remote check
+# keeps no log a lane could format from, so a format-only defect was thrown
+# away there. The command gets the files the lane's own commits changed that
+# still exist, shell-quoted, in batches that keep each command within
+# contract_command_ok's bound, through contract_run (the check's sandbox).
+# Edits to those files become one format: commit; anything else it touched is
+# restored. A formatter that fails, is missing or times out restores the tree
+# and the run goes on unformatted. C_AUTOFORMAT is the base's (load_contract),
+# and a run that changed the contract file is skipped, so a run never names
+# its own formatter. Always returns 0.
+contract_autoformat() {
+  local range path q cmd batch=0 rc=0 n before after pr="" changed=""
+  local -a paths=()
+  [ -n "${C_AUTOFORMAT:-}" ] || return 0
+  range="$BASE..HEAD"
+  [ -z "${FIX_UPSTREAM:-}" ] || range="$FIX_UPSTREAM...HEAD"
+  changed="$(safe_git diff --name-only "$range" -- "$CONTRACT_FILE" 2>> "$LOG")" ||
+    { echo "autoformat: skipped, could not read the lane's changes" >> "$LOG"; return 0; }
+  [ -z "$changed" ] || { echo "autoformat: skipped, the run changed $CONTRACT_FILE" >> "$LOG"; return 0; }
+  [ -z "$(tracked_changes)" ] || { echo "autoformat: skipped, the tree has uncommitted changes" >> "$LOG"; return 0; }
+  # This round's own commits, within what the pull request changes (a fix
+  # round's merge of the default branch brings files that are not its own).
+  pr="$(lane_changed_files 2>> "$LOG")" ||
+    { echo "autoformat: skipped, could not read the lane's changes" >> "$LOG"; return 0; }
+  while IFS= read -r -d '' path; do
+    case "$path" in *$'\n'*) continue ;; esac
+    grep -Fxq -- "$path" <<< "$pr" || continue
+    [ -f "$TREE/$path" ] && [ ! -L "$TREE/$path" ] || continue
+    paths+=("$path")
+  done < <(safe_git diff --name-only -z --diff-filter=d "$BASE" HEAD 2>> "$LOG")
+  [ "${#paths[@]}" -gt 0 ] || return 0
+  before="$(safe_git ls-files --others --exclude-standard 2>> "$LOG")"
+  cmd="$C_AUTOFORMAT"
+  for path in "${paths[@]}"; do
+    printf -v q '%q' "$path"
+    if [ "$batch" -gt 0 ] && [ $((${#cmd} + 1 + ${#q})) -gt 1000 ]; then
+      contract_run "$cmd"; rc=$?
+      [ "$rc" -eq 0 ] || break
+      cmd="$C_AUTOFORMAT" batch=0
+    fi
+    cmd="$cmd $q" batch=$((batch + 1))
+  done
+  if [ "$rc" -eq 0 ] && [ "$batch" -gt 0 ]; then contract_run "$cmd"; rc=$?; fi
+  [ "$rc" -ne 0 ] || safe_git add -- "${paths[@]}" >> "$LOG" 2>&1 || rc=$?
+  # Restore what is not kept: every tracked edit not staged above, and every
+  # untracked file the formatter left that was not there before it ran.
+  [ "$rc" -eq 0 ] || safe_git reset -q >> "$LOG" 2>&1
+  safe_git checkout -q -- . >> "$LOG" 2>&1
+  after="$(safe_git ls-files --others --exclude-standard 2>> "$LOG")"
+  while IFS= read -r path; do
+    [ -z "$path" ] || grep -Fxq -- "$path" <<< "$before" || rm -f -- "$TREE/$path"
+  done <<< "$after"
+  if [ "$rc" -ne 0 ]; then
+    echo "autoformat: the formatter exited $rc; files restored, run goes on unformatted" >> "$LOG"
+    return 0
+  fi
+  safe_git diff --cached --quiet && { echo "autoformat: nothing to format" >> "$LOG"; return 0; }
+  n="$(safe_git diff --cached --name-only | wc -l | tr -d ' ')"
+  if ! safe_git commit -qm "$(commit_msg "format: apply the contract's autoformat command to the lane's changed files")" >> "$LOG" 2>&1; then
+    { safe_git reset -q; safe_git checkout -q -- .; } >> "$LOG" 2>&1
+    echo "autoformat: could not commit the formatted files; files restored, run goes on unformatted" >> "$LOG"
+    return 0
+  fi
+  echo "autoformat: formatted $n of the lane's changed files" >> "$LOG"
+  return 0
+}
+
 # One more agent turn in the same run, after the base-test gate refused: the
 # brief names each test that passed on base and asks for a change that makes it
 # fail there. Whatever the turn changed is committed on the lane branch.
@@ -4128,7 +4204,7 @@ run_committed_contract() {
 check_contract_change() {
   local range="$BASE..HEAD" touched mode canon rc=0
   local b_interp="$C_INTERP" b_subs="$C_SUBMODULES" b_setup="$C_SETUP" b_check="$C_CHECK" b_cli="${CHECK_CLI:-}"
-  local b_affected="${C_AFFECTED:-}"
+  local b_affected="${C_AFFECTED:-}" b_autoformat="${C_AUTOFORMAT:-}"
   CONTRACT_REFUSAL=""
   [ -z "$FIX_UPSTREAM" ] || range="$FIX_UPSTREAM...HEAD"
   touched="$(safe_git diff --name-only "$range" -- "$CONTRACT_FILE" 2>> "$LOG")" ||
@@ -4148,7 +4224,7 @@ check_contract_change() {
     run_committed_contract "$b_setup" || rc=$?
   fi
   C_INTERP="$b_interp" C_SUBMODULES="$b_subs" C_SETUP="$b_setup" C_CHECK="$b_check" CHECK_CLI="$b_cli"
-  C_AFFECTED="$b_affected"
+  C_AFFECTED="$b_affected" C_AUTOFORMAT="$b_autoformat"
   [ -n "$HAS_CONTRACT" ] || drop_check_home
   return "$rc"
 }
@@ -5686,6 +5762,11 @@ for BRIEF in "$INBOX"/*.md; do
       1) park "$BRIEF" "commit refused: $CONTRACT_REFUSAL; nothing pushed"; continue ;;
       *) park "$BRIEF" "could not check the committed validation contract: $CONTRACT_REFUSAL" transient; continue ;;
     esac
+  fi
+  # The base contract's formatter on the lane's own files, before the final
+  # check reads them (loom#3577). It never parks the run.
+  if [ -n "$HAS_CONTRACT" ] && [ "$COMMITTED" -eq 1 ]; then
+    contract_autoformat
   fi
   # An agent's exit code is not evidence: only a passing check on the
   # committed head hands the work on.
