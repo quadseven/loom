@@ -11048,7 +11048,9 @@ class Station:
             _say("step tend_signin paused (LOOM_PAUSED_STEPS)")
             return
         try:
-            self._timed(self.tend_signin)
+            self.tend_signin()
+        except TargetReached as err:
+            _say("step tend_signin carried over to the next pass: %s" % err)
         except RateLimited:
             raise
         except (GitHubError, OSError, ValueError) as err:
