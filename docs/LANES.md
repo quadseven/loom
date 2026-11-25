@@ -171,7 +171,10 @@ unset variables.
   Before running a Codex agent, the lane reruns green checks that populated
   uv's scratch cache so the agent has packages for offline tests.
   Setup still runs for each brief, and the final check on the agent's commit
-  is never cached. Verdicts live under the host's `state/base-verdicts/`;
+  is never cached. A new run whose agent commits nothing runs no final
+  check: its tree is the base the base check covered, so it goes straight
+  to its no-commit outcome and holds no check slot. Verdicts live under
+  the host's `state/base-verdicts/`;
   each write sweeps the ones older than a day.
 - A passing base check closes the repo's open base-check and contract
   incidents from any lane host. The host keeps one file per incident under
