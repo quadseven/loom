@@ -1650,7 +1650,7 @@ VERIFY_DUE_HEADING = "### Verify due"
 VERIFY_RESUME_MAX = 5
 VERIFY_DUTY_AFTER = timedelta(hours=23)
 EVIDENCE_URL_ENV = "LOOM_EVIDENCE_URL"
-EVIDENCE_TOKEN_ENV = "LOOM_EVIDENCE_TOKEN"
+EVIDENCE_TOKEN_ENV = "LOOM_EVIDENCE_TOKEN"  # noqa: S105 -- env var name, not a credential
 _VERIFY_EVIDENCE_RE = re.compile(r"\b(?:logs?|station\.log|sql:)\b", re.I)
 _VERIFY_STEP_WINDOW_RE = re.compile(
     r"\bstep\s+[\w.-]+\b.*\b(?:every|within|during|over)\s+\d+\s*-?\s*"
