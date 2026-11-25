@@ -653,6 +653,7 @@ def git(*args, cwd=None):
 class LaneRunnerTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
+        self._stations = []
         root = Path(self._tmp.name)
         self.home = root / "home"
         self.loom = self.home / "loom"
@@ -760,6 +761,12 @@ print('leak guard: clean (shape patterns only)')
         self.scanner.chmod(0o755)
 
     def tearDown(self):
+        # A fake station thread writes inside the temp dir; stop it and wait
+        # for it before the dir is removed (cleanups run after tearDown).
+        for stop, thread in self._stations:
+            stop.set()
+            thread.join(10)
+            self.assertFalse(thread.is_alive(), "the fake station thread did not stop")
         self._tmp.cleanup()
 
     @staticmethod
@@ -9125,8 +9132,7 @@ echo fixed > fix.txt
 
         thread = threading.Thread(target=run, daemon=True)
         thread.start()
-        self.addCleanup(thread.join, 5)
-        self.addCleanup(stop.set)
+        self._stations.append((stop, thread))
         dispatched.said = said
         return stop, dispatched
 
