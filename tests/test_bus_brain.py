@@ -759,6 +759,35 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertEqual(brain._waiting_brain_lines([plain], pr_of, {"prs": {}}, now, "bot"),
                          ["### Waiting on the brain", "- none"])
 
+    def test_waiting_brain_blocks_a_non_loom_head_from_an_untrusted_author(self):
+        now = datetime(2030, 1, 1, 5, 0, 0, tzinfo=timezone.utc)
+        ticket = {"number": 7, "title": "Worker", "created_at": "2020-01-01T00:00:00Z",
+                  "labels": [{"name": "loom:ticket"}, {"name": "needs-brain"}]}
+        pr = {"number": 5, "title": "Wall chat", "created_at": "2030-01-01T00:00:00Z",
+              "head": {"ref": "worker/7-classhunt-no-issue-refs"},
+              "body": "Refs #7\n",
+              "user": {"login": "app/agent-anthropic-claude-code"}}
+        pr_of = {7: pr}
+        data = {"prs": {5: ready_node()}}
+        lines = brain._waiting_brain_lines([ticket], pr_of, data, now, "bot", REPO, authors=())
+        self.assertEqual(lines[0], "### Waiting on the brain")
+        self.assertIn("blocked: pull request head is not a loom branch", lines[1])
+        self.assertNotIn("READY", lines[1])
+
+    def test_waiting_brain_ready_for_a_loom_head(self):
+        now = datetime(2030, 1, 1, 5, 0, 0, tzinfo=timezone.utc)
+        ticket = {"number": 7, "title": "Worker", "created_at": "2020-01-01T00:00:00Z",
+                  "labels": [{"name": "loom:ticket"}, {"name": "needs-brain"}]}
+        pr = {"number": 5, "title": "Wall chat", "created_at": "2030-01-01T00:00:00Z",
+              "head": {"ref": "loom/7-work"},
+              "body": "Refs #7\n",
+              "user": {"login": "app/agent-anthropic-claude-code"}}
+        pr_of = {7: pr}
+        data = {"prs": {5: ready_node()}}
+        lines = brain._waiting_brain_lines([ticket], pr_of, data, now, "bot", REPO, authors=())
+        self.assertEqual(lines[0], "### Waiting on the brain")
+        self.assertIn("READY", lines[1])
+
     def test_sensitive_pr_lines_helper(self):
         sensitive_pr = {"number": 4, "title": "Sensitive", "labels": [{"name": "class:sensitive"}]}
         ordinary_pr = {"number": 5, "title": "Ordinary", "labels": []}
