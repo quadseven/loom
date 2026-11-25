@@ -92,9 +92,11 @@ agent_cli() {
         # print mode cannot answer a permission prompt: the CLI denied every
         # Edit, Write and shell call, exited 0 and the run ended "agent made
         # no commit". acceptEdits plus the shell tool lets it edit and run
-        # the tests; the pod is the isolation.
-        CLAUDE_CODE_OAUTH_TOKEN="$(cat "$LOOM_CLAUDE_AUTH_FILE")" timeout "$AGENT_TIMEOUT" \
-          claude -p --model "$MODEL" --permission-mode acceptEdits --allowedTools Bash "$3" < /dev/null
+        # the tests; the pod is the isolation. --allowedTools takes a list,
+        # so the brief goes over stdin: written after it, the CLI read the
+        # brief as a tool name and exited with no prompt on every run.
+        printf '%s' "$3" | CLAUDE_CODE_OAUTH_TOKEN="$(cat "$LOOM_CLAUDE_AUTH_FILE")" timeout "$AGENT_TIMEOUT" \
+          claude -p --model "$MODEL" --permission-mode acceptEdits --allowedTools Bash
       else
         timeout "$AGENT_TIMEOUT" claude -p --model "$MODEL" "$3" < /dev/null
       fi ;;
