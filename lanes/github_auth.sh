@@ -66,9 +66,11 @@ github_auth_git_config() {
 }
 
 github_auth_mint() {
-  local token
+  local token bound=()
   unset GH_TOKEN
-  token="$(timeout "${LOOM_NET_TIMEOUT:-120}" "$LOOM_GITHUB_BIN/../fleet-token" "$@")" || return 1
+  # A host without coreutils' timeout still mints, unbounded.
+  if command -v timeout > /dev/null 2>&1; then bound=(timeout "${LOOM_NET_TIMEOUT:-120}"); fi
+  token="$("${bound[@]+"${bound[@]}"}" "$LOOM_GITHUB_BIN/../fleet-token" "$@")" || return 1
   export GH_TOKEN="$token"
 }
 
