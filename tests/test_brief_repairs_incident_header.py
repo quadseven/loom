@@ -56,6 +56,23 @@ class BriefRepairsIncidentHeaderTests(unittest.TestCase):
             self.assertIn("Repairs incident: #31\n",
                           self._filed(incident(repo="private repo 0a1b2c3d")))
 
+    def test_a_private_repos_incident_is_named_by_the_alias_its_id_derives(self):
+        # No alias file on this host: the alias every lane host derives from
+        # the repo id (loom#3573) still names the incident.
+        alias = incident_probe.repo_alias(4242)
+        with tempfile.TemporaryDirectory() as home:
+            fake = Fake(reply(200, {"private": True}), reply(200, goal()),
+                        reply(200, incident(repo="private repo %s" % alias)),
+                        reply(200, {"id": 4242, "private": True}), reply(200, []),
+                        reply(201, {"id": 202, "html_url": "https://example.com/t"}),
+                        reply(201, {}))
+            brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket",
+                        BODY + "\nRefs %s#31\n" % FACTORY, "codex", difficulty="medium",
+                        env={"LOOM_SELF_REPO": FACTORY, "LOOM_HOME": home})
+            body = next(c[2] for c in fake.calls
+                        if c[0] == "POST" and c[1].endswith("/issues"))["body"]
+            self.assertIn("Repairs incident: #31\n", body)
+
 
 if __name__ == "__main__":
     unittest.main()

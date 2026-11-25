@@ -180,7 +180,18 @@ unset variables.
   cluster runner or a second machine releases tickets an absent host filed.
   Environment incidents describe the machine that filed them and still close
   only from that machine's own file. A private repo's incident title carries
-  a per-host alias, so it still closes only from the host that filed it.
+  an alias derived from the repo's GitHub id (`bus/incident_probe.py`
+  `repo_alias`), the same on every host and in the station, so it closes
+  from any host too. A host that cannot read the id files under its own
+  per-host alias and says so in the lane log; a pass that finds no open
+  incident to close logs that as well (loom#3573).
+- The station releases holds from GitHub's labels as well as from its own
+  `factory_held.json`: a `loom:queued` + `wait:incident` ticket with no
+  ledger entry (a station that moved hosts left its ledger behind) goes back
+  to its lane once its repo has no open base-check or contract incident, the
+  incident its status names (if any) is closed, and the default branch's CI
+  is green. An operator claim keeps it held. The status file's Held tickets
+  section counts such tickets (loom#3573).
 - An open base-check incident holds every ticket of its repo, so no ticket
   run would ever check that repo again (loom#3084). While an incident holds
   tickets, the station gives one free local lane (never a cluster runner
