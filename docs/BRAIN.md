@@ -1760,9 +1760,11 @@ no-lane reasons and dropped when a lane takes it), and the factory acts on it:
   (`PIN_FALLBACK_MAX`): a fallback run that fails climbs the ladder as any
   failure does. The status comment says `Not a failure` with a
   `loom:pin-fallback <model>` marker, and the station log says `pin fallback
-  from model <model> after N minutes`. Hard pins wait instead: a ticket a
-  person opened (the operator wrote its `Model:` line), and one carrying
-  `class:sensitive` or `tier:security` (docs/BRIEF_FORMAT.md). No demotion is
+  from model <model> after N minutes`. Hard pins wait instead: a ticket
+  carrying `class:sensitive` or `tier:security` (docs/BRIEF_FORMAT.md). A
+  ticket a person account opened is no hard pin: agent sessions post as that
+  account (loom#3592). The clock is kept in the station's state store, so a
+  station restart does not reset it. No demotion is
   lifted and no credit spent: the fallback routes around both. On
   2026-11-17 one pass assigned 0 of 86 queued tickets, each pinned to a codex
   or anthropic model with no lane up, while about 30 other lanes sat idle.

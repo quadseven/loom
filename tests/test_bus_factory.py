@@ -5704,20 +5704,25 @@ class PinFallback(Base):
         self.assign(11 * 60, ["spark"], env={"LOOM_PIN_FALLBACK_MINUTES": "10"})
         self.assertEqual((self.lane(7), self.model(7)), ("spark", None))
 
-    def test_a_ticket_a_person_opened_keeps_its_pin(self):
-        # The operator wrote its Model: line: a hard pin.
+    def test_a_ticket_a_person_opened_falls_back_like_any_default_pin(self):
+        # loom#3592: agent sessions post as the person account, so its
+        # Model: line is a default; every lane may try every ticket (loom#3550).
         self.queued(7, user=ME)
-        worker = self.assign(3 * 3600, ["spark"])
-        self.assertEqual((factory._state(self.gh.issues[7]), self.model(7)),
-                         ("queued", "claude-sonnet-5-5"))
-        self.assertIn("%s#7" % REPO, worker.waits)
+        self.assertEqual(factory.hard_pin(self.gh.issues[7]), "")
+        worker = self.assign(31 * 60, ["spark"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7), self.model(7)),
+                         ("briefed", "spark", None))
+        self.assertIn(factory.PIN_FALLBACK_MARKER % "claude-sonnet-5-5", self.notes(7))
+        self.assertIn("%s#7" % REPO, worker.settled)
 
     def test_a_sensitive_or_security_ticket_keeps_its_pin(self):
-        for label in ("class:sensitive", "tier:security"):
-            self.queued(7, labels=(label,))
-            self.assign(3 * 3600, ["spark"])
-            self.assertEqual((factory._state(self.gh.issues[7]), self.model(7)),
-                             ("queued", "claude-sonnet-5-5"), label)
+        for user in (None, ME):
+            for label in ("class:sensitive", "tier:security"):
+                self.queued(7, user=user, labels=(label,))
+                self.assertEqual(factory.hard_pin(self.gh.issues[7]), "it carries %s" % label)
+                self.assign(3 * 3600, ["spark"])
+                self.assertEqual((factory._state(self.gh.issues[7]), self.model(7)),
+                                 ("queued", "claude-sonnet-5-5"), (user, label))
 
     def test_a_fallback_skips_a_lane_the_ticket_already_ran_on(self):
         self.queued(7)
