@@ -994,8 +994,8 @@ tuple `LANE_ORDER` in bus/factory.py):
   (the operator wants every free tier used up, 2026-10-19): one slot per
   free provider (`free-ollama`, `free-gemma`, `free-nvidia`, `free-kilo`,
   `free-groq`, `free-openrouter`) at its pinned route on the spark-gateway,
-  each waiting out its own provider's reset, then openrouter, workersai,
-  zen, zai and copilot; then the subscriptions: opencode-go and its slots,
+  each waiting out its own provider's reset, then openrouter, tinker,
+  workersai, zen, zai and copilot; then the subscriptions: opencode-go and its slots,
   codex, claude, agy, muse (muse runs remotely); then the never-paid
   anthropic slots last. free-ollama is Ollama Cloud and free-gemma is Gemma,
   both on any repo. These lanes take work on public repos only: zen, zai,

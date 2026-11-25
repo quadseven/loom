@@ -2562,6 +2562,29 @@ the request. Larger verify briefs stay eligible for other lanes. Cluster
 dispatch requires both provider parameter settings, and a successful cluster
 run refreshes the meter for its report.
 
+## tinker: the Tinker free tier
+
+- Tinker's OpenAI-compatible endpoint (`LOOM_TINKER_URL`, default Tinker's
+  `/oai/api/v1` base) through an opencode provider named `tinker`, with the key
+  named by `LOOM_TINKER_KEY_SSM`, handed to the agent as `TINKER_API_KEY`.
+- One model, `LOOM_TINKER_MODEL`, written `tinker/<id>`, for example
+  `tinker/thinkingmachines/Inkling-2-Mini:peft:65536:free`. Tinker serves an id
+  ending in `:free` at no charge, within a rate limit and only while a prepaid
+  account's balance is positive; every other id is billed against that balance.
+- Fail closed (`tinker_free_model` in lanes/agent_sandbox.sh): the lane does not
+  start, and its heartbeat says `REFUSED`, when `LOOM_TINKER_MODEL` is unset or
+  does not end in `:free`, when `LOOM_TINKER_MODELS` is set, or when the URL is
+  not https. A brief's `Model:` line is ignored: the lane runs its own model.
+  `opencode_config` checks the id again before every opencode run, so no other
+  id reaches the network.
+- An HTTP 429 or "too many requests" rests the lane for `LIMIT_WAIT` (an hour);
+  an HTTP 402 or "insufficient balance" rests it a day. Either is the usual
+  limit hold: the heartbeat is unavailable with a retry time, the brief is
+  parked as a limit and handed on, and the lane takes nothing until then.
+- A free lane (station `FREE_LANES`): public repos only, tried after openrouter
+  in `LANE_ORDER`. Its pull requests name lane `tinker`, so the scorecard counts
+  them on a row of their own.
+
 ## free provider slots on the spark-gateway
 
 Set `LOOM_FREE_GATEWAY_URL` to your gateway's origin. The six free slots use

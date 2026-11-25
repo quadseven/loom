@@ -3,6 +3,7 @@
 #
 #   run_lane.sh <lane>   lane = codex | claude | openrouter | opencode-go | anthropic
 #                               | zen | zai | workersai | agy | spark | copilot
+#                               | tinker
 #                               | <lane>-<n> (an extra slot of that lane)
 #
 # A slot such as anthropic-2 is a second copy of the anthropic lane: its own
@@ -1581,6 +1582,10 @@ LIMIT_MAX_HOLD=86400
 LIMIT_FILE="$LOOM_HOME/state/usage/$SLOT.limit"
 # A spark slot (spark-2) may name its own box: LOOM_SPARK_2_URL, else LOOM_SPARK_URL.
 SPARK_URL="$(lane_setting URL)"
+# The tinker lane's endpoint: LOOM_TINKER_URL, else Tinker's OpenAI-compatible
+# base URL. opencode_config (lanes/agent_sandbox.sh) declares the provider there.
+TINKER_URL=""
+[ "$LANE" = tinker ] && TINKER_URL="${SPARK_URL:-https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1}"
 SPARK_PROBE_TIMEOUT=15
 LIMITED=""
 LIMIT_RETRY_AFTER=""
@@ -4446,7 +4451,7 @@ trains_on_prompts() {
 
 # Lanes whose agent runs sandboxed in a fresh scratch home (api_agent).
 is_api_lane() {
-  case "$LANE" in openrouter|opencode-go|anthropic|zen|zai|workersai|spark|free|copilot) return 0 ;; esac
+  case "$LANE" in openrouter|opencode-go|anthropic|zen|zai|workersai|spark|free|copilot|tinker) return 0 ;; esac
   return 1
 }
 
@@ -4663,6 +4668,7 @@ Do not search the whole filesystem (for example, find /). Search within the chec
   case "$LANE" in
     codex|claude) agent_cli "$LANE" lane "$brief_text" ;;
     openrouter) opencode_agent_continuing OPENROUTER_API_KEY text "$brief_text" ;;
+    tinker) opencode_agent_continuing TINKER_API_KEY text "$brief_text" ;;
     opencode-go) opencode_agent_continuing OPENCODE_API_KEY text "$brief_text" ;;
     zen) opencode_agent_continuing - text "$brief_text" ;;
     spark) opencode_agent_continuing "$(spark_key_var)" raw "$brief_text" ;;
@@ -4804,7 +4810,7 @@ lane_ready() {
   fi
   case "$LANE" in
     codex) cli=codex ;; claude|anthropic) cli=claude ;; copilot) cli=copilot ;;
-    openrouter|opencode-go|zen|zai|workersai|spark|free) cli="$(opencode_bin)" ;;
+    openrouter|opencode-go|zen|zai|workersai|spark|free|tinker) cli="$(opencode_bin)" ;;
     *) READY_REASON="unknown lane"; return 1 ;;
   esac
   command -v "$cli" > /dev/null || { READY_REASON="$cli not on PATH"; return 1; }
@@ -4880,6 +4886,29 @@ if [ "$LANE" = opencode-go ]; then
       exit 0
     fi
   done
+fi
+
+# The tinker lane runs one model, LOOM_TINKER_MODEL, and only a free one
+# (tinker_free_model): Tinker bills every id without ":free" against the
+# account's prepaid balance. Fail closed: with no model, a model that is not
+# free, a model ladder or an endpoint that is not https, the lane does not
+# start, takes no brief and calls nothing.
+if [ "$LANE" = tinker ]; then
+  TINKER_REFUSED=""
+  if [ -n "$(lane_setting MODELS)" ]; then
+    TINKER_REFUSED="$(setting_var "$SLOT" MODELS) is set; the tinker lane runs the one model $(setting_var "$SLOT" MODEL) names"
+  elif [ -z "$(lane_setting MODEL)" ]; then
+    TINKER_REFUSED="$(setting_var "$SLOT" MODEL) is not set; set it to a tinker/...:free model"
+  elif ! tinker_free_model "$(lane_setting MODEL)"; then
+    TINKER_REFUSED="model $(lane_setting MODEL) does not end in :free; Tinker bills every other id"
+  elif ! [[ "$TINKER_URL" =~ ^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._~/-]*)?$ ]]; then
+    TINKER_REFUSED="$(setting_var "$SLOT" URL) is not an https base URL"
+  fi
+  if [ -n "$TINKER_REFUSED" ]; then
+    echo "[$(date -u +%FT%TZ)] REFUSED: lane $SLOT: $TINKER_REFUSED" >&2
+    heartbeat false "REFUSED: $TINKER_REFUSED"
+    exit 0
+  fi
 fi
 
 if REST_UNTIL="$(transient_rest_until)"; then
@@ -5132,6 +5161,13 @@ for BRIEF in "$INBOX"/*.md; do
     anthropic:claude*) ;;
     claude:*|anthropic:*) park "$BRIEF" "model $MODEL is not a claude model"; continue ;;
     openrouter:openrouter/*:free) ;;
+    tinker:*)
+      if [ "$MODEL" != "$(lane_setting MODEL)" ]; then
+        echo "[$(date -u +%FT%TZ)] $TICKET REFUSED the brief's Model: $MODEL: lane $SLOT runs $(lane_setting MODEL) only" | tee -a "$LOG" >&2
+        MODEL="$(lane_setting MODEL)" PINNED_MODEL=""
+      fi
+      tinker_free_model "$MODEL" ||
+        { park "$BRIEF" "tinker lane runs free models only (tinker/...:free), not $MODEL"; continue; } ;;
     openrouter:*) park "$BRIEF" "openrouter lane runs free models only (openrouter/...:free), not $MODEL"; continue ;;
     opencode-go:opencode-go/*)
       # A pin off the allow-list runs the lane's own model, which the start
