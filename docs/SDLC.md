@@ -125,7 +125,7 @@ yet and cites the open ticket that tracks it.
 
 ### Planned principles
 
-- **A ticket nobody claimed moves within its tier and never climbs the ladder** (#259).
+- **A ticket nobody claimed moves to another lane and never climbs the ladder** (#259).
 - **Escalation counts only work failures, and a failed pull request create is transient** (#261).
 - **The station ships a Loom ticket when it deploys the commit that carries it** (#262).
 - **The status and the resume list the shipped tickets due for verification, and the brain spends a share of each hour on them** (#263).

@@ -1853,13 +1853,19 @@ class SensitiveResumeTests(unittest.TestCase):
             brain.brief(gh, REPO, EPIC, "Ticket", BODY, "muse", "easy")
         self.assertFalse(any(c[0] == "POST" for c in fake.calls))
 
-    def test_brief_remote_lane_refuses_hard_tier(self):
-        fake = Fake(reply(200, goal()), reply(200, []),
-                     reply(200, {"private": False}))
-        gh = GitHub("t", transport=fake)
-        with self.assertRaisesRegex(ValueError, "hard.*not one of"):
-            brain.brief(gh, REPO, EPIC, "Ticket", BODY, "muse", "hard")
-        self.assertFalse(any(c[0] == "POST" for c in fake.calls))
+    def test_brief_remote_lane_takes_any_difficulty(self):
+        # Every lane may try every ticket (loom#3550): a hard brief, or one
+        # with no difficulty, goes to muse like an easy one.
+        for difficulty in ("hard", None):
+            with self.subTest(difficulty=difficulty):
+                fake = Fake(reply(200, goal()), reply(200, []),
+                             reply(200, {"private": False}),
+                             reply(201, {"id": 202, "number": 202,
+                                        "html_url": "https://example.com/ticket"}),
+                             reply(201, {}))
+                gh = GitHub("t", transport=fake)
+                brain.brief(gh, REPO, EPIC, "Ticket", BODY, "muse", difficulty)
+                self.assertEqual(fake.calls[3][2]["labels"], ["loom:ticket", "loom:queued", "lane:muse"])
 
     def test_brief_local_lane_still_files_briefed(self):
         fake = Fake(reply(200, goal()), reply(200, []),
@@ -1869,15 +1875,6 @@ class SensitiveResumeTests(unittest.TestCase):
         gh = GitHub("t", transport=fake)
         brain.brief(gh, REPO, EPIC, "Ticket", BODY, "codex", "hard")
         self.assertEqual(fake.calls[2][2]["labels"], ["loom:ticket", "loom:briefed", "lane:codex"])
-
-    def test_brief_remote_lane_refuses_missing_difficulty(self):
-        no_diff = BODY.replace("## Why\nwhy", "## Why\ndiff")
-        fake = Fake(reply(200, goal()), reply(200, []),
-                     reply(200, {"private": False}))
-        gh = GitHub("t", transport=fake)
-        with self.assertRaisesRegex(ValueError, "difficulty.*not one of"):
-            brain.brief(gh, REPO, EPIC, "Ticket", no_diff, "muse")
-        self.assertFalse(any(c[0] == "POST" for c in fake.calls))
 
     def test_rebrief_regressed_remote_lane_on_public_repo_files_queued(self):
         issue = item(5, body="Difficulty: easy\n\n## Why\nx\n",
@@ -1904,14 +1901,14 @@ class SensitiveResumeTests(unittest.TestCase):
             brain._rebrief_regressed(gh, REPO, issue, "Ticket", ["p95 wait"], "muse", None)
         self.assertFalse(any(c[0] in ("PATCH", "PUT", "POST") for c in fake.calls))
 
-    def test_rebrief_regressed_remote_lane_refuses_hard_tier(self):
+    def test_rebrief_regressed_remote_lane_takes_a_hard_ticket(self):
         issue = item(5, body="Difficulty: hard\n\n## Why\nx\n",
                      labels=["loom:ticket", "loom:verified"])
-        fake = Fake(reply(200, {"private": False}), reply(200, []))
+        fake = Fake(reply(200, {"private": False}), reply(200, []), reply(200, {}), reply(200, {}))
         gh = GitHub("t", transport=fake)
-        with self.assertRaisesRegex(ValueError, "hard.*not one of"):
-            brain._rebrief_regressed(gh, REPO, issue, "Ticket", ["p95 wait"], "muse", None)
-        self.assertFalse(any(c[0] in ("PATCH", "PUT", "POST") for c in fake.calls))
+        brain._rebrief_regressed(gh, REPO, issue, "Ticket", ["p95 wait"], "muse", None)
+        put_labels = next(c for c in fake.calls if c[0] == "PUT")
+        self.assertIn("lane:muse", put_labels[2]["labels"])
 
     def test_rebrief_regressed_local_lane_still_files_briefed(self):
         issue = item(5, body="Difficulty: medium\n\n## Why\nx\n",
@@ -2025,17 +2022,17 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertEqual(fake.calls[4][2], {"body": "moving to muse"})
         fake.assert_all_used()
 
-    def test_move_remote_lane_refuses_ticket_without_readable_difficulty(self):
+    def test_move_remote_lane_takes_a_ticket_without_a_difficulty(self):
         fake = Fake(
             reply(200, {"state": "open", "title": "My Title", "body": BODY,
                         "labels": [{"name": "loom:ticket"}]}),
             reply(200, {"private": False}),
-            reply(200, [])
+            reply(200, []),
+            reply(200, {})
         )
         gh = GitHub("t", transport=fake)
-        with self.assertRaisesRegex(ValueError, "difficulty 'none'"):
-            brain.move(gh, REPO, 8, "queued", "muse")
-        self.assertEqual([call[0] for call in fake.calls], ["GET", "GET", "GET"])
+        brain.move(gh, REPO, 8, "queued", "muse")
+        self.assertEqual(fake.calls[3][2], {"labels": ["loom:ticket", "loom:queued", "lane:muse"]})
         fake.assert_all_used()
 
     def test_move_remote_lane_with_pull_request_refuses(self):

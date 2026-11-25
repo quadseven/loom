@@ -4111,7 +4111,7 @@ def _rebrief_regressed(gh: GitHub, repo: str, issue: Dict[str, Any], title: str,
     _check_written_text(new)
     tickets.parse(new)
     if lane and lane in REMOTE_LANES:
-        _check_remote_queue(gh, repo, number, issue, lane, body=new)
+        _check_remote_queue(gh, repo, number, issue, lane)
     state = "queued" if (not lane or lane in REMOTE_LANES) else "briefed"
     kept = _moved_labels(_labels(issue), state, lane)
     gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": new})
@@ -5594,42 +5594,27 @@ def _open_or_merged_pull(gh: GitHub, repo: str, branch: str) -> Optional[Dict[st
     return None
 
 
-def _check_remote_tier(body: str, lane: str) -> None:
-    """Refuse a remote lane brief whose difficulty the lane does not run."""
-    try:
-        difficulty = tickets.parse(body)[0].get("Difficulty", "")
-    except ValueError:
-        difficulty = ""
-    if difficulty not in REMOTE_LANES[lane]["tiers"]:
-        raise ValueError("difficulty %r is not one of %s: remote lane %s "
-                         "only runs %s" % (difficulty or "none", ", ".join(DIFFICULTIES),
-                                          lane, ", ".join(REMOTE_LANES[lane]["tiers"])))
-
-
 def _check_remote_lane(gh: GitHub, repo: str, body: str, lane: str) -> None:
     """Refuse a brief to a remote lane the lane could never claim: a private repo
-    for a public-only lane, or a difficulty tier the lane does not run.
+    for a public-only lane. Every lane takes every difficulty (loom#3550).
     Called when a new ticket is filed, so a branch check is not yet possible."""
     repo_info = gh.rest("GET", "/repos/%s" % repo).data or {}
     if REMOTE_LANES[lane].get("scope") == "public" and repo_info.get("private") is not False:
         raise ValueError("this repo is private: remote lane %s takes public repos only" % lane)
-    _check_remote_tier(body, lane)
 
 
 def _check_remote_queue(gh: GitHub, repo: str, number: int, issue: Dict[str, Any],
-                        lane: str, body: Optional[str] = None) -> None:
+                        lane: str) -> None:
     """Refuse a queued move to a remote lane that the lane could never claim:
-    a private repo for a public-only lane, a ticket whose branch already has a
-    pull request (a fix round, which remote lanes do not run), or a difficulty
-    tier the lane does not run. The body is checked when the caller has it
-    (re-briefing a regression ticket); omitted for a plain queued move."""
+    a private repo for a public-only lane, or a ticket whose branch already
+    has a pull request (a fix round, which remote lanes do not run). Every
+    lane takes every difficulty (loom#3550)."""
     repo_info = gh.rest("GET", "/repos/%s" % repo).data or {}
     if REMOTE_LANES[lane].get("scope") == "public" and repo_info.get("private") is not False:
         raise ValueError("this repo is private: remote lane %s takes public repos only" % lane)
     branch = tickets.branch_for(number, str(issue.get("title") or ""))
     if _open_or_merged_pull(gh, repo, branch) is not None:
         raise ValueError("ticket branch %s already has a pull request" % branch)
-    _check_remote_tier(str(issue.get("body") or "") if body is None else body, lane)
 
 
 def move(gh: GitHub, repo: str, number: int, state: str,

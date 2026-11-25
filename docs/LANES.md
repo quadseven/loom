@@ -775,8 +775,8 @@ inbox never means a briefed ticket is stale. Not load:
 
 A running ticket is always load; one whose run ended is settled to
 `loom:failed` (`settle_ended_runs`). A briefed ticket no lane claims for
-`BRIEFED_STALL` (2 hours) moves to a free or shorter lane of its tier or
-rung. With no such lane it goes back to `loom:queued` with no lane label
+`BRIEFED_STALL` (2 hours) moves to a free or shorter other lane (of its
+rung, for a ladder ticket). With no such lane it goes back to `loom:queued` with no lane label
 (a status note says why; it is not a failure and takes no rung marker), so
 it stops holding its lane and any free lane can take it from the queue. A
 ticket whose brief sits in a lane inbox is never settled this way.
@@ -907,12 +907,12 @@ file list, its markers in the tree; the runner completes the merge, or parks
 the brief with "conflict markers left in FILES".
 A lane at a limit (its heartbeat reason starts `limit:`, as the spark lane's
 does while its box is hot) is not failing: a ticket briefed on it moves at
-once to a free lane in its difficulty tier (docs/MUSE.md, Lane choice), with
+once to the first free other lane (docs/MUSE.md, Lane choice), with
 no rung marker, or a ticket on a ladder rung to a free lane of that rung; with
 none free it waits where it is for its lane to come back. A `loom:running`
 ticket on a local lane with no live heartbeat for 30 minutes (an unloaded or
 crashed lane, or a machine that is off) moves the same way, with a comment
-naming the lane and how long it was silent: to a free lane of its tier, or of
+naming the lane and how long it was silent: to the first free other lane, or of
 its Model, else back to `loom:queued`. It is no failure and no retry, so it
 never climbs, and the station's `silent-lane` invariant lists the lane.
 A lane deep in a run is not silent: its runner writes the heartbeat between
@@ -1286,7 +1286,7 @@ and the brain passes it to a sandboxed rung. Muse sets the same value
 
 A slot of a lane that is not Anthropic (`anthropic*` and `claude` never take
 one), is free, and has no build work (no briefed ticket claimed for it and no
-queued ticket of its tier or model) is handed one verify run instead of
+queued ticket it or its model may take) is handed one verify run instead of
 idling: the oldest shipped ticket without a proof, at most once per 6 hours
 per ticket, on a public repo only. The brief carries `Deliverable: verify`.
 A shipped ticket that has waited 2 hours since its ship does not wait for an
