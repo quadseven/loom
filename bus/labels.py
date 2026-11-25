@@ -71,8 +71,7 @@ def base_lane(slot: str) -> str:
 # local runner, so its window is longer than HEARTBEAT_MAX_AGE.
 # slots: tickets the lane may hold at once; Muse runs four scheduled lane
 # tasks (operator, 2026-10-25).
-REMOTE_LANES = {"muse": {"tiers": ("easy", "medium"), "scope": "public", "slots": 4,
-                         "beat_max": 2 * 3600}}
+REMOTE_LANES = {"muse": {"scope": "public", "slots": 4, "beat_max": 2 * 3600}}
 LANES += list(REMOTE_LANES)
 
 # The model ladder for repeatedly stuck work is bus/factory.py LADDER, and

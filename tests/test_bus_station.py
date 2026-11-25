@@ -7573,11 +7573,11 @@ class SilentLaneTest(Base):
         st = self.station()
         start = st.now
         key = "%s#12" % REPO
-        st._record_waits({key: "no free lane in tier medium"})
+        st._record_waits({key: "no free lane"})
         st.now = start + 3 * 3600
-        st._record_waits({key: "no free lane in tier medium"})
+        st._record_waits({key: "no free lane"})
         (wait,) = st._invariant_waits()
-        self.assertEqual((wait.reason, wait.since), ("no free lane in tier medium", start))
+        self.assertEqual((wait.reason, wait.since), ("no free lane", start))
         self.assertEqual(wait.ticket, st._invariant_ref(REPO, 12))
         st._record_waits({key: "no free lane takes model gpt-6-sol"})
         (wait,) = st._invariant_waits()
@@ -7618,14 +7618,14 @@ class SilentLaneTest(Base):
     def test_a_wait_reason_that_could_carry_ticket_text_never_reaches_the_invariant(self):
         st = self.station()
         st._record_waits({"%s#12" % REPO: "no free lane takes model `x` <img src=y>",
-                          "%s#13" % REPO: "no free lane in tier medium"})
-        self.assertEqual([w.reason for w in st._invariant_waits()], ["no free lane in tier medium"])
+                          "%s#13" % REPO: "no free lane"})
+        self.assertEqual([w.reason for w in st._invariant_waits()], ["no free lane"])
 
     def test_a_ticket_no_longer_waiting_is_dropped(self):
         st = self.station()
-        st._record_waits({"%s#12" % REPO: "no free lane in tier medium"})
+        st._record_waits({"%s#12" % REPO: "no free lane"})
         st.now += station.WAIT_UNSEEN + 1
-        st._record_waits({"%s#13" % REPO: "no free lane in tier hard"})
+        st._record_waits({"%s#13" % REPO: "no free lane"})
         self.assertEqual([w.ticket.label for w in st._invariant_waits()],
                          [st._invariant_ref(REPO, 13).label])
 
@@ -7850,7 +7850,7 @@ class DeadLaneRunawayTest(Base):
         bodies = self.bodies()
         held = [b for b in bodies if b.startswith("<!-- loom:runaway-dead-lane v1")]
         self.assertEqual(len(held), 1)
-        self.assertIn("no lane of its difficulty tier is free", held[0])
+        self.assertIn("no other lane is free", held[0])
         self.assertIn("codex-2", held[0])
         # The next pass does not comment again.
         self.run_pass()

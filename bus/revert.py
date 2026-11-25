@@ -46,7 +46,10 @@ from urllib.parse import quote
 from . import brain, naming, notify, text
 from .factory import GREEN, REVERT_LABEL, Factory, _labels, _lane, _state, _ts
 from .github import GitHub, GitHubError
-from .tickets import DIFFICULTIES
+
+# The Difficulty: line a repair ticket carries. Shown, never routed on: the
+# factory gives every ticket its first free lane by cost (loom#3550).
+REPAIR_DIFFICULTY = "easy"
 
 # A repo is watched while a lane pull request merged into it this recently.
 RECENT = 6 * 3600
@@ -612,7 +615,7 @@ class Reverts:
             self._decide(repo, "%s is red at %s; %s already red before the merge; factory ticket filed"
                          % (branch, sha[:12], ", ".join(names)))
             return
-        lane, difficulty = self._lane(repo)
+        lane = self._lane(repo)
         labels = ["loom:ticket", "loom:briefed" if lane else "loom:queued", CLASS_LABEL]
         if lane:
             labels.append("lane:" + lane)
@@ -620,7 +623,7 @@ class Reverts:
                 "on `%s`. The merge is not the cause.\n\n## What\nInvestigate and fix the check "
                 "on the default branch.\n\n## Acceptance criteria\n- [ ] The check passes "
                 "on the default branch.\n\n## Size\nS\n\n## Out of scope\n- Reverting the merge.\n"
-                % (difficulty or "easy", _failing(names), sha[:12], branch))
+                % (REPAIR_DIFFICULTY, _failing(names), sha[:12], branch))
         title = naming.generated("Fix pre-existing red check", ", ".join(names))
         brain._check_written_text(title + "\n" + body)
         self._file_repair(repo, {"title": title, "body": body, "labels": labels})
@@ -647,16 +650,13 @@ class Reverts:
         return commit_state(self._check_runs(repo, head), self.now, self.review_check)
 
     # -- writes ----------------------------------------------------------
-    def _lane(self, repo: str) -> Tuple[Optional[str], str]:
-        """(lane, difficulty): the easiest tier with a lane up gets it."""
+    def _lane(self, repo: str) -> Optional[str]:
+        """The factory's first free lane by cost for the repo (lane_for), or
+        None when no lane is up."""
         if self._factory is None:
             self._factory = self.lanes()
             self._factory.count_load()
-        for difficulty in DIFFICULTIES:
-            lane = self._factory.tier_lane(repo, difficulty)
-            if lane is not None:
-                return lane, difficulty
-        return None, ""
+        return self._factory.lane_for(repo)
 
     def _brief(self, repo: str, branch: str, sha: str, pr: Dict[str, Any],
                names: List[str], red_since: float) -> None:
@@ -665,14 +665,14 @@ class Reverts:
             ticket = brain._ticket_association(repo, pr)
         except ValueError:
             ticket = None
-        lane, difficulty = self._lane(repo)
+        lane = self._lane(repo)
         if lane is None:
             self._decide(repo, "%s is red from %s; no lane is up to take its revert"
                          % (branch, short))
             return
         number = ticket[1] if ticket else 0
         title = " ".join(str(pr.get("title") or "").split()) or "#%d" % int(pr["number"])
-        body = self._body(branch, sha, pr, names, red_since, difficulty, number)
+        body = self._body(branch, sha, pr, names, red_since, REPAIR_DIFFICULTY, number)
         full_title = naming.generated("Revert %s" % short, title)
         brain._check_written_text(full_title + "\n" + body)
         made = self._file_repair(repo, {

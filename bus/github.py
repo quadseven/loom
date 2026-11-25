@@ -567,6 +567,8 @@ class AppToken:
                 failure = "could not read the GitHub App private key: %s" % detail
             else:
                 failure = "could not read the GitHub App private key: %s" % secret_read_reason(err)
+        if not failure and not (isinstance(key, str) and key.strip()):
+            failure = "could not read the GitHub App private key: the key is empty"
         if failure:
             raise GitHubError(failure)
         try:
@@ -1645,6 +1647,17 @@ def auth_from_env(env: Optional[Dict[str, str]] = None) -> Auth:
     token_from_env finds."""
     app = AppToken.from_env(env)
     return app if app is not None else token_from_env()
+
+
+def app_auth_from_env(env: Optional[Dict[str, str]] = None) -> "AppToken":
+    """The GitHub App token the LOOM_GITHUB_APP_* settings name, with no
+    personal-token fallback (loom#3083): GitHubError when they name no App."""
+    app = AppToken.from_env(env)
+    if app is None:
+        raise GitHubError("LOOM_GITHUB_APP_ID, LOOM_GITHUB_APP_INSTALLATION_ID and "
+                          "LOOM_GITHUB_APP_KEY_SSM (or LOOM_GITHUB_APP_KEY_FILE) name no "
+                          "GitHub App; Loom never falls back to a personal login")
+    return app
 
 
 def token_from_env() -> str:

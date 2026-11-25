@@ -1,7 +1,7 @@
 """Station findings from an audit (loom#2583).
 
-1. A dead-lane runaway whose hold stayed for want of a free tier lane is
-   released on a later pass once a lane of its tier is free.
+1. A dead-lane runaway whose hold stayed for want of a free lane is
+   released on a later pass once another lane is free.
 2. A done brief whose pull request is never found stops retrying after
    DONE_NO_PR_WAIT and takes the failure path.
 3. A half-done claim met with the pass's request target reached waits for
@@ -48,14 +48,14 @@ class DeadLaneReleaseLaterTest(base.Base):
     def marked(self):
         return [b for b in self.bodies() if b.startswith("<!-- loom:runaway-dead-lane v1")]
 
-    def test_a_hold_that_stayed_is_released_once_a_tier_lane_is_free(self):
+    def test_a_hold_that_stayed_is_released_once_another_lane_is_free(self):
         self.file_invariant("codex-2")
         self.hold(lane="codex-2")
         self.heartbeat("codex", available=False)
         self.run_pass()
         self.assertIn("loom:runaway", self.fake.names(12))
         self.assertTrue(any("the hold stays" in b for b in self.marked()))
-        # A later pass: lane codex, of the same tier, is free again.
+        # A later pass: lane codex is free again.
         self.heartbeat("codex")
         self.run_pass()
         names = self.fake.names(12)

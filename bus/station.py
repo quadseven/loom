@@ -3680,7 +3680,7 @@ class Station:
         self._cap_held = set()
         self._repair_flying = {}
         # A runaway held because one dead lane kept failing it goes back to a
-        # free lane of its tier on its own (loom#565), before claims.
+        # free lane on its own (loom#565), before claims.
         self._release_dead_lane_runaways(free)
         # A starved shipped ticket takes one free lane ahead of build work.
         free = self._reserve_verify(free)
@@ -3733,10 +3733,10 @@ class Station:
     def _release_dead_lane_runaways(self, free: List[str]) -> None:
         """Release runaway holds caused by one dead lane: every attempt since
         the ticket's last brief ran on a lane with an open runs-and-none-done
-        invariant. The hold is released and the ticket briefed to a free lane
-        of its difficulty tier, with a comment naming the lane fault. This is
+        invariant. The hold is released and the ticket briefed to the first
+        free lane by cost, with a comment naming the lane fault. This is
         not a failure: no rung marker, no ladder move, no failure recorded.
-        With no free lane in its tier the ticket stays held and the comment
+        With no free lane the ticket stays held and the comment
         says why. A runaway whose attempts spread across lanes keeps its hold
         for the brain, as before."""
         runaways: List[Tuple[str, Dict[str, Any]]] = []
@@ -3786,23 +3786,23 @@ class Station:
         reviewed = [str(c.get("body") or "") for c in comments
                     if str(c.get("body") or "").startswith(marker)]
         # The marker starts both comments: only a release ends the review. A
-        # hold that stayed for want of a free tier lane is reviewed again each
-        # pass, and released once a lane of its tier is free (loom#2583).
+        # hold that stayed for want of a free lane is reviewed again each
+        # pass, and released once another lane is free (loom#2583).
         if any(DEAD_LANE_RELEASED in body for body in reviewed):
             return
         if repo not in self._publics:
             self._publics[repo] = self._public(repo)
-        tier = factory.tier_lanes(issue, not self._publics[repo])
-        target = next((x for x in tier if x in free and x not in used), None)
+        allowed = factory.lanes_for(not self._publics[repo])
+        target = next((x for x in allowed if x in free and x not in used), None)
         if target is None:
-            # Said once: a later pass with no free tier lane posts nothing.
+            # Said once: a later pass with no free lane posts nothing.
             if not reviewed:
                 self._comment(repo, number,
                               "%s\nRunaway hold reviewed: every attempt since the last brief "
                               "ran on lane %s, which has an open runs-and-none-done invariant "
-                              "(#%d); but no lane of its difficulty tier is free, so the hold "
+                              "(#%d); but no other lane is free, so the hold "
                               "stays." % (marker, lane, inv_number), notify.RUNAWAY)
-                _say("%s#%d stays held: its dead lane %s has no free tier lane"
+                _say("%s#%d stays held: its dead lane %s has no other free lane"
                      % (repo, number, lane))
             return
         names = self._drop_claim(n for n in names
@@ -3815,8 +3815,8 @@ class Station:
         self._comment(repo, number,
                       "%s\n%s: every attempt since the last brief ran on "
                       "lane %s, which has an open runs-and-none-done invariant (#%d: %s). "
-                      "This is not a failure: the ticket is briefed to lane %s, in its "
-                      "difficulty tier." % (marker, DEAD_LANE_RELEASED, lane, inv_number,
+                      "This is not a failure: the ticket is briefed to lane %s, the first "
+                      "free lane by cost." % (marker, DEAD_LANE_RELEASED, lane, inv_number,
                                             inv_title, target),
                       notify.RUNAWAY)
         used.add(target)
@@ -4074,7 +4074,7 @@ class Station:
     def _queued_lanes(self, repo: str, issues: List[Dict[str, Any]],
                       counts: Dict[Tuple[str, int], int]) -> set:
         """The lanes a queued ticket of the repo may be given: its model's
-        lanes, else its difficulty tier's. A ticket the unproven-work gate
+        lanes, else any lane its repo may run on. A ticket the unproven-work gate
         refuses wants no lane: holding its lanes from verify runs too left
         the goal's shipped work stuck over the limit (2026-10-18)."""
         limit = brain.unverified_limit()
@@ -4088,7 +4088,7 @@ class Station:
             if model:
                 lanes.update(model_lanes(model.group(1)))
             else:
-                lanes.update(factory.lanes_of(factory.difficulty_of(issue), not self._public(repo)))
+                lanes.update(factory.lanes_for(not self._public(repo)))
         if not self._code_ready("workersai"):
             lanes.discard("workersai")
         return lanes
@@ -15502,8 +15502,8 @@ class Station:
         return journals, posts
 
     def _invariant_queued(self) -> List[Tuple[invariants.Ref, Tuple[str, ...]]]:
-        """Each trusted, truly queued ticket and the lanes of its difficulty
-        tier: loom:queued its only state label, and not another operator's.
+        """Each trusted, truly queued ticket and the lanes it may run on
+        (factory.lanes_for): loom:queued its only state label, and not another operator's.
         A ticket still marked queued beside a later state (shipped, merged)
         or claimed by another operator waits for no lane; counting those
         named shipped tickets as queued (loom#399)."""
@@ -15523,7 +15523,7 @@ class Station:
                 ref = self._invariant_ref(repo, int(issue["number"]))
                 if repo not in self._publics:
                     self._publics[repo] = self._public(repo)
-                out.append((ref, factory.tier_lanes(issue, not self._publics[repo])))
+                out.append((ref, factory.lanes_for(not self._publics[repo])))
         return out
 
     def _invariant_headerless(self) -> List[invariants.Ref]:
@@ -19306,8 +19306,9 @@ def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
     so the inbox marks its events done only after a pass that ran."""
     use_launchd = gh is None
     if gh is None:
-        from .github import auth_from_env
-        gh = GitHub(auth_from_env())
+        # The station calls GitHub only as its App (loom#3083).
+        from .github import app_auth_from_env
+        gh = GitHub(app_auth_from_env())
         gh.status_in_body = True
         hooks.setdefault("operator_reader", operator_budget.read_core)
     if gh.cache_dir is None:

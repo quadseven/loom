@@ -635,7 +635,7 @@ class StationRewriteTest(Base):
         self.fake.add_triage(7)
         self.fake.goal_tickets = [self.ticket(50, "queued")]
         st = self.station(cmd=self.agent(BRIEF))
-        st._record_waits({"%s#50" % REPO: "no free lane in tier easy"})
+        st._record_waits({"%s#50" % REPO: "no free lane"})
         with mock.patch.dict(os.environ, {"LOOM_GOAL_CAP": "1", "LOOM_HOME": self.home}):
             self.run_station(st)
         self.assertEqual(len(self.fake.created), 1)
