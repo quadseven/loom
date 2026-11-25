@@ -39,6 +39,8 @@ slot such as anthropic-2 runs its lane's agent):
 - `agy` - Google's Antigravity CLI on the operator's Google plan, run as a
   separate macOS user.
 - `openrouter` - free models via opencode.
+- `tinker` - Tinker's free Inkling model via opencode; any id without
+  `:free` is refused; public repos only.
 - `opencode-go` - subscription models via opencode.
 - `zen` - OpenCode Zen free models via opencode; public repos only.
 - `copilot` - GitHub Copilot Free CLI with a scoped token; public repos only.

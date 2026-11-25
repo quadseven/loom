@@ -4433,7 +4433,7 @@ class Tickets(Base):
 
     def test_a_public_easy_ticket_may_go_to_the_muse_spark_slot_and_a_private_one_never(self):
         self.gh.private = False
-        self.limited_easy(busy=factory.FREE_POOL + ("openrouter", "workersai", "zen", "zai", "copilot",
+        self.limited_easy(busy=factory.FREE_POOL + ("openrouter", "tinker", "workersai", "zen", "zai", "copilot",
                                                     "opencode-go", "opencode-go-1", "opencode-go-2",
                                                     "opencode-go-3"))
         self.assertEqual(self.lane(7), "opencode-go-4")
@@ -4470,8 +4470,23 @@ class Tickets(Base):
     def test_the_free_lanes_come_before_the_paid_codex_lanes(self):
         # Operator 2026-10-19: "I always want my free tier used up".
         order = factory.LANE_ORDER
-        for lane in ("openrouter", "workersai", "zen", "zai"):
+        for lane in ("openrouter", "tinker", "workersai", "zen", "zai"):
             self.assertLess(order.index(lane), order.index("codex"))
+
+    def test_the_tinker_lane_takes_the_openrouter_lanes_tickets_on_free_models_only(self):
+        # loom#3579: a free lane, tried right after openrouter, public repos
+        # only, and routed only tickets whose pin is a tinker :free model.
+        from bus import station
+        order = factory.LANE_ORDER
+        self.assertEqual(order.index("tinker"), order.index("openrouter") + 1)
+        self.assertEqual(factory.lane_kind("tinker"), "free")
+        self.assertIn("tinker", factory.lanes_for(False))
+        self.assertNotIn("tinker", factory.lanes_for(True))
+        self.assertTrue(station.needs_public_repo("tinker", ""))
+        self.assertTrue(station.lane_takes_model("tinker",
+                                                 "tinker/thinkingmachines/Inkling-2-Mini:peft:65536:free"))
+        self.assertFalse(station.lane_takes_model("tinker", "tinker/thinkingmachines/Inkling-2-Mini:peft:65536"))
+        self.assertFalse(station.lane_takes_model("tinker", "openrouter/vendor/model:free"))
 
     def test_free_provider_slots_that_may_train_take_public_repos_only(self):
         for lane in ("free-nvidia", "free-kilo", "free-groq", "free-openrouter"):
@@ -4502,7 +4517,7 @@ class Tickets(Base):
 
     def test_a_public_easy_ticket_may_go_to_zen(self):
         self.gh.private = False
-        self.limited_easy(busy=("openrouter", "workersai") + factory.FREE_POOL)
+        self.limited_easy(busy=("openrouter", "tinker", "workersai") + factory.FREE_POOL)
         self.assertEqual(self.lane(7), "zen")
 
     def test_a_limit_hand_off_of_a_briefed_ticket_never_picks_a_remote_lane(self):

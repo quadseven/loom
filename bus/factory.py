@@ -432,7 +432,7 @@ OPENCODE_GO = ("opencode-go", "opencode-go-1", "opencode-go-2", "opencode-go-3",
 # anthropic credit last.
 LANE_ORDER: Tuple[str, ...] = (
     SPARKS
-    + FREE_POOL + ("openrouter", "workersai", "zen", "zai", "copilot")
+    + FREE_POOL + ("openrouter", "tinker", "workersai", "zen", "zai", "copilot")
     + OPENCODE_GO + CODEX + ("claude", "agy", "muse")
     + ANTHROPIC)
 # What a lane costs, for the dashboard's Tiers and allowances page (loom#968):
@@ -445,7 +445,7 @@ LANE_ORDER: Tuple[str, ...] = (
 KINDS = ("own-hardware", "free", "subscription", "never-paid")
 LANE_KINDS: Dict[str, str] = {
     "spark": "own-hardware",
-    **{lane: "free" for lane in FREE_POOL + ("openrouter", "workersai", "zen", "zai", "copilot")},
+    **{lane: "free" for lane in FREE_POOL + ("openrouter", "tinker", "workersai", "zen", "zai", "copilot")},
     **{lane: "subscription" for lane in ("claude", "codex", "opencode-go", "agy", "muse")},
     "anthropic": "never-paid",
 }
