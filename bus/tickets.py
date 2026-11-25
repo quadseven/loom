@@ -687,10 +687,8 @@ TIMEDOUT_RE = re.compile(r"; the edits are on branch ([A-Za-z0-9._/-]+-timedout-
 
 
 def _last(pattern: re.Pattern, text: str) -> Optional[re.Match]:
-    found = None
-    for found in pattern.finditer(text):
-        pass
-    return found
+    matches = list(pattern.finditer(text))
+    return matches[-1] if matches else None
 
 
 def timedout_branch(texts: List[str]) -> Optional[str]:
