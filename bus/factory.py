@@ -2975,7 +2975,12 @@ class Factory:
                     continue
                 if pr.get("merged_at") is None and not pr.get("merged"):
                     continue
-                assoc = self._association(repo, pr)
+                # This historical lookup needs merged PRs; the normal
+                # association path skips them without logging conflicts.
+                try:
+                    assoc = brain._ticket_association(repo, pr)
+                except ValueError:
+                    continue
                 if assoc and assoc[0] == repo:
                     t_num = assoc[1]
                     if t_num not in merged or int(pr["number"]) > merged[t_num]:
@@ -3125,6 +3130,8 @@ class Factory:
         return issue if issue is not None and _state(issue) == "pr" else None
 
     def _association(self, repo: str, pr: Dict[str, Any]) -> Optional[Tuple[str, int]]:
+        if pr.get("merged_at") is not None or pr.get("merged"):
+            return None
         try:
             return brain._ticket_association(repo, pr)
         except brain.OtherRepoTicket:
