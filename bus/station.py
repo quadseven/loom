@@ -862,6 +862,17 @@ STATELESS_FILE = "stateless.json"
 READY_LABEL = "ready-for-agent"
 READY_EVERY = 3600
 READY_PER_RUN = 20
+# The same hourly run then takes every other open issue Loom has not seen
+# (loom#3598): on 2026-11-25, 375 open issues carried no triage or Loom
+# label, so Loom never read them. LOOM_INTAKE_PER_RUN caps one run's label
+# writes, ready-for-agent issues first. 60 by default: each write is a
+# content-creating request, and GitHub's secondary limit is 80 of those a
+# minute and 500 an hour, so even one run's burst stays under the minute
+# limit and the hour keeps 440 for every other write; the reads are one
+# request per 100 open issues of a repo. 375 issues drain in about 7 hours.
+# INTAKE_MAX bounds the setting under the per-minute limit.
+INTAKE_PER_RUN = 60
+INTAKE_MAX = 80
 READY_FILE = "ready_for_agent.json"
 STATELESS_TEXT = ("Queued: this ticket carried no state label, so nothing would route it "
                   "to a lane (loom#1653).")
@@ -1209,6 +1220,8 @@ class Settings:
                  settle_claimed_max: int = claimed.PER_RUN,
                  ask_answerers: Sequence[str] = (),
                  claim_idle_hours: int = 0,
+                 intake_per_run: int = READY_PER_RUN,
+                 intake_all: bool = False,
                  brain_holders: Sequence[str] = (),
                  claim_referee: str = "off",
                  engine_claims: Sequence[str] = claim_referee.ENGINE_CLAIMS,
@@ -1262,6 +1275,11 @@ class Settings:
         # alone this long comes back to this Loom (bus/stale_claims.py); 0, the
         # default for a Settings built in code, is off; from_env defaults to 24.
         self.claim_idle_hours = claim_idle_hours
+        # The hourly intake (intake_ready_for_agent): how many issues one run
+        # gives loom:triage, and whether it takes every unseen open issue or
+        # only ready-for-agent ones. from_env turns intake_all on.
+        self.intake_per_run = intake_per_run
+        self.intake_all = intake_all
         # LOOM_CLAIM_REFEREE: "on" (from_env's default) keeps one engine claim
         # per ticket and expires idle ones (bus/claim_referee.py), "dry" logs
         # what it would remove, "off" skips it; off for a Settings built in
@@ -1477,6 +1495,8 @@ class Settings:
                    settle_claimed=claimed.mode(env.get("LOOM_SETTLE_CLAIMED", "")),
                    settle_claimed_max=claimed.per_run(env.get("LOOM_SETTLE_CLAIMED_MAX", "")),
                    claim_idle_hours=stale_claims.idle_hours(env.get("LOOM_CLAIM_IDLE_HOURS", "")),
+                   intake_per_run=_intake_per_run(env.get("LOOM_INTAKE_PER_RUN", "")),
+                   intake_all=env.get("LOOM_INTAKE_ALL", "").strip().lower() not in ("0", "off", "no"),
                    brain_holders=[h for h in words("LOOM_BRAIN_BACKUP_HOLDERS")
                                   if BRAIN_HOLDER_RE.fullmatch(h)],
                    claim_referee=claim_referee.mode(env.get("LOOM_CLAIM_REFEREE", "")),
@@ -1508,6 +1528,15 @@ def _keep_days(raw: str) -> int:
         return int(raw)
     _say("ignoring LOOM_LOG_KEEP_DAYS %r: not a whole number of days" % raw)
     return LOG_KEEP_DAYS
+
+
+def _intake_per_run(raw: str) -> int:
+    """LOOM_INTAKE_PER_RUN: a whole number from 1 to INTAKE_MAX; empty or
+    unreadable is INTAKE_PER_RUN, and a larger number is INTAKE_MAX."""
+    raw = raw.strip()
+    if not raw.isdigit() or int(raw) < 1:
+        return INTAKE_PER_RUN
+    return min(int(raw), INTAKE_MAX)
 
 
 def _log_size(env: Dict[str, str], name: str, default: float) -> float:
@@ -14041,8 +14070,11 @@ class Station:
         """Give loom:triage to each open ready-for-agent issue of each repo
         that Loom has not seen: no loom: label, not an epic or other non-work
         (brain triage's own skip rules), no assignee and no claim: label. The
-        brain then triages it as any other issue; nothing skips triage. At
-        most READY_PER_RUN issues a run, oldest first, at most once an hour,
+        brain then triages it as any other issue; nothing skips triage. With
+        intake_all (LOOM_INTAKE_ALL, on by default from the environment) it
+        then takes every other open issue the same rules let through
+        (loom#3598). At most intake_per_run issues a run (LOOM_INTAKE_PER_RUN),
+        ready-for-agent ones first, oldest first, at most once an hour,
         and no comment: one log line a run with the count. A run in which a
         repo read failed leaves the hour unstamped, so the next pass retries."""
         path = os.path.join(self.state, READY_FILE)
@@ -14051,27 +14083,31 @@ class Station:
         last = state.get("_at")
         if self._num(last) and 0 <= self.now - last < READY_EVERY:
             return
-        left, failed = READY_PER_RUN, False
+        cap = self.s.intake_per_run
+        left, failed = cap, False
+        listings = [self._ready_issues] + ([self._open_issues] if self.s.intake_all else [])
         try:
-            for repo in self._verify_repos():
-                if left <= 0 or self._deferred():
-                    break
-                try:
-                    left -= self._intake_ready_repo(repo, left)
-                except RateLimited:
-                    raise
-                except GitHubError as err:
-                    failed = True
-                    _say("ready-for-agent intake: could not read %s: %s" % (repo, err))
+            for listing in listings:
+                for repo in self._verify_repos():
+                    if left <= 0 or self._deferred():
+                        break
+                    try:
+                        left -= self._intake_ready_repo(repo, left, listing)
+                    except RateLimited:
+                        raise
+                    except GitHubError as err:
+                        failed = True
+                        _say("ready-for-agent intake: could not read %s: %s" % (repo, err))
         finally:
             if not failed:
                 state["_at"] = self.now
                 _write_json(path, state)
-            done = READY_PER_RUN - left
+            done = cap - left
             _say("ready-for-agent intake: %d issue%s to loom:triage"
                  % (done, "" if done == 1 else "s"))
 
-    def _intake_ready_repo(self, repo: str, left: int) -> int:
+    def _intake_ready_repo(self, repo: str, left: int,
+                           listing: Optional[Callable[[str], Iterator[Any]]] = None) -> int:
         """Label up to `left` of one repo's unseen ready-for-agent issues
         loom:triage; how many it labeled. It stops when the pass budget is
         spent, and a failed label write ends the repo with the count so far,
@@ -14079,7 +14115,7 @@ class Station:
         first, until `left` are labeled or the pages run out, so issues it
         skips (claimed, epics, already Loom's) never hide later ones."""
         done = 0
-        for issue in self._ready_issues(repo):
+        for issue in (listing or self._ready_issues)(repo):
             if done >= left or self._deferred():
                 break
             if (not isinstance(issue, dict) or issue.get("assignees") or issue.get("assignee")
@@ -14102,11 +14138,21 @@ class Station:
     def _ready_issues(self, repo: str) -> Iterator[Any]:
         """The repo's open ready-for-agent issues, oldest first, one page
         read at a time as the caller asks for more."""
+        return self._issue_pages(repo, "labels=%s&" % READY_LABEL)
+
+    def _open_issues(self, repo: str) -> Iterator[Any]:
+        """Every open issue and pull request of the repo, oldest first, one
+        page read at a time (a pull request is skipped by _triage_skip)."""
+        return self._issue_pages(repo, "")
+
+    def _issue_pages(self, repo: str, labels: str) -> Iterator[Any]:
+        """The repo's open issues matching `labels` (a query prefix, or ""),
+        oldest first, one page read at a time as the caller asks for more."""
         page = 1
         while True:
-            found = self.gh.rest("GET", "/repos/%s/issues?labels=%s&state=open&sort=created"
+            found = self.gh.rest("GET", "/repos/%s/issues?%sstate=open&sort=created"
                                  "&direction=asc&per_page=100&page=%d"
-                                 % (repo, READY_LABEL, page)).data
+                                 % (repo, labels, page)).data
             found = found if isinstance(found, list) else []
             yield from found
             if len(found) < 100:

@@ -1248,10 +1248,26 @@ carrying it in each `LOOM_REPOS` repo, oldest first, and gives `loom:triage`
 to each that carries no `loom:` label, has no assignee and no `claim:` label,
 and is not an epic, goal home or other issue triage skips
 (`intake_ready_for_agent`, loom#3092). The brain then triages it like any
-other issue: the label never skips triage. At most 20 issues a run
-(`READY_PER_RUN`), and the run stops when the pass's request budget is spent.
-It writes no comment and logs one line a run with the count. A run in which
-a repo read failed does not count toward the hour, so the next pass retries.
+other issue: the label never skips triage. The same run then reads every
+other open issue of each repo and gives `loom:triage` to each the same rules
+let through (loom#3598): before it, an issue with no label at all was never
+read. `LOOM_INTAKE_ALL=0` (or `off`) limits the run to `ready-for-agent`
+issues. At most `LOOM_INTAKE_PER_RUN` issues a run (default 60, at most 80),
+`ready-for-agent` ones first, oldest first, and the run stops when the pass's
+request budget is spent. Each label is a content-creating write, which
+GitHub's secondary limit holds to 80 a minute and 500 an hour, so a run's
+burst stays under the minute limit and the hour keeps most of its writes for
+everything else; the reads are one request per 100 open issues of a repo.
+At 60 an hour, 375 unseen issues are labelled in about 7 hours. It writes
+no comment and logs one line a run with the count. A run in which a repo
+read failed does not count toward the hour, so the next pass retries.
+
+Labelling is not triage. The issues it labels wait for the agent rewrites
+(at most 6 an hour across the station, `REWRITE_STATION_PER_HOUR`; Agent
+rewrites in docs/BRAIN.md) and the brain's triage step (up to 5 a tick, a
+tick about every 30 minutes), so a large intake drains at about 15 issues an
+hour, not at the intake's rate; those two caps bound it. A repo with a backlog goal home also has `triage_backlogs` (25 a run,
+before this intake in the pass), which queues a ready issue with no model.
 
 Each Loom sets these for itself when it installs; a second operator running
 from a clone of another operator's checkout must not inherit them:
