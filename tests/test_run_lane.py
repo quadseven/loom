@@ -7964,12 +7964,23 @@ exit %d
             (tree / name).write_text(body)
         calls = tmp / "uv-calls"
         fakebin = tmp / "uvbin"
-        self.write_tool(fakebin / "uv", '#!/bin/sh\nprintf "%%s|%%s\\n" "$UV_PYTHON_INSTALL_DIR" "$*" >> "%s"\n' % calls)
+        shared = tmp / "run" / "uv-shared"
+        # The stand-in also records whether the Python install lock was
+        # held while it ran (a second holder cannot take it).
+        self.lock_seen = tmp / "python-lock-seen"
+        probe = ("import fcntl, os, sys\nfd = os.open(sys.argv[1], os.O_RDONLY)\n"
+                 "try:\n    fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB); print('free')\n"
+                 "except OSError:\n    print('held')\n")
+        self.write_tool(fakebin / "uv", (
+            '#!/bin/sh\nprintf "%%s|%%s\\n" "$UV_PYTHON_INSTALL_DIR" "$*" >> "%s"\n'
+            '"%s" -c "%s" "%s" >> "%s"\n') % (calls, sys.executable, probe.replace('"', '\\"'),
+                                           shared / "locks" / "python.lock", self.lock_seen))
+        # Not every macOS has timeout in /usr/bin; the runner's own PATH does.
+        self.write_tool(fakebin / "timeout", '#!/bin/bash\nshift\nexec "$@"\n')
         env = {"PATH": ("%s:/usr/bin:/bin" % fakebin) if uv else "/usr/bin:/bin",
-               "HOME": str(tmp / "nohome")}
+               "HOME": str(tmp / "nohome"), "LOOM_ROOT": str(RUNNER.parent.parent)}
         script = ('CHECK_UV_DIR="$1" LOG="$2" TREE="$3" REPO="$4" C_CHECK="$5" C_SETUP="" NET_TIMEOUT=30\n'
                   'check_uv_prepare || exit 7\nprintf "%s\\n%s" "$CHECK_UV_CACHE" "$CHECK_UV_LOCK"\n')
-        shared = tmp / "run" / "uv-shared"
         result = subprocess.run(["bash", "-c", funcs + script, "test", str(shared), str(tmp / "lane.log"),
                                  str(tree), repo, contract_check], env=env, capture_output=True, text=True)
         return result, shared, (calls.read_text().splitlines() if calls.exists() else [])
@@ -7999,6 +8010,8 @@ exit %d
                              "pyproject.toml": 'requires-python = ">=3.10"\n'})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(calls, ["%s|python install --no-config --no-bin --no-cache 3.12 3.11.4" % (shared / "python")])
+        # One install at a time: the install ran holding the Python lock.
+        self.assertEqual(self.lock_seen.read_text().split(), ["held"])
         _, shared, calls = self.check_uv_prepare(
             "example/py", {"pyproject.toml": '[project]\nrequires-python = ">=3.10,<3.13"\n'})
         self.assertEqual(calls[-1], "%s|python install --no-config --no-bin --no-cache >=3.10,<3.13" % (shared / "python"))

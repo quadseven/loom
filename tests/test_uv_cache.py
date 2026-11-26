@@ -141,6 +141,18 @@ class UvCacheBoundTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "held")
 
+    def test_exclusive_holds_the_lock_against_a_shared_holder(self):
+        lock = self.shared / "locks" / "python.lock"
+        probe = ("import fcntl, os, sys\n"
+                 "fd = os.open(sys.argv[1], os.O_RDONLY)\n"
+                 "try:\n    fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB); print('free')\n"
+                 "except OSError:\n    print('held')\n")
+        result = subprocess.run([sys.executable, "-B", str(TOOL), "exclusive", str(lock), "--",
+                                 sys.executable, "-c", probe, str(lock)],
+                                capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "held")
+
 
 if __name__ == "__main__":
     unittest.main()

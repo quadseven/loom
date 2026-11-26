@@ -5,11 +5,14 @@ Layout under ROOT ($LOOM_HOME/run/uv-shared):
   python/            managed Pythons; the runner installs them, checks read them
   repos/<key>/cache  one repo's uv cache; only that repo's checks write it
   locks/<key>.lock   that cache's lock; no sandbox can write here
+  locks/python.lock  the lock the runner's Python installs take
 
-Two commands:
+Three commands:
 
   shared LOCK -- CMD...   take a shared lock on LOCK and exec CMD; a check
                           holds it while it runs
+  exclusive LOCK -- CMD...
+                          the same, exclusive: one Python install at a time
   bound ROOT KEY MAX_MB [UV]
                           with LOCK taken exclusively and without waiting,
                           bring repos/KEY/cache under MAX_MB: `UV cache
@@ -34,11 +37,15 @@ def _open_lock(path):
     return os.open(path, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
 
 
-def shared(lock, argv):
+def locked(lock, mode, argv):
+    """Take LOCK in mode (fcntl.LOCK_SH or LOCK_EX), waiting for it, and
+    exec argv holding it: the lock goes when that command ends."""
     fd = _open_lock(lock)
-    fcntl.flock(fd, fcntl.LOCK_SH)
+    fcntl.flock(fd, mode)
     os.set_inheritable(fd, True)
-    os.execvp(argv[0], argv)
+    # S606 (a process started without a shell) is the intent: argv is the
+    # runner's own command line, run as given; a shell would re-parse it.
+    os.execvp(argv[0], argv)  # noqa: S606
 
 
 def size_kb(path):
@@ -110,11 +117,12 @@ def bound(root, key, max_mb, uv):
 
 
 def main(argv):
-    if len(argv) >= 4 and argv[0] == "shared" and argv[2] == "--":
-        shared(argv[1], argv[3:])
+    if len(argv) >= 4 and argv[0] in ("shared", "exclusive") and argv[2] == "--":
+        locked(argv[1], fcntl.LOCK_SH if argv[0] == "shared" else fcntl.LOCK_EX, argv[3:])
     if len(argv) in (4, 5) and argv[0] == "bound" and argv[3].isdigit():
         return bound(argv[1], argv[2], int(argv[3]), argv[4] if len(argv) == 5 else "")
-    print("usage: uv_cache.py shared LOCK -- CMD... | bound ROOT KEY MAX_MB [UV]", file=sys.stderr)
+    print("usage: uv_cache.py shared|exclusive LOCK -- CMD... | bound ROOT KEY MAX_MB [UV]",
+          file=sys.stderr)
     return 2
 
 

@@ -3355,7 +3355,10 @@ check_uv_prepare() {
     case " ${C_SETUP:-} ${C_CHECK:-} " in *" uv "*|*" uvx "*) ;; *) return 0 ;; esac
     [ -z "$(ls -A "$CHECK_UV_DIR/python" 2>/dev/null)" ] || return 0
   fi
-  UV_PYTHON_INSTALL_DIR="$CHECK_UV_DIR/python" timeout "$NET_TIMEOUT" "$uv_bin" python install \
+  # One install at a time across slots (locks/python.lock, exclusive): two
+  # slots preparing at once must not write the same interpreter together.
+  UV_PYTHON_INSTALL_DIR="$CHECK_UV_DIR/python" python3 -B "$LOOM_ROOT/lanes/uv_cache.py" exclusive \
+    "$CHECK_UV_DIR/locks/python.lock" -- timeout "$NET_TIMEOUT" "$uv_bin" python install \
     --no-config --no-bin --no-cache ${reqs[@]+"${reqs[@]}"} >> "$LOG" 2>&1 ||
     echo "contract_run: uv could not install the Python this check asks for (${reqs[*]:-default})" >> "$LOG"
   return 0
