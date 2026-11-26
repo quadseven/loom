@@ -336,7 +336,7 @@ TEST_MARKER = "<!-- loom:test-named -->"
 # fixed time just after the hold shipped, never the clock: a ticket created
 # earlier was on the board before the rule and is never held by it, whatever
 # it contains, so the hold needs no bulk rewrite (#3299).
-TEST_RULE_SINCE = "2026-11-25T00:00:00Z"
+TEST_RULE_SINCE = "2026-11-28T00:00:00Z"
 # A regression or revert ticket is exempt, as it is from the stale reads at
 # the station's claim: holding one back keeps a broken change live.
 TEST_RULE_EXEMPT = frozenset({"loom:regression", "loom:revert"})

@@ -6075,7 +6075,7 @@ class ClaimTest(Base):
                 self.heartbeat("codex", available=available)
                 station.usage.write(self.home, rows)
                 self.fake.add(number, state="queued",
-                              body="Difficulty: %s\n\n## Why\nx\n\n## Acceptance criteria\n\n- [ ] x\n"
+                              body="Difficulty: %s\n\n## Why\nx\n\n## Acceptance criteria\n\n- [ ] tests/test_x.py passes\n"
                               % difficulty)
                 self.fake.issues[number]["labels"].pop()
                 st = station.Station(GitHub("token", transport=self.fake), self.settings, now=now)
