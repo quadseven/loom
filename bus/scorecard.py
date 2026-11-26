@@ -12,7 +12,9 @@ runner's footer naming the lane and model) and records, per pull request:
 
 - the review outcome: clean (no review-bot finding), findings, or bad-work
   (a finding from bus/merge_tier.py's BAD_WORK rules, at any severity),
-  read from every review thread once the pull request is closed;
+  read from every review thread once the pull request is closed. An
+  intent-mismatch on criteria the brief marks live alone is a finding
+  (`live_only`, loom#3625);
 - the send-backs: the factory's fix briefs on its ticket;
 - merged, and reverted (a merged revert pull request undoes it);
 - a failed deploy, from the post-merge watch (bus/deploy_watch.py).
@@ -189,13 +191,35 @@ def review_findings(threads: Sequence[Mapping[str, Any]],
     return found
 
 
+LIVE_ONLY_RULE = "intent-mismatch"
+# How the review bot names a ticket criterion in a finding: `#N criterion K "text"`.
+NAMED_CRITERION_RE = re.compile(r"\bcriterion \d+ \"([^\"\n]+)\"")
+
+
+def _norm(text: str) -> str:
+    return " ".join(str(text or "").split()).casefold()
+
+
+def live_only(body: str, live: Sequence[str]) -> bool:
+    """Whether a finding is an intent-mismatch whose every named criterion is
+    one the brief marks live (loom#3625): no diff can meet such a criterion,
+    so the finding is the ticket's, not the lane's. A finding that names no
+    criterion, or one the ticket does not mark live, is the lane's."""
+    found = merge_tier.finding(body)
+    named = {_norm(text) for text in NAMED_CRITERION_RE.findall(body or "")}
+    return (bool(found) and found[2] == LIVE_ONLY_RULE and bool(named)
+            and named <= {_norm(text) for text in live})
+
+
 def review_outcome(threads: Sequence[Mapping[str, Any]],
                    by_bot: Callable[[Mapping[str, Any]], bool],
-                   env: Optional[Mapping[str, str]] = None) -> str:
+                   env: Optional[Mapping[str, str]] = None,
+                   live: Sequence[str] = ()) -> str:
     """clean, findings or bad-work, from every review thread's opening
-    comment that the review bot wrote."""
+    comment that the review bot wrote. A bad-work finding that is an
+    intent-mismatch on `live` criteria alone (`live_only`) is a finding."""
     found = review_findings(threads, by_bot)
-    if any(merge_tier.bad_work(body, env) for body in found):
+    if any(merge_tier.bad_work(body, env) and not live_only(body, live) for body in found):
         return BAD_WORK
     return FINDINGS if found else CLEAN
 
@@ -477,6 +501,13 @@ class Scorecard:
                        and str(c.get("body") or "").startswith(tickets.FIX_MARKER))
         record["sent_back"] = sent
         record["review"] = review_outcome(threads, lambda c: brain.by_bot(dict(c), bot), self.env)
+        if record["review"] == BAD_WORK and ticket is not None:
+            from . import criteria_gate
+            issue = gh.rest("GET", "/repos/%s/issues/%d" % ticket).data
+            live = criteria_gate.live_criteria(
+                str(issue.get("body") or "") if isinstance(issue, dict) else "")
+            record["review"] = review_outcome(
+                threads, lambda c: brain.by_bot(dict(c), bot), self.env, live)
         record["findings"] = len(review_findings(threads, lambda c: brain.by_bot(dict(c), bot)))
 
     def _settle(self, gh: Any, repo: str, pr: Dict[str, Any], record: Dict[str, Any],
