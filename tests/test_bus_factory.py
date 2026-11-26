@@ -5513,10 +5513,13 @@ class NoLane(Base):
         self.gh.issues[number]["created_at"] = iso(0)
 
     def assign(self, waited, available, **kwargs):
+        # These tests time the reroute and the hand-off alone: the pin
+        # fallback (PinFallback) would move any pinned ticket after 30 minutes.
         key = "%s#7" % REPO
-        worker = factory.Factory(self.gh, [REPO], NOW, trusted=["alice-example"],
-                                 available=available, no_lane_since={key: NOW - waited},
-                                 **kwargs)
+        with mock.patch.dict(os.environ, {"LOOM_PIN_FALLBACK_MINUTES": "0"}):
+            worker = factory.Factory(self.gh, [REPO], NOW, trusted=["alice-example"],
+                                     available=available, no_lane_since={key: NOW - waited},
+                                     **kwargs)
         worker.assign_queued()
         return worker
 
