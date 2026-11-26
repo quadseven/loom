@@ -48,7 +48,10 @@ CHECK_UV_HELPERS = "".join(
     re.search(r"^%s\(\) \{\n.*?^\}\n" % name, RUNNER.read_text(), re.S | re.M).group(0)
     for name in ("runner_uv", "check_uv_key", "check_uv_prepare")) + (
     'REPO="${REPO:-example/repo}" CHECK_UV_DIR="${CHECK_UV_DIR:-$CHECK_HOME-uv-shared}" '
-    'LOOM_ROOT="${LOOM_ROOT:-%s}" NET_TIMEOUT="${NET_TIMEOUT:-30}"\n' % RUNNER.parent.parent)
+    'LOOM_ROOT="${LOOM_ROOT:-%s}" NET_TIMEOUT="${NET_TIMEOUT:-30}" '
+    # No baseline Python install unless a test asks for one (loom#3602):
+    # a runner with a real uv must not download Pythons for every test.
+    'LOOM_CHECK_PYTHONS="${LOOM_CHECK_PYTHONS-}"\n' % RUNNER.parent.parent)
 
 BRIEF = """# Brief: T042-fix-the-thing
 
@@ -822,6 +825,9 @@ print('leak guard: clean (shape patterns only)')
             # A check slot is taken whatever the load of the machine running
             # this suite; the load limits have their own tests, which set them.
             "LOOM_CHECK_LOAD_1M": "0", "LOOM_CHECK_LOAD_5M": "0",
+            # No baseline Pythons (loom#3602): the baseline has its own
+            # tests, and a real uv on PATH must not download them here.
+            "LOOM_CHECK_PYTHONS": "",
             "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
             "LOOM_GITHUB_APP_ID": "124", "LOOM_APP_TOKEN_CMD": str(self.default_mint),
@@ -7950,10 +7956,13 @@ exit %d
         self.assertTrue((self.inbox / "failed" / "T043-fix-the-thing.md").exists())
         self.assertFalse(any(c.startswith("codex") for c in self.calls()))
 
-    def check_uv_prepare(self, repo, files=None, contract_check="check", uv=True):
+    def check_uv_prepare(self, repo, files=None, contract_check="check", uv=True, pythons="",
+                         installed=()):
         """Run check_uv_prepare alone for repo on a tree holding files, with
-        a stand-in uv (on PATH when uv) that logs each call. Returns the
-        result, the cache it named and the uv calls."""
+        a stand-in uv (on PATH when uv) that logs each call. pythons is
+        LOOM_CHECK_PYTHONS (None leaves it unset, for the default baseline);
+        installed names directories already under the shared python/.
+        Returns the result, the cache it named and the uv calls."""
         text = RUNNER.read_text()
         funcs = "".join(re.search(r"^%s\(\) \{[^\n]*\n.*?^\}\n" % name, text, re.S | re.M).group(0)
                         for name in ("runner_uv", "check_uv_key", "check_uv_prepare"))
@@ -7963,8 +7972,11 @@ exit %d
         for name, body in (files or {}).items():
             (tree / name).write_text(body)
         calls = tmp / "uv-calls"
+        calls.unlink(missing_ok=True)  # each run reports only its own calls
         fakebin = tmp / "uvbin"
         shared = tmp / "run" / "uv-shared"
+        for name in installed:
+            (shared / "python" / name).mkdir(parents=True, exist_ok=True)
         # The stand-in also records whether the Python install lock was
         # held while it ran (a second holder cannot take it).
         self.lock_seen = tmp / "python-lock-seen"
@@ -7979,6 +7991,8 @@ exit %d
         self.write_tool(fakebin / "timeout", '#!/bin/bash\nshift\nexec "$@"\n')
         env = {"PATH": ("%s:/usr/bin:/bin" % fakebin) if uv else "/usr/bin:/bin",
                "HOME": str(tmp / "nohome"), "LOOM_ROOT": str(RUNNER.parent.parent)}
+        if pythons is not None:
+            env["LOOM_CHECK_PYTHONS"] = pythons
         script = ('CHECK_UV_DIR="$1" LOG="$2" TREE="$3" REPO="$4" C_CHECK="$5" C_SETUP="" NET_TIMEOUT=30\n'
                   'check_uv_prepare || exit 7\nprintf "%s\\n%s" "$CHECK_UV_CACHE" "$CHECK_UV_LOCK"\n')
         result = subprocess.run(["bash", "-c", funcs + script, "test", str(shared), str(tmp / "lane.log"),
@@ -8021,6 +8035,46 @@ exit %d
         self.assertEqual(calls, [])
         _, shared, calls = self.check_uv_prepare("example/uvx", contract_check="uvx ruff check .")
         self.assertEqual(calls, ["%s|python install --no-config --no-bin --no-cache" % (shared / "python")])
+
+    def test_a_tree_that_asks_for_no_python_still_gets_the_baseline_pythons(self):
+        # loom#3602: a tree that declares no Python but whose check scripts
+        # run `uv run --python 3.12` failed every base check once downloads
+        # were off. The runner installs the LOOM_CHECK_PYTHONS baseline
+        # (default 3.12 3.13 3.14) whatever the contract runs.
+        result, shared, calls = self.check_uv_prepare("example/repo", pythons=None)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls, ["%s|python install --no-config --no-bin --no-cache 3.12 3.13 3.14"
+                                 % (shared / "python")])
+        self.assertEqual(self.lock_seen.read_text().split(), ["held"])
+        # The tree's own versions come first, and the baseline is not repeated.
+        _, shared, calls = self.check_uv_prepare(
+            "example/py", {".python-version": "3.13\n"}, pythons="3.12 3.13")
+        self.assertEqual(calls, ["%s|python install --no-config --no-bin --no-cache 3.13 3.12"
+                                 % (shared / "python")])
+
+    def test_a_baseline_python_already_installed_is_not_installed_again(self):
+        _, shared, calls = self.check_uv_prepare(
+            "example/repo", pythons="3.12 3.13 3.14.1",
+            installed=("cpython-3.12.7-macos-aarch64-none", "cpython-3.13.1+freethreaded-linux-x86_64-gnu",
+                       "cpython-3.14.10-linux-x86_64-gnu"))
+        # 3.12 is there; a free-threaded 3.13 is not 3.13; 3.14.10 is not 3.14.1.
+        self.assertEqual(calls, ["%s|python install --no-config --no-bin --no-cache 3.13 3.14.1"
+                                 % (shared / "python")])
+        # Everything present: no install at all, so the common path stays fast.
+        _, _, calls = self.check_uv_prepare(
+            "example/other", pythons="3.12 3.13",
+            installed=("cpython-3.12.7-macos-aarch64-none", "cpython-3.13.1-macos-aarch64-none"))
+        self.assertEqual(calls, [])
+
+    def test_a_bad_baseline_entry_is_ignored_and_logged(self):
+        result, shared, calls = self.check_uv_prepare("example/repo", pythons="3.12 $(id) >=3.10 3.13")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls, ["%s|python install --no-config --no-bin --no-cache 3.12 3.13"
+                                 % (shared / "python")])
+        log = (Path(self._tmp.name) / "lane.log").read_text()
+        self.assertIn("ignoring LOOM_CHECK_PYTHONS entry", log)
+        self.assertIn(">=3.10", log)
+        self.assertNotIn("uid=", log)
 
     def test_a_base_verdict_write_prunes_expired_verdicts_and_keeps_fresh_ones(self):
         text = RUNNER.read_text()

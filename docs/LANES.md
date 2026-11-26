@@ -286,6 +286,18 @@ unset variables.
     none gets uv's default Python when its contract runs `uv` or `uvx` and
     none is installed yet. Every check and agent reads them; none may write
     them.
+  - `LOOM_CHECK_PYTHONS` (default `3.12 3.13 3.14`, space separated) is a
+    baseline the runner installs beside the tree's versions, in the same
+    install under `locks/python.lock` (loom#3602). A tree may declare no
+    Python and still run `uv run --python 3.12` in its check scripts; with
+    downloads off, that failed every base check. Each entry must be a plain
+    version (`3`, `3.12`, `3.12.7`); any other entry is logged and ignored.
+    A version already under `python/` (a `cpython-<version>.*` or
+    `cpython-<version>-*` directory, not a `+freethreaded` or other `+`
+    variant) is not asked for again, so a warm directory runs no install.
+    An empty value turns the baseline off. `python/` lives on the pod's
+    `run/` volume, so a restarted pod installs the baseline again on its
+    first check.
   - `locks/<owner>_<name>.lock`: a check holds its repo's lock shared while
     it runs.
   The check home keeps the per-slot HOME and TMPDIR and holds no uv cache or
