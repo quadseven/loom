@@ -107,8 +107,25 @@ class SignatureLineTest(unittest.TestCase):
 
     def test_commit_trailers_are_added_once(self):
         message = signature.commit_message("Fix the thing", "spark", MODEL)
-        self.assertEqual(message, "Fix the thing\n\nLoom-Lane: lane-spark\nLoom-Model: %s\n" % MODEL)
+        self.assertEqual(
+            message,
+            "Fix the thing\n\nLoom-Engine: unknown\nLoom-Model: %s\nLoom-Lane: lane-spark\n"
+            "Loom-Run: unknown\n" % MODEL)
         self.assertEqual(signature.commit_message(message, "spark", MODEL), message)
+
+    def test_commit_carries_the_four_trailers_with_engine_and_run(self):
+        message = signature.commit_message("Fix", "spark", "m1", "eng", "run-7")
+        self.assertEqual(message.splitlines()[-4:], [
+            "Loom-Engine: eng", "Loom-Model: m1", "Loom-Lane: lane-spark", "Loom-Run: run-7"])
+        again = signature.commit_message(message, "spark", "m1", "eng", "run-7")
+        self.assertEqual(again, message)
+
+    def test_engine_and_run_fall_back_to_the_environment(self):
+        env = {"LOOM_SPARK_ENGINE": "eng-env", "LOOM_RUN_ID": "r9"}
+        with mock.patch.dict(os.environ, env, clear=False):
+            text = signature.trailers("spark", "m1")
+        self.assertIn("Loom-Engine: eng-env", text)
+        self.assertIn("Loom-Run: r9", text)
 
 
 class PullRequestBodyTest(unittest.TestCase):
@@ -190,7 +207,8 @@ class RunnerShellTest(unittest.TestCase):
 
     def test_commit_msg_carries_both_trailers_once(self):
         out = shell('MODEL=%s; commit_msg "$(commit_msg "Fix the thing")"' % MODEL)
-        self.assertEqual(out.strip(), "Fix the thing\n\nLoom-Lane: lane-spark\nLoom-Model: " + MODEL)
+        self.assertEqual(out.strip(), "Fix the thing\n\nLoom-Engine: unknown\nLoom-Model: " + MODEL
+                         + "\nLoom-Lane: lane-spark\nLoom-Run: unknown")
 
     def test_a_real_commit_made_with_commit_msg_has_the_trailers(self):
         with tempfile.TemporaryDirectory() as tmp:

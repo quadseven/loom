@@ -3,8 +3,8 @@
 Every lane shares one GitHub App identity, so the author of a pull request or
 comment does not say which lane or model wrote it. A lane therefore signs its
 own text: one final line, `Signed: <lane name>, model <model id>`, on each
-pull request body and comment, and two trailers on each commit,
-`Loom-Lane: <lane name>` and `Loom-Model: <model id>`.
+pull request body and comment, and four trailers on each commit,
+`Loom-Engine`, `Loom-Model`, `Loom-Lane` and `Loom-Run`.
 
 The lane name is `lane-<slot>` (lane-spark). The model is the one the lane
 calls: the run's own model when the caller has it, else LOOM_<SLOT>_MODEL from
@@ -93,17 +93,38 @@ def sign(text: str, slot: str, model: Optional[str] = None) -> str:
     return (body + "\n\n" if body else "") + line(slot, model)
 
 
-def trailers(slot: str, model: Optional[str] = None) -> str:
+def engine_for(slot: str, env: Optional[Mapping[str, str]] = None) -> str:
+    """The engine a slot runs on, from LOOM_<SLOT>_ENGINE, else the lane's
+    family LOOM_<LANE>_ENGINE, the same fall-back as model_for."""
+    env = os.environ if env is None else env
+    parts = lane_name(slot)[len("lane-"):].upper().replace("-", "_").split("_")
+    while parts:
+        value = str(env.get("LOOM_%s_ENGINE" % "_".join(parts)) or "").strip()
+        if value:
+            return value
+        parts.pop()
+    return ""
+
+
+def trailers(slot: str, model: Optional[str] = None, engine: Optional[str] = None,
+             run: Optional[str] = None) -> str:
+    """The four lane trailers: Loom-Engine, Loom-Model, Loom-Lane, Loom-Run.
+    An engine or run the caller does not know is written as `unknown`; the
+    run falls back to LOOM_RUN_ID in the environment."""
     chosen = _clean(model or model_for(slot)) or UNKNOWN_MODEL
-    return "Loom-Lane: %s\nLoom-Model: %s" % (_clean(lane_name(slot)), chosen)
+    eng = _clean(engine or engine_for(slot)) or UNKNOWN_MODEL
+    rid = _clean(run or os.environ.get("LOOM_RUN_ID", "")) or UNKNOWN_MODEL
+    return "Loom-Engine: %s\nLoom-Model: %s\nLoom-Lane: %s\nLoom-Run: %s" % (
+        eng, chosen, _clean(lane_name(slot)), rid)
 
 
-def commit_message(subject: str, slot: str, model: Optional[str] = None) -> str:
+def commit_message(subject: str, slot: str, model: Optional[str] = None,
+                   engine: Optional[str] = None, run: Optional[str] = None) -> str:
     """The message with the lane trailers last, once."""
     kept = [x for x in str(subject or "").rstrip().split("\n")
-            if not x.startswith(("Loom-Lane: ", "Loom-Model: "))]
+            if not x.startswith(("Loom-Lane: ", "Loom-Model: ", "Loom-Engine: ", "Loom-Run: "))]
     head = "\n".join(kept).rstrip()
-    return "%s\n\n%s\n" % (head, trailers(slot, model))
+    return "%s\n\n%s\n" % (head, trailers(slot, model, engine, run))
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -113,6 +134,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         p = sub.add_parser(name)
         p.add_argument("--lane", required=True)
         p.add_argument("--model", default="")
+        p.add_argument("--engine", default="")
+        p.add_argument("--run", default="")
         if name == "message":
             p.add_argument("subject")
     p = sub.add_parser("strip")
@@ -121,7 +144,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.command == "sign":
         sys.stdout.write(sign(sys.stdin.read(), args.lane, args.model) + "\n")
     elif args.command == "message":
-        sys.stdout.write(commit_message(args.subject, args.lane, args.model))
+        sys.stdout.write(commit_message(args.subject, args.lane, args.model, args.engine, args.run))
     else:
         with open(args.file, encoding="utf-8") as fh:
             old = fh.read()

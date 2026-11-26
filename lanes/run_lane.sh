@@ -2457,7 +2457,7 @@ sign_tail() { printf '\n\n%s' "$(signed "")"; }
 commit_msg() {
   local out
   out="$(PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.signature message \
-    --lane "$SLOT" --model "${MODEL:-}" "$1" 2>> "${LOG:-/dev/null}")" || out="$1"
+    --lane "$SLOT" --model "${MODEL:-}" --engine "${ENGINE:-}" --run "${LOOM_RUN_ID:-}" "$1" 2>> "${LOG:-/dev/null}")" || out="$1"
   printf '%s' "$out"
 }
 
