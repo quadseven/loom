@@ -7218,6 +7218,31 @@ class RetryTest(Base):
                          "Lane codex failed: [work] agent made no commit on loom/12-fix-the-thing")
         self.assertEqual(self.listing("codex-2"), [])
 
+    def _old_failed_runs(self, count):
+        """`count` claims over days, each ended by a different work failure."""
+        rows = []
+        for n in range(count):
+            at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - (30 - n) * 86400))
+            rows.append({"body": "Claimed for lane codex (body sha256 0123456789ab)",
+                         "created_at": at, "user": {"login": "alice-example"}})
+            rows.append({"body": "Lane codex failed: [work] reason number %d" % n,
+                         "created_at": at, "user": {"login": "alice-example"}})
+        return rows
+
+    def test_failed_runs_past_the_cap_hold_the_ticket_though_each_differs(self):
+        self.failed(body=BODY_WITH_CRITERIA, reason="[work] the newest reason")
+        self.fake.comments[12][:0] = self._old_failed_runs(8)
+        self.run_pass()
+        self.assertIn("loom:runaway", self.fake.names(12))
+        self.assertIn("Runaway: ", self.bodies()[-1])
+        self.assertIn("failed runs since the last brief.", self.bodies()[-1])
+
+    def test_failed_runs_under_the_cap_do_not_hold_the_ticket(self):
+        self.failed(body=BODY_WITH_CRITERIA, reason="[work] the newest reason")
+        self.fake.comments[12][:0] = self._old_failed_runs(3)
+        self.run_pass()
+        self.assertNotIn("loom:runaway", self.fake.names(12))
+
     def test_three_recent_attempts_with_no_earlier_failure_flag_the_ticket(self):
         self.failed(body=BODY_WITH_CRITERIA, reason="[work] agent made no commit on loom/12-fix-the-thing")
         at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 600))
