@@ -2,8 +2,8 @@
 print it as the "key: value" lines lanes/run_lane.sh runs.
 
 Three forms are in use (2026-10-16):
-- key: value lines (interpreter, submodules, setup, check, affected), which
-  pass through unchanged;
+- key: value lines (interpreter, submodules, setup, check, affected,
+  autoformat), which pass through unchanged;
 - one "<kind> | <command> | <workflow> | <step>" line per command;
 - "[kind]" or "[kind.name]" tables, or "[[kind]]" array tables (one per
   command), with a command = "..." key.
@@ -20,6 +20,12 @@ an `[affected]` table) is not part of the check: the runner runs it after the
 check with the pull request's changed files on stdin, so a repo can run the
 per-directory suites its path-scoped CI jobs run (loom#1773). In the last two
 forms the affected commands become one `affected:` line joined with " && ".
+
+An "autoformat" command (an `autoformat:` line, an `autoformat | <command>`
+line or an `[autoformat]` table) is not part of the check either: the runner
+runs it once before the final check with the lane's changed files appended,
+and commits what it changed in those files (loom#3577). The last two forms
+join several into one `autoformat:` line the same way.
 """
 from __future__ import annotations
 
@@ -30,7 +36,8 @@ from typing import Dict, List, Tuple
 
 KINDS = ("lint", "format", "type", "test")
 AFFECTED = "affected"
-LEGACY = re.compile(r"^(interpreter|submodules|setup|check|affected)\s*:")
+AUTOFORMAT = "autoformat"
+LEGACY = re.compile(r"^(interpreter|submodules|setup|check|affected|autoformat)\s*:")
 TABLE = re.compile(r"^(?:\[([a-z]+)(?:\.[A-Za-z0-9_-]+)*\]|\[\[([a-z]+)(?:\.[A-Za-z0-9_-]+)*\]\])$")
 COMMAND = re.compile(r'^command\s*=\s*(?:"((?:[^"\\]|\\.)*)"|(.*\S))$')
 
@@ -42,7 +49,7 @@ def _lines(text: str) -> List[str]:
 
 def _ordered(found: List[Tuple[str, str]]) -> List[str]:
     for kind, _ in found:
-        if kind not in KINDS and kind != AFFECTED:
+        if kind not in KINDS and kind not in (AFFECTED, AUTOFORMAT):
             raise ValueError("unknown kind %r (expected one of %s)" % (kind, ", ".join(KINDS)))
     return [cmd for kind in KINDS for k, cmd in found if k == kind and cmd]
 
@@ -110,10 +117,12 @@ def normalize(text: str) -> str:
     found = _from_tables(lines) if tables else _from_pipes(lines)
     commands = _ordered(found)
     affected = [cmd for kind, cmd in found if kind == AFFECTED and cmd]
+    autoformat = [cmd for kind, cmd in found if kind == AUTOFORMAT and cmd]
     tail = "affected: %s\n" % " && ".join(affected) if affected else ""
+    tail += "autoformat: %s\n" % " && ".join(autoformat) if autoformat else ""
     if not commands:
         return "check: true\n" + tail
-    return "interpreter: %s\ncheck: %s\n%s" % (_interpreter(commands + affected),
+    return "interpreter: %s\ncheck: %s\n%s" % (_interpreter(commands + affected + autoformat),
                                                " && ".join(commands), tail)
 
 

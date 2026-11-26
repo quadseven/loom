@@ -137,6 +137,35 @@ echo "agent-exit $slot $status" >> "$FAKE_LOG"
         self.assertIn("drain-seen zen", lines)
         self.assertLess(took, 15)
 
+    # A pod fed by the station (bus/lane_feed.py, loom#3621): each
+    # round first pushes the slots' heartbeats and reports and takes their
+    # next briefs, then starts the runners. A fake module records the call.
+    FAKE_FEED = """import os, sys
+with open(os.environ["FAKE_LOG"], "a") as fh:
+    fh.write("feed %s\\n" % " ".join(sys.argv[1:]))
+"""
+
+    def with_fake_feed(self):
+        bus = self.root / "bus"
+        bus.mkdir()
+        (bus / "__init__.py").write_text("")
+        (bus / "lane_feed.py").write_text(self.FAKE_FEED)
+
+    def test_a_fed_pod_syncs_its_slots_before_each_round(self):
+        self.with_fake_feed()
+        result = self.pod(LOOM_POD_SLOTS="zen opencode-go-5", LOOM_POD_FEED="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = self.log.read_text().splitlines()
+        self.assertEqual(lines[0], "feed sync zen opencode-go-5")
+        self.assertEqual(sorted(lines[1:]), ["opencode-go-5 sandbox=bwrap drop=1",
+                                             "zen sandbox=bwrap drop=1"])
+
+    def test_a_pod_not_fed_runs_no_sync(self):
+        self.with_fake_feed()
+        result = self.pod(LOOM_POD_SLOTS="zen")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("feed", self.log.read_text())
+
     def test_bad_settings_start_nothing(self):
         for env in ({}, {"LOOM_POD_SLOTS": "zen ../x"}, {"LOOM_POD_SLOTS": "zen", "LOOM_POD_INTERVAL": "0"},
                     {"LOOM_POD_SLOTS": "zen", "LOOM_POD_DRAIN_SECONDS": "x"},
@@ -145,6 +174,38 @@ echo "agent-exit $slot $status" >> "$FAKE_LOG"
                 result = self.pod(**env)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse(self.log.exists())
+
+    # The sign-in probe (lanes/signin_probe.sh, loom#3572): one per sign-in
+    # lane with a slot here, covering every slot of that lane.
+    FAKE_PROBE = """#!/usr/bin/env bash
+echo "probe $*" >> "$FAKE_LOG"
+"""
+
+    def with_fake_probe(self):
+        probe = self.root / "lanes" / "signin_probe.sh"
+        probe.write_text(self.FAKE_PROBE)
+        probe.chmod(0o755)
+
+    def test_one_round_probes_each_sign_in_lane_over_all_its_slots(self):
+        self.with_fake_probe()
+        result = self.pod(LOOM_POD_SLOTS="codex codex-2 codex-12 zen")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = self.log.read_text().splitlines()
+        self.assertEqual([line for line in lines if line.startswith("probe")],
+                         ["probe codex codex-2 codex-12"])
+
+    def test_no_probe_for_api_lanes_or_when_turned_off(self):
+        self.with_fake_probe()
+        for env in ({"LOOM_POD_SLOTS": "zen opencode-go-5"},
+                    {"LOOM_POD_SLOTS": "claude", "LOOM_SIGNIN_PROBE_INTERVAL": "0"},
+                    {"LOOM_POD_SLOTS": "claude", "LOOM_SIGNIN_LANES": ""}):
+            with self.subTest(env=env):
+                if self.log.exists():
+                    self.log.unlink()
+                result = self.pod(**env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(any(line.startswith("probe")
+                                     for line in self.log.read_text().splitlines()))
 
 
 if __name__ == "__main__":

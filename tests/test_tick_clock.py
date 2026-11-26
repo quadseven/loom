@@ -351,14 +351,17 @@ class JournalFooterTests(unittest.TestCase):
 
     def test_the_journal_command_reads_the_holders_step_times(self):
         _, gh = held_lock()
-        brain.tick_step(gh, REPO, "lock", holder="muse", now=at(0))
+        # A 10-minute tick, so the journal at 7 minutes is past its budget
+        # and skipping the steps between is allowed (loom#3593).
+        brain.tick_step(gh, REPO, "lock", holder="muse", now=at(0), tick_minutes=10)
         brain.tick_step(gh, REPO, "merge", holder="muse", now=at(2))
         brain.tick_step(gh, REPO, "journal", holder="muse", now=at(7))
         with mock.patch.object(cli, "datetime", clock(at(8))):
             line = cli._steps_footer(gh, REPO, "muse")
             self.assertIsNone(cli._steps_footer(gh, REPO, "peer"))
         self.assertEqual(line, "- Steps: lock 2m00s, merge 5m00s, journal 1m00s (running); "
-                               "elapsed 8 of 25 minutes (1020 seconds left)")
+                               "elapsed 8 of 10 minutes (120 seconds left): past 5, "
+                               "a step may be deferred on budget")
         posting = Scripted(reply(200, {"login": "me"}), reply(200, []), reply(201, {}))
         journal.post(GitHub("tok", transport=posting), REPO, 7,
                      journal.JOURNAL_MARKER + "\nMoved: one.\n- Steps: stale\n", "muse",

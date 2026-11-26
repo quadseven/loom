@@ -19,7 +19,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tests.test_run_lane import SANDBOX_HELPERS
+from tests.test_run_lane import CHECK_UV_HELPERS, SANDBOX_HELPERS
 
 RUNNER = Path(__file__).resolve().parent.parent / "lanes" / "run_lane.sh"
 
@@ -54,7 +54,7 @@ class LaneTmpdirTest(unittest.TestCase):
                 fake.chmod(0o755)
             check_home = root / "check"
             log = root / "log"
-            script = (funcs + SANDBOX_HELPERS
+            script = (funcs + CHECK_UV_HELPERS + SANDBOX_HELPERS
                       + 'sandbox_profile() { echo "(version 1)"; }\n'
                       + 'contract_run_sandboxed "$1"\n')
             env = {"PATH": f"{fakes}:/usr/bin:/bin", "LOG": str(log),

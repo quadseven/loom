@@ -63,6 +63,13 @@ if [ "$3" = lock ]; then
   exit "${FAKE_LOCK:-0}"
 fi
 [ "$3" = yielded ] && exit "${FAKE_YIELD:-0}"
+if [ "$3" = step-pending ]; then
+  # FAKE_PENDING=n: the first n reads find steps not run with time left.
+  n=$(grep -c ' step-pending ' "$FAKE_LOG")
+  if [ "$n" -le "${FAKE_PENDING:-0}" ]; then echo "not run yet: brief, triage"; exit 0; fi
+  echo "every step ran"
+  exit 1
+fi
 exit 0
 """
 
@@ -434,6 +441,24 @@ class BrainTickTest(unittest.TestCase):
         self.assertTrue((self.home / "brain" / "loom" / "docs" / "MUSE.md").exists())
         self.assertEqual("python3 -m bus unlock example/loom --holder lane-machine", calls[-1])
 
+    def test_report_queue_survives_checkout_cleanup_and_prompt_reserves_work(self):
+        self.tick()
+        queue = self.home / "brain" / "report-budget.json"
+        queue.write_text('{"pending": []}\n')
+        run, calls = self.tick()
+        self.assertEqual(0, run.returncode)
+        prompt = next(c for c in calls if c.startswith("claude "))
+        working = self.home / "brain" / "loom" / "report-budget.json"
+        self.assertIn("report-plan --state \"%s\"" % working, prompt)
+        self.assertIn("--holder lane-machine --lock-repo example/loom", prompt)
+        self.assertIn("verify, brief, triage and sweep", prompt)
+        self.assertIn("Reports deferred", prompt)
+        self.assertEqual('{"pending": []}\n', queue.read_text())
+        working.write_text('{"pending": ["%s#%d"]}\n' % ("example/project", 1))
+        self.tick()
+        self.assertEqual(working.read_text(), queue.read_text())
+        self.assertIn('"example/project' + '#1"', queue.read_text())
+
     def test_the_agent_records_its_steps_as_the_wrapper_holder(self):
         _, calls = self.tick()
         claude = [c for c in calls if c.startswith("claude ")]
@@ -441,6 +466,30 @@ class BrainTickTest(unittest.TestCase):
                       "--lock-repo example/loom", claude[0])
         self.assertEqual("python3 -m bus.brain step unlock --holder lane-machine "
                          "--lock-repo example/loom", calls[-2])
+
+    def test_an_agent_that_ends_with_steps_not_run_gets_the_tick_back(self):
+        # loom#3593: the 2026-11-25 ticks ended after merge with time left.
+        _, calls = self.tick(FAKE_PENDING="1")
+        claude = [c for c in calls if c.startswith("claude ")]
+        self.assertEqual(2, len(claude))
+        # The agent's log line ends at the prompt's first newline.
+        self.assertNotIn("The tick is not finished", claude[0])
+        self.assertIn("The tick is not finished: not run yet: brief, triage. Continue",
+                      "\n".join(calls[calls.index(claude[1]):]))
+        self.assertEqual(2, sum(" step-pending " in c for c in calls))
+        self.assertEqual("python3 -m bus unlock example/loom --holder lane-machine", calls[-1])
+
+    def test_continues_are_bounded(self):
+        _, calls = self.tick(FAKE_PENDING="9")
+        self.assertEqual(3, sum(c.startswith("claude ") for c in calls))
+
+    def test_a_tick_whose_steps_all_ran_is_not_continued(self):
+        _, calls = self.tick()
+        self.assertEqual(1, sum(c.startswith("claude ") for c in calls))
+
+    def test_a_failed_agent_is_not_continued(self):
+        _, calls = self.tick(FAKE_PENDING="1", FAKE_CLAUDE_EXIT="2")
+        self.assertFalse(any(" step-pending " in c for c in calls))
 
     def test_a_failed_agent_still_unlocks(self):
         _, calls = self.tick(FAKE_CLAUDE_EXIT="2")

@@ -44,7 +44,7 @@ C_CHECK='cd "$ROOT/check-dir" && export CHECK_STATE=kept && passing && flaky && 
 printf 'earlier setup output\n' > "$LOG"
 : > "$CALLS"
 load_contract() { return 0; }
-remote_checks_on() { return 1; }
+remote_base_verdict() { return 1; }
 sandbox_ready() { return 0; }
 sha256sum() { return 0; }
 tool_runs() { return 0; }

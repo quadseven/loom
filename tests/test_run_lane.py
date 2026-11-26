@@ -41,6 +41,17 @@ SANDBOX_HELPERS = "".join(
     re.search(r"^%s\(\) \{\n.*?^\}\n" % name,
               (RUNNER.parent / "agent_sandbox.sh").read_text(), re.S | re.M).group(0)
     for name in ("sandbox_kind", "sandbox_command"))
+# The shared uv directory helpers contract_run_sandboxed calls (loom#3591),
+# for the same tests: the repo, its shared uv directory (beside the check
+# home unless the test names one) and the checkout that holds uv_cache.py.
+CHECK_UV_HELPERS = "".join(
+    re.search(r"^%s\(\) \{\n.*?^\}\n" % name, RUNNER.read_text(), re.S | re.M).group(0)
+    for name in ("runner_uv", "check_uv_key", "check_uv_prepare")) + (
+    'REPO="${REPO:-example/repo}" CHECK_UV_DIR="${CHECK_UV_DIR:-$CHECK_HOME-uv-shared}" '
+    'LOOM_ROOT="${LOOM_ROOT:-%s}" NET_TIMEOUT="${NET_TIMEOUT:-30}" '
+    # No baseline Python install unless a test asks for one (loom#3602):
+    # a runner with a real uv must not download Pythons for every test.
+    'LOOM_CHECK_PYTHONS="${LOOM_CHECK_PYTHONS-}"\n' % RUNNER.parent.parent)
 
 BRIEF = """# Brief: T042-fix-the-thing
 
@@ -96,9 +107,12 @@ if [ "$1" = api ]; then
   store="$FAKE_LOG.comments"
   case "$*" in
     # A commit's GitHub checks, one "status conclusion" line each, from
-    # $FAKE_GH_CHECKS (default none).
+    # $FAKE_GH_CHECKS (default none), with optional tab-separated names.
     "api --paginate repos/"*"/check-runs"*)
-      printf '%s' "${FAKE_GH_CHECKS:-}"; exit 0 ;;
+      case "$*" in
+        *'.name'*) printf '%s' "${FAKE_GH_CHECKS:-}" ;;
+        *) printf '%s' "${FAKE_GH_CHECKS:-}" | cut -f1 ;;
+      esac; exit 0 ;;
     "api --paginate repos/"*"/comments --jq "*)
       [ -z "${FAKE_GH_COMMENTS_FAIL:-}" ] || { echo "HTTP 502" >&2; exit 1; }
       where="${3#repos/}"; where="${where%/comments}"; repo="${where%/issues/*}"; num="${where##*/}"
@@ -424,7 +438,7 @@ if [ "${1:-}" = models ]; then
 fi
 args="$*"; args="${args//$'\\n'/ }"
 keyvar=none; key=none
-for v in OPENROUTER_API_KEY OPENCODE_API_KEY ANTHROPIC_API_KEY ZHIPU_API_KEY CLOUDFLARE_API_KEY SPARK_API_KEY; do
+for v in OPENROUTER_API_KEY OPENCODE_API_KEY ANTHROPIC_API_KEY ZHIPU_API_KEY CLOUDFLARE_API_KEY SPARK_API_KEY TINKER_API_KEY; do
   if [ -n "${!v:-}" ]; then keyvar="$v"; key="${!v}"; fi
 done
 real_home="$(cd ../../.. && pwd)"
@@ -655,6 +669,7 @@ def git(*args, cwd=None):
 class LaneRunnerTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
+        self._stations = []
         root = Path(self._tmp.name)
         self.home = root / "home"
         self.loom = self.home / "loom"
@@ -765,6 +780,12 @@ print('leak guard: clean (shape patterns only)')
         self.scanner.chmod(0o755)
 
     def tearDown(self):
+        # A fake station thread writes inside the temp dir; stop it and wait
+        # for it before the dir is removed (cleanups run after tearDown).
+        for stop, thread in self._stations:
+            stop.set()
+            thread.join(20)
+            self.assertFalse(thread.is_alive(), "the fake station thread did not stop")
         self._tmp.cleanup()
 
     @staticmethod
@@ -807,6 +828,9 @@ print('leak guard: clean (shape patterns only)')
             # A check slot is taken whatever the load of the machine running
             # this suite; the load limits have their own tests, which set them.
             "LOOM_CHECK_LOAD_1M": "0", "LOOM_CHECK_LOAD_5M": "0",
+            # No baseline Pythons (loom#3602): the baseline has its own
+            # tests, and a real uv on PATH must not download them here.
+            "LOOM_CHECK_PYTHONS": "",
             "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
             "LOOM_GITHUB_APP_ID": "124", "LOOM_APP_TOKEN_CMD": str(self.default_mint),
@@ -836,6 +860,7 @@ print('leak guard: clean (shape patterns only)')
         for agent in sorted((self.loom / "run").glob("*-home/tmp/agent.log")):
             extra += agent.read_text().splitlines()
         return self.log.read_text().splitlines() + extra
+
 
     def test_fix_items_ignores_dispositions_before_a_finding(self):
         brief = Path(self._tmp.name) / "fix-items.md"
@@ -3024,7 +3049,8 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
 
     def beats(self):
         usage = self.loom / "state" / "usage"
-        return {p.stem: json.loads(p.read_text()) for p in usage.glob("*.json")}
+        # Heartbeats only: a codex pass also writes its codex.meter.json.
+        return {p.stem: json.loads(p.read_text()) for p in usage.glob("*.json") if "." not in p.stem}
 
     def test_empty_credit_on_one_anthropic_slot_holds_all_eight(self):
         self.hold_credit("anthropic-3")
@@ -3942,6 +3968,27 @@ exec /usr/bin/git "$@"
         git("push", "-q", "origin", side, cwd=work)
         self.drop_brief(text=BRIEF + "\n## Earlier attempt\n\nAn earlier attempt timed out after "
                         "editing, and the runner kept its edits on branch %s.\n" % side)
+        self.write_tool(self.bin / "codex", FAKE_AGENT.replace(
+            "cat > /dev/null\n",
+            "cat > /dev/null\n[ -f earlier.txt ] && echo agent-saw-earlier >> \"$FAKE_LOG\"\n", 1))
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("agent-saw-earlier", self.calls())
+        self.assertIn("merged the earlier attempt's branch %s" % side, self.lane_log())
+
+    def test_an_earlier_red_check_attempts_edits_are_in_the_tree_before_the_agent(self):
+        # A run parked on a red final check keeps its edits on an
+        # -unvalidated- branch; the next attempt fixes them, not starts over.
+        side = "loom/T042-fix-the-thing-unvalidated-1792595837"
+        work = Path(self._tmp.name) / "side-work"
+        git("clone", "-q", str(self.remote), str(work))
+        git("checkout", "-q", "-b", side, cwd=work)
+        (work / "earlier.txt").write_text("from the red-check run\n")
+        git("add", "earlier.txt", cwd=work)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "WIP", cwd=work)
+        git("push", "-q", "origin", side, cwd=work)
+        self.drop_brief(text=BRIEF + "\n## Earlier attempt\n\nAn earlier attempt edited this ticket but "
+                        "its final check failed, and the runner kept its edits on branch %s.\n" % side)
         self.write_tool(self.bin / "codex", FAKE_AGENT.replace(
             "cat > /dev/null\n",
             "cat > /dev/null\n[ -f earlier.txt ] && echo agent-saw-earlier >> \"$FAKE_LOG\"\n", 1))
@@ -5224,6 +5271,150 @@ esac
         self.assertIn("-m opencode-go/beam-free", run)
         self.assertNotIn("-m opencode-go/kimi", run)
         self.assertIn("REFUSED the brief's Model: opencode-go/kimi-k2.7-code", result.stderr)
+
+    # The tinker lane (loom#3579): Tinker bills every model id without :free
+    # against a prepaid balance, so the lane runs its configured :free id only
+    # and no other id ever reaches the network.
+    TINKER_FREE = "tinker/thinkingmachines/Inkling-2-Mini:peft:65536:free"
+    TINKER_PAID = "tinker/thinkingmachines/Inkling-2-Mini:peft:65536"
+
+    def tinker_env(self, **env):
+        return {"LOOM_TINKER_KEY_SSM": "/k/tk", "FAKE_SECRET__k_tk": "fake-tk-key",
+                "LOOM_TINKER_URL": "https://tinker.example.invalid/oai/api/v1",
+                "LOOM_TINKER_MODEL": self.TINKER_FREE, **env}
+
+    def assert_tinker_calls_nothing(self):
+        calls = self.calls()
+        self.assertFalse(any(c.startswith(("opencode ", "curl ")) for c in calls), calls)
+
+    def assert_tinker_refuses(self, why, **env):
+        inbox = self.loom / "briefs" / "tinker"
+        inbox.mkdir(parents=True, exist_ok=True)
+        (inbox / "T042-fix-the-thing.md").write_text(BRIEF.replace("Lane: codex", "Lane: tinker"))
+        result = self.run_lane("tinker", **self.tinker_env(**env))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("REFUSED", result.stderr)
+        self.assert_tinker_calls_nothing()
+        self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
+        beat = self.beat("tinker")
+        self.assertFalse(beat["available"], beat)
+        self.assertIn(why, beat["reason"])
+
+    def test_a_tinker_lane_on_a_paid_model_id_does_not_start_and_calls_nothing(self):
+        self.assert_tinker_refuses("does not end in :free", LOOM_TINKER_MODEL=self.TINKER_PAID)
+
+    def test_a_tinker_lane_whose_id_has_free_before_its_end_does_not_start(self):
+        self.assert_tinker_refuses("does not end in :free", LOOM_TINKER_MODEL=self.TINKER_FREE + ":x")
+
+    def test_a_tinker_lane_whose_id_ends_in_free_in_another_case_does_not_start(self):
+        self.assert_tinker_refuses("does not end in :free", LOOM_TINKER_MODEL=self.TINKER_PAID + ":FREE")
+
+    def test_a_tinker_lane_with_no_model_does_not_start(self):
+        self.assert_tinker_refuses("LOOM_TINKER_MODEL", LOOM_TINKER_MODEL="")
+
+    def test_a_tinker_lane_with_a_model_ladder_does_not_start(self):
+        self.assert_tinker_refuses("LOOM_TINKER_MODELS",
+                                   LOOM_TINKER_MODELS=self.TINKER_FREE + " " + self.TINKER_PAID)
+
+    def test_a_tinker_lane_on_a_plain_http_endpoint_does_not_start(self):
+        self.assert_tinker_refuses("LOOM_TINKER_URL", LOOM_TINKER_URL="http://tinker.example.invalid/v1")
+
+    def tinker_config(self, model):
+        """opencode_config, then opencode_run, for the tinker lane alone, with
+        api_agent standing in for the sandboxed CLI: (stdout, stderr, every
+        call api_agent or the CLI received)."""
+        calls = Path(self._tmp.name) / "tinker-calls"
+        fake = Path(self._tmp.name) / "fake-opencode"
+        self.write_tool(fake, '#!/usr/bin/env bash\necho "opencode $*" >> "%s"\necho 1.18.4\n' % calls)
+        script = "\n".join([
+            '. "$1/lanes/agent_sandbox.sh"',
+            'CALLS="$2"',
+            'api_agent() { echo "api_agent $*" >> "$CALLS"; }',
+            'LANE=tinker MODEL="$3" TINKER_URL=https://tinker.example.invalid/v1 API_KEY=k AGENT_EXTRA_ENV=""',
+            'opencode_config; echo "config=$?"',
+            'printf "env=%s\\n" "${AGENT_EXTRA_ENV:-none}"',
+            'AGENT_EXTRA_ENV=""',
+            'opencode_run TINKER_API_KEY "$4" run hello; echo "run=$?"',
+        ])
+        out = subprocess.run(["bash", "-c", script, "-", str(RUNNER.parent.parent), str(calls), model, str(fake)],
+                             capture_output=True, text=True, timeout=30)
+        return out.stdout, out.stderr, calls.read_text() if calls.exists() else ""
+
+    def test_the_tinker_request_path_refuses_a_paid_model_id_before_any_call(self):
+        for model in (self.TINKER_PAID, self.TINKER_FREE + ":x", "tinker/:free", self.TINKER_PAID + ":FREE",
+                      "openrouter/vendor/model:free"):
+            with self.subTest(model=model):
+                stdout, stderr, calls = self.tinker_config(model)
+                self.assertIn("config=1", stdout)
+                self.assertIn("env=none", stdout)
+                self.assertNotIn("run=0", stdout)
+                self.assertIn("does not end in :free", stderr)
+                self.assertEqual(calls, "")
+
+    def test_the_tinker_provider_serves_only_the_free_model(self):
+        stdout, _, calls = self.tinker_config(self.TINKER_FREE)
+        self.assertIn("config=0", stdout)
+        config = json.loads(re.search(r"OPENCODE_CONFIG_CONTENT=(.*)", stdout).group(1))
+        self.assertEqual(config["model"], self.TINKER_FREE)
+        self.assertEqual(config["small_model"], self.TINKER_FREE)
+        self.assertEqual(list(config["provider"]), ["tinker"])
+        provider = config["provider"]["tinker"]
+        self.assertEqual(provider["options"]["baseURL"], "https://tinker.example.invalid/v1")
+        self.assertEqual(provider["options"]["apiKey"], "{env:TINKER_API_KEY}")
+        self.assertEqual(list(provider["models"]), ["thinkingmachines/Inkling-2-Mini:peft:65536:free"])
+        self.assertIn("run=0", stdout)
+        self.assertIn("api_agent TINKER_API_KEY", calls)
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_tinker_run_uses_the_free_model_on_the_tinker_provider(self):
+        inbox, result = self.api_lane("tinker", **self.tinker_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run = [c for c in self.calls() if c.startswith("opencode ")]
+        self.assertEqual(len(run), 1, self.calls())
+        self.assertIn("-m %s --print-logs" % self.TINKER_FREE, run[0])
+        self.assertIn("keyvar=TINKER_API_KEY key=fake-tk-key", run[0])
+        self.assertIn("small=%s" % self.TINKER_FREE, run[0])
+        config = [c for c in self.calls() if c.startswith("config=")][-1]
+        self.assertIn('"baseURL": "https://tinker.example.invalid/oai/api/v1"', config)
+        self.assertFalse(any(c.startswith("curl ") for c in self.calls()), self.calls())
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists(), result.stderr)
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_tinker_brief_pinning_a_paid_model_runs_the_free_model(self):
+        inbox, result = self.api_lane("tinker", extra="Model: %s\n" % self.TINKER_PAID, **self.tinker_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run = [c for c in self.calls() if c.startswith("opencode ")]
+        self.assertEqual(len(run), 1, self.calls())
+        self.assertIn("-m %s --print-logs" % self.TINKER_FREE, run[0])
+        self.assertNotIn("-m %s " % self.TINKER_PAID, run[0])
+        self.assertIn("REFUSED the brief's Model: %s" % self.TINKER_PAID, result.stderr)
+
+    def assert_tinker_rests(self, line, at_least):
+        self.write_tool(self.bin / "opencode", FAKE_OPENCODE.replace(
+            'args="$*"; args=', 'echo "%s"; exit 1\nargs="$*"; args=' % line, 1))
+        started = time.time()
+        inbox, result = self.api_lane("tinker", **self.tinker_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists(), result.stderr)
+        self.assertTrue(self.failure_line(lane="tinker").startswith("[limit] "), self.failure_line(lane="tinker"))
+        beat = self.beat("tinker")
+        self.assertFalse(beat["available"], beat)
+        self.assertGreaterEqual(beat["retry_at"], started + at_least)
+        # The next pass takes nothing and calls nothing until the rest is over.
+        before = [c for c in self.calls() if c.startswith(("opencode ", "curl "))]
+        (inbox / "T043-next.md").write_text(BRIEF.replace("T042", "T043").replace("Lane: codex", "Lane: tinker"))
+        result = self.run_lane("tinker", **self.tinker_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([c for c in self.calls() if c.startswith(("opencode ", "curl "))], before)
+        self.assertTrue((inbox / "T043-next.md").exists())
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_tinker_rate_limit_rests_the_lane(self):
+        self.assert_tinker_rests("AI_APICallError: Too Many Requests (statusCode: 429)", 3000)
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_tinker_empty_balance_rests_the_lane_a_day(self):
+        self.assert_tinker_rests("AI_APICallError: Payment Required: insufficient balance (statusCode: 402)", 80000)
 
     def test_the_installer_defaults_every_go_slot_to_an_allowed_model(self):
         text = (RUNNER.parent / "mac" / "install.sh").read_text()
@@ -6811,6 +7002,32 @@ exit %d
         self.assertEqual(beat["lane"], "codex")
         self.assertGreaterEqual(beat["at"], before)
 
+    def test_an_idle_codex_pass_writes_its_session_usage_to_the_shared_home(self):
+        # loom#3630: in the cluster the sessions live in the lane's own Codex
+        # home, which the station does not mount; the lane writes the meter
+        # into the Loom home the station reads.
+        sessions = self.home / "codex-lane-home" / "sessions" / "2026" / "11" / "26"
+        sessions.mkdir(parents=True)
+        (sessions / "rollout.jsonl").write_text(json.dumps({
+            "timestamp": "2026-11-26T14:40:00Z", "type": "event_msg", "payload": {
+                "type": "token_count", "rate_limits": {"secondary": {
+                    "used_percent": 3, "window_minutes": 10080, "resets_at": 1795000000}}}}) + "\n")
+        self.run_lane(CODEX_HOME=str(self.home / "codex-lane-home"))
+        written = json.loads((self.loom / "state" / "usage" / "codex.meter.json").read_text())
+        self.assertEqual([(w["window"], w["used_pct"], w["window_minutes"]) for w in written["windows"]],
+                         [("weekly", 3.0, 10080)])
+
+    def test_a_codex_run_keeps_its_session_in_the_lanes_codex_home(self):
+        # A Codex home with no sessions folder yet: the run's session must
+        # still land where the lane meter reads it, not in the run's scratch
+        # home that is removed after the run.
+        codex_home = self.home / "fresh-codex-home"
+        codex_home.mkdir()
+        self.drop_brief()
+        self.run_lane(CODEX_HOME=str(codex_home))
+        self.assertTrue(any(c.startswith("codex ") for c in self.calls()))
+        self.assertTrue((codex_home / "sessions").is_dir())
+
     def test_failed_run_is_parked_once_and_the_next_brief_still_runs(self):
         self.drop_brief("T001-broken.md", BRIEF.replace("T042-fix-the-thing", "T001-broken"))
         self.drop_brief("T002-later.md", BRIEF.replace("T042-fix-the-thing", "T002-later"))
@@ -7770,6 +7987,126 @@ exit %d
         self.assertTrue((self.inbox / "failed" / "T043-fix-the-thing.md").exists())
         self.assertFalse(any(c.startswith("codex") for c in self.calls()))
 
+    def check_uv_prepare(self, repo, files=None, contract_check="check", uv=True, pythons="",
+                         installed=()):
+        """Run check_uv_prepare alone for repo on a tree holding files, with
+        a stand-in uv (on PATH when uv) that logs each call. pythons is
+        LOOM_CHECK_PYTHONS (None leaves it unset, for the default baseline);
+        installed names directories already under the shared python/.
+        Returns the result, the cache it named and the uv calls."""
+        text = RUNNER.read_text()
+        funcs = "".join(re.search(r"^%s\(\) \{[^\n]*\n.*?^\}\n" % name, text, re.S | re.M).group(0)
+                        for name in ("runner_uv", "check_uv_key", "check_uv_prepare"))
+        tmp = Path(self._tmp.name)
+        tree = tmp / ("tree-" + repo.replace("/", "-"))
+        tree.mkdir()
+        for name, body in (files or {}).items():
+            (tree / name).write_text(body)
+        calls = tmp / "uv-calls"
+        calls.unlink(missing_ok=True)  # each run reports only its own calls
+        fakebin = tmp / "uvbin"
+        shared = tmp / "run" / "uv-shared"
+        for name in installed:
+            (shared / "python" / name).mkdir(parents=True, exist_ok=True)
+        # The stand-in also records whether the Python install lock was
+        # held while it ran (a second holder cannot take it).
+        self.lock_seen = tmp / "python-lock-seen"
+        probe = ("import fcntl, os, sys\nfd = os.open(sys.argv[1], os.O_RDONLY)\n"
+                 "try:\n    fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB); print('free')\n"
+                 "except OSError:\n    print('held')\n")
+        self.write_tool(fakebin / "uv", (
+            '#!/bin/sh\nprintf "%%s|%%s\\n" "$UV_PYTHON_INSTALL_DIR" "$*" >> "%s"\n'
+            '"%s" -c "%s" "%s" >> "%s"\n') % (calls, sys.executable, probe.replace('"', '\\"'),
+                                           shared / "locks" / "python.lock", self.lock_seen))
+        # Not every macOS has timeout in /usr/bin; the runner's own PATH does.
+        self.write_tool(fakebin / "timeout", '#!/bin/bash\nshift\nexec "$@"\n')
+        env = {"PATH": ("%s:/usr/bin:/bin" % fakebin) if uv else "/usr/bin:/bin",
+               "HOME": str(tmp / "nohome"), "LOOM_ROOT": str(RUNNER.parent.parent)}
+        if pythons is not None:
+            env["LOOM_CHECK_PYTHONS"] = pythons
+        script = ('CHECK_UV_DIR="$1" LOG="$2" TREE="$3" REPO="$4" C_CHECK="$5" C_SETUP="" NET_TIMEOUT=30\n'
+                  'check_uv_prepare || exit 7\nprintf "%s\\n%s" "$CHECK_UV_CACHE" "$CHECK_UV_LOCK"\n')
+        result = subprocess.run(["bash", "-c", funcs + script, "test", str(shared), str(tmp / "lane.log"),
+                                 str(tree), repo, contract_check], env=env, capture_output=True, text=True)
+        return result, shared, (calls.read_text().splitlines() if calls.exists() else [])
+
+    def test_each_repo_gets_its_own_uv_cache_and_lock(self):
+        # loom#3591: one repo's check must never write a cache another
+        # repo's check reads.
+        one, shared, _ = self.check_uv_prepare("example/repo")
+        two, _, _ = self.check_uv_prepare("Example/Other")
+        self.assertEqual(one.returncode, 0, one.stderr)
+        self.assertEqual(two.returncode, 0, two.stderr)
+        self.assertEqual(one.stdout.splitlines(), [str(shared / "repos" / "example_repo" / "cache"),
+                                                   str(shared / "locks" / "example_repo.lock")])
+        self.assertEqual(two.stdout.splitlines(), [str(shared / "repos" / "example_other" / "cache"),
+                                                   str(shared / "locks" / "example_other.lock")])
+        self.assertTrue((shared / "repos" / "example_repo" / "cache").is_dir())
+        self.assertTrue((shared / "python").is_dir())
+        bad, _, _ = self.check_uv_prepare("not a repo")
+        self.assertEqual(bad.returncode, 7)
+
+    def test_the_runner_installs_the_pythons_the_tree_asks_for_without_its_config(self):
+        # The managed Pythons are installed outside the sandbox, by the
+        # runner, from plain version strings only: --no-config keeps a
+        # mirror the tree's uv settings name away from them.
+        result, shared, calls = self.check_uv_prepare(
+            "example/repo", {".python-version": "3.12\n$(touch /tmp/x)\n3.11.4 # pinned\n",
+                             "pyproject.toml": 'requires-python = ">=3.10"\n'})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls, ["%s|python install --no-config --no-bin --no-cache 3.12 3.11.4" % (shared / "python")])
+        # One install at a time: the install ran holding the Python lock.
+        self.assertEqual(self.lock_seen.read_text().split(), ["held"])
+        _, shared, calls = self.check_uv_prepare(
+            "example/py", {"pyproject.toml": '[project]\nrequires-python = ">=3.10,<3.13"\n'})
+        self.assertEqual(calls[-1], "%s|python install --no-config --no-bin --no-cache >=3.10,<3.13" % (shared / "python"))
+
+    def test_a_tree_that_asks_for_no_python_installs_one_only_for_a_uv_contract(self):
+        _, _, calls = self.check_uv_prepare("example/repo", {"pyproject.toml": 'requires-python = "$(id)"\n'})
+        self.assertEqual(calls, [])
+        _, shared, calls = self.check_uv_prepare("example/uvx", contract_check="uvx ruff check .")
+        self.assertEqual(calls, ["%s|python install --no-config --no-bin --no-cache" % (shared / "python")])
+
+    def test_a_tree_that_asks_for_no_python_still_gets_the_baseline_pythons(self):
+        # loom#3602: a tree that declares no Python but whose check scripts
+        # run `uv run --python 3.12` failed every base check once downloads
+        # were off. The runner installs the LOOM_CHECK_PYTHONS baseline
+        # (default 3.12 3.13 3.14) whatever the contract runs.
+        result, shared, calls = self.check_uv_prepare("example/repo", pythons=None)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls, ["%s|python install --no-config --no-bin --no-cache 3.12 3.13 3.14"
+                                 % (shared / "python")])
+        self.assertEqual(self.lock_seen.read_text().split(), ["held"])
+        # The tree's own versions come first, and the baseline is not repeated.
+        _, shared, calls = self.check_uv_prepare(
+            "example/py", {".python-version": "3.13\n"}, pythons="3.12 3.13")
+        self.assertEqual(calls, ["%s|python install --no-config --no-bin --no-cache 3.13 3.12"
+                                 % (shared / "python")])
+
+    def test_a_baseline_python_already_installed_is_not_installed_again(self):
+        _, shared, calls = self.check_uv_prepare(
+            "example/repo", pythons="3.12 3.13 3.14.1",
+            installed=("cpython-3.12.7-macos-aarch64-none", "cpython-3.13.1+freethreaded-linux-x86_64-gnu",
+                       "cpython-3.14.10-linux-x86_64-gnu"))
+        # 3.12 is there; a free-threaded 3.13 is not 3.13; 3.14.10 is not 3.14.1.
+        self.assertEqual(calls, ["%s|python install --no-config --no-bin --no-cache 3.13 3.14.1"
+                                 % (shared / "python")])
+        # Everything present: no install at all, so the common path stays fast.
+        _, _, calls = self.check_uv_prepare(
+            "example/other", pythons="3.12 3.13",
+            installed=("cpython-3.12.7-macos-aarch64-none", "cpython-3.13.1-macos-aarch64-none"))
+        self.assertEqual(calls, [])
+
+    def test_a_bad_baseline_entry_is_ignored_and_logged(self):
+        result, shared, calls = self.check_uv_prepare("example/repo", pythons="3.12 $(id) >=3.10 3.13")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls, ["%s|python install --no-config --no-bin --no-cache 3.12 3.13"
+                                 % (shared / "python")])
+        log = (Path(self._tmp.name) / "lane.log").read_text()
+        self.assertIn("ignoring LOOM_CHECK_PYTHONS entry", log)
+        self.assertIn(">=3.10", log)
+        self.assertNotIn("uid=", log)
+
     def test_a_base_verdict_write_prunes_expired_verdicts_and_keeps_fresh_ones(self):
         text = RUNNER.read_text()
         funcs = re.search(r"^base_verdict_write\(\) \{[^\n]*\n.*?^\}\n", text, re.S | re.M).group(0)
@@ -8045,45 +8382,132 @@ exit %d
         # The check's scratch home is gone once the run is over (loom#643).
         self.assertFalse((self.loom / "run" / "codex-check").exists())
 
+    def uv_check(self):
+        """A contract whose check leaves a package in uv's cache, tries to
+        write into uv's Python install directory, and appends its HOME, both
+        uv directories and that write's outcome to uv-record.txt beside the
+        loom home (outside HOME, where a check may write)."""
+        record = Path(self._tmp.name) / "uv-record.txt"
+        return record, CONTRACT.replace("check: ", (
+            'check: printf cached > "$UV_CACHE_DIR/pkg" && '
+            '{ (echo evil > "$UV_PYTHON_INSTALL_DIR/planted") 2> /dev/null && w=written || w=denied; } && '
+            'echo "$HOME $UV_CACHE_DIR $UV_PYTHON_INSTALL_DIR $w $UV_PYTHON_DOWNLOADS" >> %s && ' % record))
+
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
-    def test_a_codex_agent_runs_uv_offline_from_a_copy_of_the_base_checks_cache(self):
+    def test_two_slots_checks_share_one_repo_uv_cache_and_read_only_pythons(self):
+        # loom#3591: each slot's check pointed uv at its own scratch home, so
+        # every check downloaded a managed Python and every wheel again, and
+        # three codex slots filled the pod's run/ volume until the pod was
+        # evicted. Two slots' checks of one repo now share that repo's cache
+        # under run/uv-shared, may not write the managed Pythons, and leave
+        # neither in their check homes.
+        record, contract = self.uv_check()
+        self.contract_repo(contract)
+        self.write_tool(self.bin / "codex", FAKE_AGENT.replace("cat > /dev/null\n", (
+            "cat > /dev/null\n"
+            'for d in "$LOOM_HOME"/run/*-check; do\n'
+            '  printf "check-home %s uv-cache=%s uv-python=%s\\n" "$(basename "$d")" '
+            '"$([ -e "$d/.cache/uv" ] && echo yes || echo no)" '
+            '"$([ -e "$d/.local/share/uv" ] && echo yes || echo no)" >> "$FAKE_LOG"\n'
+            "done\n"), 1))
+        shared = self.loom / "run" / "uv-shared"
+        cache = shared / "repos" / "example_repo" / "cache"
+        for slot, ticket in (("codex", "T042"), ("codex-3", "T043")):
+            inbox = self.loom / "briefs" / slot
+            inbox.mkdir(parents=True, exist_ok=True)
+            (inbox / ("%s-fix-the-thing.md" % ticket)).write_text(BRIEF.replace("T042", ticket))
+            result = self.run_contract_lane(lane=slot)
+            log = self.loom / "logs" / slot / ("%s-fix-the-thing.log" % ticket)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((inbox / "done" / ("%s-fix-the-thing.md" % ticket)).exists(), log.read_text())
+        rows = [line.split() for line in record.read_text().splitlines()]
+        self.assertEqual({Path(row[0]).name for row in rows}, {"codex-check", "codex-3-check"}, rows)
+        self.assertEqual({tuple(row[1:]) for row in rows},
+                         {(str(cache), str(shared / "python"), "denied", "never")})
+        self.assertEqual((cache / "pkg").read_text(), "cached")
+        self.assertFalse((shared / "python" / "planted").exists())
+        # After the base check, before the agent, neither check home holds
+        # a uv cache or a Python install.
+        seen = [c for c in self.calls() if c.startswith("check-home ")]
+        self.assertIn("check-home codex-check uv-cache=no uv-python=no", seen)
+        self.assertIn("check-home codex-3-check uv-cache=no uv-python=no", seen)
+        self.assertFalse([c for c in seen if "=yes" in c], seen)
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_check_that_leaves_its_uv_cache_over_the_bound_prunes_it(self):
+        # The repo's cache is bounded: after a check, a cache larger than
+        # LOOM_CHECK_UV_CACHE_MB is pruned with the runner's uv.
+        _, contract = self.uv_check()
+        self.contract_repo(contract)
+        self.write_tool(self.bin / "uv", '#!/bin/sh\nprintf "uv %s cache=%s\\n" "$*" "$UV_CACHE_DIR" >> "$FAKE_LOG"\n')
+        self.drop_brief()
+        result = self.run_contract_lane(LOOM_CHECK_UV_CACHE_MB="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        cache = self.loom / "run" / "uv-shared" / "repos" / "example_repo" / "cache"
+        self.assertIn("uv cache prune cache=%s" % cache, self.calls())
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_codex_agents_uv_writes_land_in_its_repos_bounded_cache(self):
+        # A live pod's run volume held about 2.9 GB per codex slot in
+        # <slot>-check/agent-uv/cache, the per-run copy agent_uv_cache made,
+        # on top of the check's own cache, with no bound on either. Now no
+        # copy is made: what the agent's uv writes lands in its repo's cache,
+        # which the bound after the final check prunes.
+        _, contract = self.uv_check()
+        self.contract_repo(contract)
+        self.drop_brief()
+        self.write_tool(self.bin / "uv", '#!/bin/sh\nprintf "uv %s cache=%s\\n" "$*" "$UV_CACHE_DIR" >> "$FAKE_LOG"\n')
+        self.write_tool(self.bin / "codex", FAKE_AGENT.replace("cat > /dev/null\n", (
+            "cat > /dev/null\n"
+            'printf "agent-copy=%s\\n" "$(ls -d "$LOOM_HOME"/run/*-check/agent-uv 2> /dev/null || echo none)" >> "$FAKE_LOG"\n'
+            'echo built > "$UV_CACHE_DIR/agent-wheel"\n'), 1))
+        result = self.run_contract_lane(LOOM_CHECK_UV_CACHE_MB="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        cache = self.loom / "run" / "uv-shared" / "repos" / "example_repo" / "cache"
+        calls = self.calls()
+        self.assertIn("agent-copy=none", calls)
+        self.assertEqual((cache / "agent-wheel").read_text(), "built\n")
+        agent_at = next(i for i, c in enumerate(calls) if c.startswith("codex exec"))
+        self.assertIn("uv cache prune cache=%s" % cache, calls[agent_at:])
+        self.assertEqual(list((self.loom / "run" / "uv-shared" / "repos").iterdir()), [cache.parent])
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_codex_agent_runs_uv_offline_from_its_repos_check_cache(self):
         # loom#1665: a codex agent has no network, so uv could not fetch the
         # packages its tests need ("dns error" from the package index) while
         # the base check, outside the agent's sandbox, had downloaded them.
-        # The base check here leaves a uv cache entry; the agent must get a
-        # writable copy of it, uv's offline settings and that one extra
-        # writable directory, and its writes must not reach the check's cache.
-        # The check fails when it finds the agent's write in its own cache.
-        self.contract_repo(CONTRACT.replace("check: ", (
-            "check: loom-test-python -c 'import os; d = os.path.expanduser(\"~/.cache/uv\"); "
-            "os.makedirs(d, exist_ok=True); p = d + \"/pkg\"; "
-            "assert not os.path.exists(p) or open(p).read() == \"cached\"; "
-            "open(p, \"w\").write(\"cached\")' && ")))
+        # The agent gets its repo's cache in the checks' shared uv directory
+        # as its one extra writable directory (loom#3591; it was a per-run
+        # copy, a second full copy on a pod's disk). The managed Pythons are
+        # not writable to it.
+        _, contract = self.uv_check()
+        self.contract_repo(contract)
         self.drop_brief()
         self.write_tool(self.bin / "codex", FAKE_AGENT.replace("cat > /dev/null\n", (
             "cat > /dev/null\n"
-            'printf "uv-env cache=%s python=%s offline=%s managed=%s pip=%s\\n" '
+            'printf "uv-env cache=%s python=%s offline=%s managed=%s downloads=%s pip=%s\\n" '
             '"${UV_CACHE_DIR:-unset}" "${UV_PYTHON_INSTALL_DIR:-unset}" "${UV_OFFLINE:-unset}" '
-            '"${UV_MANAGED_PYTHON:-unset}" "${PIP_NO_INDEX:-unset}" >> "$FAKE_LOG"\n'
+            '"${UV_MANAGED_PYTHON:-unset}" "${UV_PYTHON_DOWNLOADS:-unset}" "${PIP_NO_INDEX:-unset}" >> "$FAKE_LOG"\n'
             ': "${UV_CACHE_DIR:?missing uv cache}"\n'
-            'printf "uv-pkg %s\\n" "$(cat "$UV_CACHE_DIR/pkg" 2>&1)" >> "$FAKE_LOG"\n'
-            'echo agent > "$UV_CACHE_DIR/pkg"\n'), 1))
+            'printf "uv-pkg %s\\n" "$(cat "$UV_CACHE_DIR/pkg" 2>&1)" >> "$FAKE_LOG"\n'), 1))
         result = self.run_contract_lane()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists(), self.lane_log())
-        check_home = self.loom / "run" / "codex-check"
+        shared = self.loom / "run" / "uv-shared"
+        cache = shared / "repos" / "example_repo" / "cache"
         calls = self.calls()
         agent = [c for c in calls if c.startswith("codex exec")]
         self.assertEqual(len(agent), 1, calls)
-        self.assertIn("--sandbox workspace-write --add-dir %s/agent-uv --model" % check_home, agent[0])
-        self.assertIn("uv-env cache=%s/agent-uv/cache python=%s/.local/share/uv/python "
-                      "offline=1 managed=1 pip=1" % (check_home, check_home), calls)
+        self.assertIn("--sandbox workspace-write --add-dir %s --model" % cache, agent[0])
+        self.assertEqual(agent[0].count("--add-dir"), 1, agent[0])
+        self.assertNotIn(str(shared / "python"), agent[0])
+        self.assertIn("uv-env cache=%s python=%s offline=1 managed=1 downloads=never pip=1"
+                      % (cache, shared / "python"), calls)
         self.assertIn("uv-pkg cached", calls)
-        # The final check read its own cache, not the agent's copy.
         self.assertEqual([(r["phase"], r["ok"]) for r in self.records()][-1], ("final", True))
 
-        # The green verdict outlives the scratch home. The next agent still
-        # needs the base check's packages even though the revision is unchanged.
+        # The green verdict outlives the check home; the next agent still
+        # finds the base check's packages in the repo's cache.
         self.drop_brief("T043-fix-the-thing.md", BRIEF.replace("T042", "T043"))
         result = self.run_contract_lane()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -9243,8 +9667,7 @@ echo fixed > fix.txt
 
         thread = threading.Thread(target=run, daemon=True)
         thread.start()
-        self.addCleanup(thread.join, 5)
-        self.addCleanup(stop.set)
+        self._stations.append((stop, thread))
         dispatched.said = said
         return stop, dispatched
 
@@ -9273,6 +9696,89 @@ echo fixed > fix.txt
         self.assertEqual(dispatched[0]["check"], "test -f .prepared && loom-test-python check.py")
         self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()), log)
         self.assertIn("refs/heads/loom/T042-fix-the-thing", self.remote_heads())
+
+    def run_remote_fix_base(self, checks, advance_default=False, **env):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo(contract="check: echo HOST_BASE_CHECK\n")
+        name, head = self.fix_brief(with_head=True)
+        if advance_default:
+            self.advance_main("main.txt", "updated default branch\n")
+        result = self.run_contract_lane(
+            **{"LOOM_REMOTE_CHECKS": "1", "FAKE_GH_CHECKS": checks,
+               "FAKE_AGENT": "say", "FAKE_EXIT": "1", "FAKE_OUT": "agent started", **env})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        records = [json.loads(line) for line in (self.loom / "logs" / "codex" /
+                   (name + ".validation.jsonl")).read_text().splitlines()]
+        baseline = next(row for row in records if row["phase"] == "baseline")
+        self.assertEqual(baseline["revision"], head)
+        self.assertTrue(any(c.startswith("codex ") for c in self.calls()))
+        return self.run_log(name + ".log"), baseline
+
+    def test_fix_round_uses_github_base_verdict_without_a_host_check(self):
+        log, baseline = self.run_remote_fix_base(self.GREEN_CHECKS)
+        self.assertNotIn("HOST_BASE_CHECK\n", log)
+        self.assertIn("GitHub", baseline["detail"])
+        self.assertTrue(baseline["ok"])
+        self.assertEqual(baseline["exit"], 0)
+        self.assertTrue(any(f"/commits/{baseline['revision']}/check-runs?" in call
+                            for call in self.calls()))
+
+    def test_fix_round_without_head_checks_records_the_host_base_verdict(self):
+        log, baseline = self.run_remote_fix_base("")
+        self.assertIn("HOST_BASE_CHECK\n", log)
+        self.assertIn("host", baseline["detail"])
+        self.assertTrue(baseline["ok"])
+
+    def test_fix_round_ignores_failed_review_when_ci_passed(self):
+        log, baseline = self.run_remote_fix_base(
+            "completed success\tunittest\ncompleted failure\tGrug - Elder\n")
+        self.assertNotIn("HOST_BASE_CHECK\n", log)
+        self.assertIn("GitHub", baseline["detail"])
+        self.assertTrue(baseline["ok"])
+        self.assertEqual(baseline["exit"], 0)
+
+    def test_fix_round_with_only_review_checks_runs_host_base_check(self):
+        log, baseline = self.run_remote_fix_base(
+            "completed success\tGrug - Elder\ncompleted success\tGrug - Chief\n")
+        self.assertIn("HOST_BASE_CHECK\n", log)
+        self.assertIn("host", baseline["detail"])
+
+    def test_fix_round_reads_the_pr_head_checks_after_merging_the_default_branch(self):
+        log, baseline = self.run_remote_fix_base(self.GREEN_CHECKS, advance_default=True)
+        self.assertNotIn("HOST_BASE_CHECK\n", log)
+        self.assertIn("GitHub", baseline["detail"])
+        self.assertTrue(any(f"/commits/{baseline['revision']}/check-runs?" in call
+                            for call in self.calls()))
+
+    def test_cluster_fix_round_reads_existing_github_checks(self):
+        log, baseline = self.run_remote_fix_base(self.GREEN_CHECKS, LOOM_CLUSTER_RUNNER="1")
+        self.assertNotIn("HOST_BASE_CHECK\n", log)
+        self.assertIn("GitHub", baseline["detail"])
+
+    def test_fix_round_consumes_a_red_github_verdict_before_the_default_gate(self):
+        log, baseline = self.run_remote_fix_base("completed failure\n")
+        self.assertEqual(baseline["exit"], 1)
+        self.assertFalse(baseline["ok"])
+        self.assertIn("GitHub", baseline["detail"])
+        # Only the default branch runs on the host; its pass allows the agent.
+        self.assertEqual(log.count("HOST_BASE_CHECK\n"), 1)
+
+    def test_fix_round_with_pending_head_checks_uses_the_host(self):
+        log, baseline = self.run_remote_fix_base("completed success\nin_progress null\n")
+        self.assertIn("HOST_BASE_CHECK\n", log)
+        self.assertIn("host", baseline["detail"])
+
+    def test_private_fix_round_keeps_the_host_base_check(self):
+        log, baseline = self.run_remote_fix_base(self.GREEN_CHECKS, FAKE_GH_PRIVATE="true")
+        self.assertIn("HOST_BASE_CHECK\n", log)
+        self.assertIn("host", baseline["detail"])
+        self.assertFalse(any("/check-runs?" in call for call in self.calls()))
+
+    def test_fix_round_with_remote_checks_off_keeps_the_host_base_check(self):
+        log, baseline = self.run_remote_fix_base(self.GREEN_CHECKS, LOOM_REMOTE_CHECKS="0")
+        self.assertIn("HOST_BASE_CHECK\n", log)
+        self.assertIn("host", baseline["detail"])
+        self.assertFalse(any("/check-runs?" in call for call in self.calls()))
 
     def test_remote_checks_on_a_private_repo_still_take_a_check_slot(self):
         _, dispatched = self.fake_station()
@@ -9758,7 +10264,7 @@ echo fixed > fix.txt
         (fakes / "sandbox-exec").chmod(0o755)
         (fakes / "timeout").write_text('#!/bin/bash\nshift\nexec "$@"\n')
         (fakes / "timeout").chmod(0o755)
-        script = funcs + SANDBOX_HELPERS + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run_sandboxed "$1"\n'
+        script = funcs + CHECK_UV_HELPERS + SANDBOX_HELPERS + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run_sandboxed "$1"\n'
         env = {"PATH": f"{fakes}:/usr/bin:/bin", "LOG": str(tmp / "log"), "TREE": str(tmp),
                "CHECK_HOME": str(tmp), "CHECK_CLI": "bash", "CHECK_TIMEOUT": "30"}
         result = subprocess.run(["bash", "-c", script, "test", f"true\x1b[2K; touch {marker}"],
@@ -9788,7 +10294,7 @@ echo fixed > fix.txt
         (fakes / "sandbox-exec").chmod(0o755)
         (fakes / "timeout").write_text('#!/bin/bash\nshift\nexec "$@"\n')
         (fakes / "timeout").chmod(0o755)
-        script = funcs + SANDBOX_HELPERS + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run_sandboxed "$1"\n'
+        script = funcs + CHECK_UV_HELPERS + SANDBOX_HELPERS + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run_sandboxed "$1"\n'
         log = tmp / "log"
         env = {"PATH": f"{fakes}:/usr/bin:/bin", "LOG": str(log), "TREE": str(tmp),
                "CHECK_HOME": str(tmp), "CHECK_CLI": "bash", "CHECK_TIMEOUT": "30",
@@ -9814,7 +10320,7 @@ echo fixed > fix.txt
         (fakes / "sandbox-exec").chmod(0o755)
         (fakes / "timeout").write_text('#!/bin/bash\nshift\nexec "$@"\n')
         (fakes / "timeout").chmod(0o755)
-        script = funcs + SANDBOX_HELPERS + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run_sandboxed "$1"\n'
+        script = funcs + CHECK_UV_HELPERS + SANDBOX_HELPERS + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run_sandboxed "$1"\n'
         log = tmp / "log"
         env = {"PATH": f"{fakes}:/usr/bin:/bin", "LOG": str(log), "TREE": str(tmp),
                "CHECK_HOME": str(tmp), "CHECK_CLI": "bash", "CHECK_TIMEOUT": "30",
@@ -9846,7 +10352,7 @@ echo fixed > fix.txt
         (fakes / "sandbox-exec").chmod(0o755)
         (fakes / "timeout").write_text('#!/bin/bash\nshift\nexec "$@"\n')
         (fakes / "timeout").chmod(0o755)
-        script = funcs + SANDBOX_HELPERS + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run_sandboxed "$1"\n'
+        script = funcs + CHECK_UV_HELPERS + SANDBOX_HELPERS + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run_sandboxed "$1"\n'
         log = tmp / "log"
         env = {"PATH": f"{fakes}:/usr/bin:/bin", "HOME": str(tmp / "home"), "LOG": str(log),
                "TREE": str(tmp), "CHECK_HOME": str(tmp), "CHECK_CLI": "bash",
@@ -10223,7 +10729,7 @@ echo fixed > fix.txt
         fakes.mkdir(exist_ok=True)
         self.write_tool(fakes / "sandbox-exec", '#!/bin/bash\nshift 2\nexec "$@"\n')
         self.write_tool(fakes / "timeout", '#!/bin/bash\nshift\nexec "$@"\n')
-        script = (setup + funcs + SANDBOX_HELPERS
+        script = (setup + funcs + CHECK_UV_HELPERS + SANDBOX_HELPERS
                   + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run_sandboxed "$1"\n')
         log = tmp / "check-step.log"
         log.write_text("")

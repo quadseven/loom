@@ -232,7 +232,11 @@ class Summary:
                          % (self.unknown, "" if self.unknown == 1 else "s"))
         text = "Anthropic spend: " + "; ".join(parts)
         if self.under_floor():
-            text += ". Under the $%.2f floor: the anthropic slots take no work." % b.floor
+            # Only the anthropic slots: on 2026-11-25 the brain read "the
+            # anthropic slots take no work" as a stop on every brief.
+            text += (". Under the $%.2f floor: only the anthropic slots (anthropic to "
+                     "anthropic-8) take no work; every other lane takes briefs as usual."
+                     % b.floor)
         return text
 
 
