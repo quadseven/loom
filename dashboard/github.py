@@ -583,6 +583,10 @@ class TicketStore:
         carried = [source for source in VIEW_SOURCES if read_at.get(source)]
         for source in carried:
             data.update({key: self._snapshot[key] for key in VIEW_SOURCES[source] if key in self._snapshot})
+        if "pull_requests" in carried and data["tickets"] != self._snapshot["tickets"]:
+            # Ticket reads can reach the floor after updating a difficulty.
+            rows = [row for found in data["tickets"].values() if found for row in found]
+            _, _, _, data["scoreboard"] = views.summarize_prs(data["pull_requests"], rows)
         data["source_read_at"], data["sources_carried"] = read_at, carried
         # The goal cards keep the last pass that read them. Dropping them
         # here left every Goals card at "-" with "No report on this goal
