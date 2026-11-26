@@ -747,6 +747,12 @@ pr_body() {
   criteria="$(criteria_section "$WORKDIR/$TICKET.summary.md" 2>/dev/null)"
   [ -n "$criteria" ] || criteria="$(criteria_section "$TREE/$SUMMARY_FILE" 2>/dev/null)"
   [ -n "$criteria" ] || criteria="$(criteria_section "$1")"
+  criteria="$(printf '%s\n' "$criteria" | PYTHONPATH="$REPO_ROOT" python3 -B -c '
+import sys
+from bus.pr_repair import build_checklist
+with open(sys.argv[1], encoding="utf-8") as brief:
+    print(build_checklist(brief.read(), sys.stdin.read().rstrip("\n")))
+' "$1" 2>> "$LOG")" || return 1
   # The lane's own word on operator steps, else the ticket's; a body with
   # neither says so, and the factory's keyword backstop still reads both.
   ops="$(section "$OPERATOR_SECTION" "$WORKDIR/$TICKET.summary.md" 2>/dev/null)"
@@ -777,7 +783,7 @@ PLAN_NOTE_MARKER="<!-- loom:plan-hold-note v1 -->"
 # Compose from the filed brief, or render the ticket again if the run lost it.
 # Keep the recovered copy outside the inbox so it cannot start another run.
 compose_pr_body() {
-  local recovered
+  local recovered status=0
   PLAN_GAPS=""
   if [ -f "$BRIEF" ]; then
     compose_pr_body_from "$BRIEF"
@@ -793,19 +799,20 @@ if not (issue.get("body") or "").strip():
     sys.exit("ticket body is empty")
 print(render_brief(sys.argv[1], issue, sys.argv[2]))
 ' "$REPO" "$LANE" > "$recovered" 2>> "$LOG"; then
-    compose_pr_body_from "$recovered"
+    compose_pr_body_from "$recovered" || status=$?
   else
     echo "[$(date -u +%FT%TZ)] $TICKET [factory] brief file missing: ${BRIEF##*/}; could not rebuild from ticket" >> "$LOG"
-    PR_BODY="$(pr_body /dev/null "$TICKET")"
+    PR_BODY="$(pr_body /dev/null "$TICKET")" || return 1
   fi
   [ -z "${recovered:-}" ] || rm -f "$recovered"
+  return "$status"
 }
 
 # Repair a failing body from the same source used to compose it. PLAN_GAPS
 # holds any sections that source still lacks for the ticket's plan-hold note.
 compose_pr_body_from() {
   local problems dir summary=() private=()
-  PR_BODY="$(pr_body "$1" "$TICKET")"
+  PR_BODY="$(pr_body "$1" "$TICKET")" || return 1
   problems="$(printf '%s' "$PR_BODY" | PYTHONPATH="$REPO_ROOT" python3 -B -m bus.hunt_plan check - 2>&1)" && return 0
   echo "[$(date -u +%FT%TZ)] $TICKET pull request body fails the plan checks: $(printf '%s' "$problems" | tr '\n' ';')" >> "$LOG"
   if ! dir="$(mktemp -d "$TMPDIR/pr-plan.XXXXXX")"; then
@@ -6073,7 +6080,9 @@ for BRIEF in "$INBOX"/*.md; do
         INTENT_TEXT="${INTENT_TEXT}
 - Dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
       fi
-      compose_pr_body
+      if ! compose_pr_body; then
+        park "$BRIEF" "could not compose the pull request body; nothing pushed" transient; continue
+      fi
       BODY_FILE="$(mktemp "$LOOM_HOME/run/$SLOT-leak-body.XXXXXX")"
       printf '%s\n%s\n' "${TITLE:-$TICKET}" "$PR_BODY" > "$BODY_FILE"
       LEAK_RC=0
@@ -6130,7 +6139,9 @@ for BRIEF in "$INBOX"/*.md; do
         INTENT_TEXT="${INTENT_TEXT}
 - Dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
       fi
-      compose_pr_body
+      if ! compose_pr_body; then
+        park "$BRIEF" "could not compose the pull request body; nothing pushed" transient; continue
+      fi
       PR_BODY="$(printf '%s' "$PR_BODY" | PYTHONPATH="$REPO_ROOT" python3 -B -c \
         'import sys; from bus.pr_repair import public_refs; print("\n".join(public_refs(x, sys.argv[1]) for x in sys.stdin.read().splitlines()))' "$REPO")" || {
         park "$BRIEF" "could not prepare public repo PR text; nothing pushed" transient; continue
@@ -6375,7 +6386,9 @@ Review threads this round left without a reply: $UNANSWERED"
   # before that check, edited by hand, or read differently by the shell and
   # Python readers: compose_pr_body rebuilds it, and marks the pull request
   # when the brief cannot fill it.
-  [ -n "${PR_BODY:-}" ] || compose_pr_body
+  if [ -z "${PR_BODY:-}" ] && ! compose_pr_body; then
+    park "$BRIEF" "could not compose the pull request body; branch $BRANCH is pushed" transient; continue
+  fi
   [ -z "$LIVE_NOTES" ] || PR_BODY="$PR_BODY"$'\n\n'"$LIVE_NOTES"
   # The signature is the last line a reader sees; the plan-hold marker is an
   # HTML comment, so it goes after it (bus/signature.py reads past it).

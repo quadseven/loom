@@ -2093,6 +2093,31 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertFalse(repaired["changed"], repaired)
         self.assertEqual(repaired["old_hash"], repaired["new_hash"])
 
+    def test_a_live_only_build_pr_defers_live_criteria_even_with_a_partial_summary(self):
+        boxes = ("Live: The page shows the corrected total.",
+                 "A test or a ledger row shows it",
+                 "Live: The reported reason is gone or explained.")
+        why, _, after = BRIEF.partition("## Acceptance criteria\n")
+        _, _, size = after.partition("## Size\n")
+        request = "Proof: Check the corrected total with seeded data."
+        why = why.replace("Make the thing work.\n", "Make the thing work.\n" + request + "\n")
+        self.drop_brief(text=why + "## Acceptance criteria\n"
+                        + "".join("- [ ] %s\n" % box for box in boxes) + "\n## Size\n" + size)
+        result = self.run_lane(FAKE_SUMMARY="Correct the total.\n\n## Acceptance criteria\n"
+                               "- [x] %s\n- [x] %s\n" % boxes[:2])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        self.assertIn(request, body.splitlines())
+        for box in (boxes[0], boxes[2]):
+            self.assertIn("- [ ] %s; not built: checked after merge" % box, body)
+            self.assertNotIn("- [x] " + box, body)
+        self.assertIn("- [x] " + boxes[1], body)
+        done = self.inbox / "done" / "T042-fix-the-thing.md"
+        repaired = pr_repair.reconcile(str(done), "Fix the thing", body,
+                                       "codex", "gpt-test-default", "T042-fix-the-thing")
+        self.assertFalse(repaired["changed"], repaired)
+        self.assertEqual(repaired["reason"], "")
+
     def test_uncommitted_agent_edits_are_committed_by_the_runner(self):
         self.drop_brief()
         result = self.run_lane(FAKE_AGENT="edit")

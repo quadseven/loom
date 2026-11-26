@@ -302,6 +302,8 @@ def test_verdict(body: str) -> Optional[Verdict]:
     boxes = [text for text, _ in tickets.proof_checks(body)]
     if not boxes or any(names_test(box) for box in boxes):
         return None
+    if tickets.has_proof_request(body) and tickets.needs_buildable_deliverable(body):
+        return None  # The rendered brief requires a regression test.
     stamp = hashlib.sha256(body.encode("utf-8")).hexdigest()[:12]
     return Verdict(CRITERIA, "test-" + stamp,
                    "none of its acceptance boxes names the test that proves it: write one box "

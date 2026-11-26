@@ -2338,9 +2338,10 @@ is read fresh.
 A ticket whose every acceptance criterion is a check on a live host or
 network (a command run on a host, a reach test from a network, a port, a
 firewall or ACL rule, a check across the hosts, or a Live line, and none
-naming a test) gets no lane: the factory puts it to `needs:human` with one
-ask instead of giving it one, and `bus.brain brief` refuses it. The
-station's close of a shipped ticket whose Live line names nothing to search
+naming a test) needs a buildable deliverable and a `Proof:` request to go to
+a lane (docs/BRIEF_FORMAT.md). Otherwise, the factory puts it to `needs:human`
+with one ask, and `bus.brain brief` refuses it. The station's close of a
+shipped ticket whose Live line names nothing to search
 leaves it open while an unticked criterion is such a host or network check:
 a merge proves none of them.
 
