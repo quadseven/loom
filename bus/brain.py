@@ -8684,6 +8684,22 @@ def _verify_due_in(gh: GitHub, repo: str, now: datetime
     return [(at, repo, issue) for at, issue in verify_due(gh, repo, tickets, now)]
 
 
+def _verify_resume_criterion(criteria: str, overdue: bool,
+                             evidence_access: bool) -> Tuple[str, str]:
+    """Classify a verify handoff and select the criterion text to show."""
+    live = [text for kind, text in criteria_gate.needing_evidence(criteria)
+            if kind == criteria_gate.LIVE]
+    if not evidence_access:
+        endpoint_live = [text for text in live if _verify_needs_evidence_endpoint(text)]
+        if endpoint_live:
+            live = [text for text in live if text not in endpoint_live]
+            if not live:
+                return "skipped", endpoint_live[0]
+    if live and overdue and not criteria_gate.open_operator_criteria(criteria):
+        return "urgent", " ".join(live)
+    return "ordinary", live[0] if live else live_criterion(criteria)
+
+
 def _verify_resume_lines(gh: GitHub, repos: Sequence[str], now: datetime,
                          due: Optional[List[Tuple[datetime, str, Dict[str, Any]]]] = None,
                          env: Optional[Dict[str, str]] = None
@@ -8696,40 +8712,29 @@ def _verify_resume_lines(gh: GitHub, repos: Sequence[str], now: datetime,
     due = list(due)
     due.sort(key=lambda x: (x[0], x[1], int(x[2]["number"])))
     evidence_access = _evidence_endpoint_available(env)
-    urgent, ordinary = [], []
-    skipped = []
+    items = {"urgent": [], "ordinary": [], "skipped": []}
     for shipped, repo, issue in due:
         labels = _labels(issue)
         if issue.get("assignees") or any(n.lower().startswith(stale_claims.CLAIM_PREFIX) for n in labels):
             continue
         criteria = str(issue.get("body") or "")
-        live = [text for kind, text in criteria_gate.needing_evidence(criteria)
-                if kind == criteria_gate.LIVE]
-        endpoint_live = [text for text in live if _verify_needs_evidence_endpoint(text)]
-        if endpoint_live and not evidence_access:
-            live = [text for text in live if text not in endpoint_live]
-            if not live:
-                skipped.append((repo, issue, endpoint_live[0]))
-                continue
-        if (live and now - shipped >= VERIFY_DUTY_AFTER
-                and not criteria_gate.open_operator_criteria(criteria)):
-            urgent.append((shipped, repo, issue, " ".join(live)))
-        else:
-            ordinary.append((shipped, repo, issue, live[0] if live else live_criterion(criteria)))
-    out = ["", "## Verify due"]
-    if urgent:
+        kind, criterion = _verify_resume_criterion(
+            criteria, now - shipped >= VERIFY_DUTY_AFTER, evidence_access)
+        items[kind].append((shipped, repo, issue, criterion))
+    out = []
+    if items["urgent"]:
         out.append("The brain holding the lock owns the live evidence hand-out. "
                    "Read logs, the running system, or code and record what you observed "
                    "or what evidence is missing on each ticket.")
-    for shipped, repo, issue, criterion in urgent + ordinary[:VERIFY_RESUME_MAX]:
+    for shipped, repo, issue, criterion in items["urgent"] + items["ordinary"][:VERIFY_RESUME_MAX]:
         out.append("- resume verify %s#%s shipped %s ago: %s" % (
             repo, issue["number"], _since(shipped, now), _one_line(criterion, 240)))
-    for repo, issue, criterion in skipped:
+    for _, repo, issue, criterion in items["skipped"]:
         out.append("- skip verify %s#%s: %s needs the evidence endpoint, but this brain "
                    "has no evidence endpoint; "
                    "leave it for a brain with evidence access" % (
                        repo, issue["number"], _one_line(criterion, 160)))
-    return out if urgent or ordinary or skipped else out + ["- none"]
+    return ["", "## Verify due"] + (out or ["- none"])
 
 
 def _evidence_endpoint_available(env: Optional[Dict[str, str]]) -> bool:
