@@ -420,7 +420,10 @@ step NAME --holder $HOLDER --lock-repo $LOCK_REPO --note \"one line: what this \
 step found or decided\" in place of the step \
 command MUSE.md gives; the wrapper records lock and unlock. For the report \
 budget turn use python3 -m bus.brain report-plan --state \"$WORK/loom/report-budget.json\" \
---holder $HOLDER --lock-repo $LOCK_REPO. The wrapper preserves this queue \
+--holder $HOLDER --lock-repo $LOCK_REPO. Add --owed OWNER/NAME#N for each \
+goal a fresh status result finds owing a report, and call it with --done \
+OWNER/NAME#N after each successful post, so a posted report is not offered \
+again. The wrapper preserves this queue \
 between ticks. Stop drafting and posting reports at report_until, then give \
 verify, brief, triage and sweep their timed turns before other work. Copy \
 the Reports deferred journal_line into the tick journal. LOOM_REPOS is \
