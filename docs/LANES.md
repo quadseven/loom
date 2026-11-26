@@ -113,6 +113,20 @@ pushes nothing, and its record is the `affected` phase. A lane pull request
 in the deploy repo passed its check and went red in CI on two such suites
 (loom#1773).
 
+`autoformat` is optional too: a formatter command, such as
+`autoformat: uvx ruff@0.15.10 format`. After the agent's commit passes the
+scope and contract checks, and before the final check on the host or the
+remote check, the runner runs it once in the check sandbox with the files
+the lane's own commits changed (and that still exist) appended, shell-quoted.
+What it changes in those files becomes one `format:` commit; anything else it
+touches is restored. A formatter that fails, is missing or times out is
+logged as `autoformat: ...`, the files are restored and the run goes on to
+the check unchanged; it never parks a run. The command is the base's, and a
+run that changes `.loom/validation.conf` skips the step, so a run never names
+its own formatter. A remote check keeps no log a lane can format from, so
+before this a run whose only defect was formatting was thrown away there
+(loom#3577).
+
 A successful contract command proves its exit status, not coverage of the
 changed paths. The contract has no path-to-check mapping. PR bodies and
 fix-round comments therefore keep the command result (including retries,
@@ -150,7 +164,8 @@ The runner's reader (`bus/contract.py`) also accepts a list of
 `<kind> | <command>` lines, or `[kind]`, `[kind.name]` and `[[kind]]` tables
 with a `command = "..."` key, for the kinds lint, format, type and test. It
 joins the commands, in that order, into one `check`. The kind `affected`
-(`affected | <command>`, `[affected]`) becomes the `affected` command instead.
+(`affected | <command>`, `[affected]`) becomes the `affected` command instead,
+and the kind `autoformat` the `autoformat` command.
 List only commands that run on a lane machine with no secrets, simulators or
 unset variables.
 
@@ -2343,6 +2358,11 @@ cannot query the viewer or any other local service.
   endpoint. zai and zen have no meter: Z.ai documents no usage endpoint for
   API keys (its quota monitor covers the GLM Coding Plan only) and Zen's free
   models take no key, so Usage says "no meter: provider exposes no usage".
+  A codex lane reads no provider: on the same heartbeat, and after each run,
+  it copies the newest 5-hour and weekly readings from `CODEX_HOME/sessions`
+  into `state/usage/<slot>.meter.json` (`python3 -m bus.meter
+  --codex-sessions`), so a station that cannot see that Codex home still
+  records Codex usage (loom#3630).
 
 ### One slot on opencode 2.0
 
