@@ -2187,9 +2187,13 @@ settle_ask() {
              --json number,title --jq '.[] | select(.title == env.TITLE) | .number' \
              2>>"$LOG" | tr -cd '0-9\n' | sort -n | head -1)" || return 0
   [ -n "$first" ] && [ "$first" -lt "$number" ] || return 0
-  gh issue close "$number" --repo "$FACTORY_REPO" --reason "not planned" \
-    --comment "$(printf 'Filed in the same moment as #%s, which holds this ask.%s' "$first" "$(sign_tail)")" \
-    >/dev/null 2>>"$LOG" || echo "could not close the duplicate ask $FACTORY_REPO#$number" >> "$LOG"
+  # Shadow mode (bus/shadow.py) holds this close, as it is no factory
+  # incident: the duplicate then stays open, as before this check.
+  if PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.shadow gh-guard --lane "$PWD" \
+       issue close --repo "$FACTORY_REPO" "$number" >>"$LOG" 2>&1; then
+    gh issue close --repo "$FACTORY_REPO" "$number" --reason "not planned" --comment "Filed in the same moment as #$first, which holds this ask.$(sign_tail)" >/dev/null 2>>"$LOG" ||
+      echo "could not close the duplicate ask $FACTORY_REPO#$number" >> "$LOG"
+  fi
   printf '' | upsert_sticky_comment "$FACTORY_REPO" "$first" "$KEY_REPEAT_MARKER" repeat \
     --headline "$headline" --items-label "Lanes seen" --item "$SLOT" ||
     echo "could not update the open ask $FACTORY_REPO#$first" >> "$LOG"

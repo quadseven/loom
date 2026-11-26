@@ -6830,7 +6830,7 @@ echo fixed > fix.txt
         # issues again, closes itself, and counts its lane on the earlier ask.
         closed = self.key_ask_race(FAKE_GH_LIST="11\\n12\\n")
         self.assertEqual(len(closed), 1, self.calls())
-        self.assertTrue(closed[0].startswith("gh issue close 12 --repo quadseven/loom"), closed)
+        self.assertTrue(closed[0].startswith("gh issue close --repo quadseven/loom 12 "), closed)
         self.assertIn("#11", closed[0])
         [note] = self.sticky_bodies()
         self.assertIn("Could not use the key again: 1 time", note)
