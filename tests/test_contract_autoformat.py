@@ -3,6 +3,7 @@ after the scope and contract checks and before the final check, host or
 remote, so a run whose only defect is formatting is not thrown away
 (loom#3577)."""
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -111,6 +112,44 @@ class ContractAutoformatTest(base.LaneRunnerTest):
         self.assertFalse(self.args_log.exists())
         self.assertIn("autoformat: skipped, the run changed .loom/validation.conf", log)
         self.assertEqual(self.branch_file("fix.txt"), "fixed\n")
+
+    def test_an_untracked_file_skips_autoformat_without_touching_it(self):
+        tree = Path(self._tmp.name) / "tree"
+        tree.mkdir()
+        def git(*args):
+            return subprocess.run(["git", "-C", str(tree), *args],
+                                  capture_output=True, text=True, check=True)
+        git("init", "-q")
+        (tree / "fix.txt").write_text("base\n")
+        git("add", "fix.txt")
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "base")
+        base_sha = git("rev-parse", "HEAD").stdout.strip()
+        (tree / "fix.txt").write_text("fixed\n")
+        git("add", "fix.txt")
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "fix")
+        (tree / "scratch.txt").write_text("keep\n")
+        func = re.search(r"^contract_autoformat\(\) \{\n.*?^\}\n",
+                         base.RUNNER.read_text(), re.S | re.M).group(0)
+        log = Path(self._tmp.name) / "autoformat.log"
+        ran = Path(self._tmp.name) / "ran"
+        script = (
+            'safe_git() { git -C "$TREE" "$@"; }\n'
+            'tracked_changes() { safe_git diff --name-only; }\n'
+            'lane_changed_files() { printf "fix.txt\\n"; }\n'
+            f'contract_run() {{ touch "{ran}"; return 0; }}\n'
+            'commit_msg() { printf "%s" "$1"; }\n'
+            + func +
+            'contract_autoformat\n'
+        )
+        env = {"PATH": "/usr/bin:/bin", "TREE": str(tree), "LOG": str(log),
+               "BASE": base_sha, "CONTRACT_FILE": ".loom/validation.conf",
+               "C_AUTOFORMAT": "loom-fmt"}
+        result = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("autoformat: skipped, the tree has untracked files", log.read_text())
+        self.assertFalse(ran.exists())
+        self.assertEqual((tree / "scratch.txt").read_text(), "keep\n")
+        self.assertEqual((tree / "fix.txt").read_text(), "fixed\n")
 
 
 for _name in dir(base.LaneRunnerTest):
