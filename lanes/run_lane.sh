@@ -3336,11 +3336,19 @@ check_uv_key() {
 # to every check and agent. uv is given the versions the tree asks for, read
 # as plain version strings (`.python-version`, else `requires-python` in
 # pyproject.toml), with --no-config so no setting in the tree (a download
-# mirror) reaches it. A tree that asks for none gets uv's default Python
-# when the contract runs uv and no Python is installed yet. A failed install
-# is logged; the check then finds the Pythons already there or fails itself.
+# mirror) reaches it. Every check also gets the baseline LOOM_CHECK_PYTHONS
+# (default "3.12 3.13 3.14", space separated; empty turns it off), because a
+# tree may declare no Python and still run `uv run --python 3.12` with
+# downloads off (loom#3602). Each entry is a plain version, validated like
+# `.python-version`; a bad one is logged and ignored, and one already
+# installed (python/cpython-<version>[.-]*, not a `+` variant) is not asked
+# for again, so a warm directory runs no install. A tree that asks for none
+# and needs no baseline gets uv's default Python when the contract runs uv
+# and no Python is installed yet. A failed install is logged; the check
+# then finds the Pythons already there or fails itself.
 check_uv_prepare() {
-  local key uv_bin line req spec_re='^[0-9.,<>=!~ *]+$' reqs=()
+  local key uv_bin line req have dir spec_re='^[0-9.,<>=!~ *]+$' ver_re='^[0-9]+(\.[0-9]+){0,2}$'
+  local reqs=() base=() baseline=()
   key="$(check_uv_key)" || { echo "contract_run: no uv cache for repo '${REPO:-}'" >> "$LOG"; return 1; }
   CHECK_UV_CACHE="$CHECK_UV_DIR/repos/$key/cache" CHECK_UV_LOCK="$CHECK_UV_DIR/locks/$key.lock"
   mkdir -p "$CHECK_UV_CACHE" "$CHECK_UV_DIR/python" "$CHECK_UV_DIR/locks" || return 1
@@ -3349,17 +3357,32 @@ check_uv_prepare() {
   if [ -f "$TREE/.python-version" ] && [ ! -L "$TREE/.python-version" ]; then
     while IFS= read -r line || [ -n "$line" ]; do
       line="$(printf '%s' "${line%%#*}" | tr -d ' \t\r')"
-      [[ "$line" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]] && reqs+=("$line")
+      [[ "$line" =~ $ver_re ]] && reqs+=("$line")
     done < <(head -n 5 "$TREE/.python-version")
   fi
   if [ "${#reqs[@]}" -eq 0 ] && [ -f "$TREE/pyproject.toml" ] && [ ! -L "$TREE/pyproject.toml" ]; then
     req="$(sed -n 's/^requires-python[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$TREE/pyproject.toml" | head -n 1)"
     [ -n "$req" ] && [[ "$req" =~ $spec_re ]] && reqs+=("$req")
   fi
-  if [ "${#reqs[@]}" -eq 0 ]; then
+  read -r -a baseline <<< "${LOOM_CHECK_PYTHONS-3.12 3.13 3.14}"
+  for req in ${baseline[@]+"${baseline[@]}"}; do
+    if ! [[ "$req" =~ $ver_re ]]; then
+      printf 'contract_run: ignoring LOOM_CHECK_PYTHONS entry [%s]: not a version\n' "$req" >> "$LOG"
+      continue
+    fi
+    case " ${reqs[*]:-} ${base[*]:-} " in *" $req "*) continue ;; esac
+    have=""
+    for dir in "$CHECK_UV_DIR/python/cpython-$req".* "$CHECK_UV_DIR/python/cpython-$req"-*; do
+      case "${dir##*/}" in *+*) continue ;; esac
+      [ -d "$dir" ] && { have=1; break; }
+    done
+    [ -n "$have" ] || base+=("$req")
+  done
+  if [ "${#reqs[@]}" -eq 0 ] && [ "${#base[@]}" -eq 0 ]; then
     case " ${C_SETUP:-} ${C_CHECK:-} " in *" uv "*|*" uvx "*) ;; *) return 0 ;; esac
     [ -z "$(ls -A "$CHECK_UV_DIR/python" 2>/dev/null)" ] || return 0
   fi
+  reqs+=(${base[@]+"${base[@]}"})
   # One install at a time across slots (locks/python.lock, exclusive): two
   # slots preparing at once must not write the same interpreter together.
   UV_PYTHON_INSTALL_DIR="$CHECK_UV_DIR/python" python3 -B "$LOOM_ROOT/lanes/uv_cache.py" exclusive \
