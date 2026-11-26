@@ -2955,8 +2955,70 @@ low, medium, high, xhigh or max) sets a codex lane run's reasoning effort with
 `-c model_reasoning_effort=...` over the Codex home's `config.toml`; unset, the
 config's own setting applies. A brain run ignores it.
 
-A long-lived lane pod takes no work from the station. Lane runs on the
-cluster go through ephemeral runners instead (next section).
+A lane pod on the station's own disk takes work from that disk. A lane pod
+on another node takes it from the station's database (next section).
+Ephemeral lane runs go through cluster runners ("Lanes on cluster runners").
+
+### Lane pods fed by the station
+
+A slot named in `LOOM_POD_FEED_SLOTS` on the station runs in a lane pod on
+any node that reaches the station's database, not on the station's disk
+(`bus/lane_feed.py`, loom#3621). The setting is `slot=role` pairs, space- or
+comma-separated, empty by default: each slot with the database role of the
+one pod that runs it. The one station stays the only claimer. With the
+setting empty nothing is offered, written or read, and every lane works as
+before.
+
+- The station claims the ticket and writes its brief to the slot's inbox as
+  for any lane. Each pass it offers the slot's next brief, one at a time, as
+  the slot's `offer` row in the `lane_feed` table, addressed to the slot's
+  role.
+- The pod runs `pod.sh` with `LOOM_POD_FEED=1`. Each round first runs
+  `python3 -m bus.lane_feed sync <slots>`: it writes each slot's heartbeat,
+  side files and keepalive stamp (`beat`), writes a finished run's files
+  (`report`: the brief's move to done/ or failed/, its logs and answers, as
+  a cluster runner's report carries them), and takes the next brief offered
+  to it into its own inbox (`claim`). Then `run_lane.sh` runs it as usual.
+  Its output goes to `logs/lane-feed.log`.
+- Lane pods run agent code, so they are trusted less than the station. A
+  pod connects as a role of its own (`LOOM_LANE_DB_HOST`, `LOOM_LANE_DB_NAME`,
+  `LOOM_LANE_DB_USER`, `LOOM_LANE_DB_PASSWORD`), never the station's, and
+  that role is granted `SELECT, INSERT, UPDATE` on `lane_feed` and `SELECT`
+  on `lane_feed_grant` only, never `loom_state` or `station_lease`. The
+  station owns both tables and makes them on first use, with row-level
+  security on `lane_feed`: a role reads only the rows of the slots
+  `lane_feed_grant` gives it, and writes only their `claim`, `beat` and
+  `report` rows, as itself. Each row records its writer as the database
+  sets it (`current_user`). On the shared backend the station keeps
+  `lane_feed_grant` equal to its setting every pass, so a pod dropped from
+  it loses its rows at once; an empty setting revokes every grant, and so
+  does one it cannot read (fail closed, with a log line).
+- The station believes a pod's row only when the slot's role wrote it, and
+  applies a report only when that role also wrote the claim of the offer
+  the report answers. A pod takes only an offer addressed to it. Moving a
+  slot to another role withdraws its open offer.
+- The station mirrors the pod's heartbeat and keepalive stamp into its own
+  `state/usage/`, so the slot is free, busy, limited or silent exactly as a
+  local slot is. It applies a report with the cluster runner's own checks
+  (`Runners.apply`): a file outside the run refuses the whole report and
+  parks the brief `[transient]`, as does a run that ended without moving
+  its brief.
+- A pod that stops pushing lets its heartbeat and stamp age. After
+  `SILENT_MAX` the factory moves its running ticket as it moves a silent
+  local lane's, the station returns the brief, and its next pass withdraws
+  the offer. A revived pod moves an unstarted withdrawn brief to
+  `returned/`, and the station ignores a late report.
+- The station uses the table when `LOOM_STATE_BACKEND=postgres`, through
+  its own `LOOM_DB_*`. On the file backend the rows are files below the
+  station's loom home, a pod shares that home (`LOOM_POD_FEED_HOME`) and
+  names itself with `LOOM_POD_NAME`; nothing is authorized there, so it
+  serves one host and the tests only.
+- The station's lease fences its offer writes: on Postgres each is one
+  statement that needs the lease row at the station's epoch. A fed slot is
+  never held by the station host's load, and is not a cluster runner slot
+  (a slot in both settings is refused). Pod clocks are trusted as runner
+  clocks are.
+- Needs the operator: a database role per lane pod with the grants above.
 
 ## Lanes on cluster runners
 
