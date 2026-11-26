@@ -781,12 +781,12 @@ print('leak guard: clean (shape patterns only)')
         # for it before the dir is removed (cleanups run after tearDown).
         for stop, thread in self._stations:
             stop.set()
-            thread.join(10)
+            thread.join(20)
             self.assertFalse(thread.is_alive(), "the fake station thread did not stop")
-        # A writer that finished moments ago can still race the removal on
-        # macOS, so retry it a bounded number of times and let a real error
-        # surface on the last attempt rather than swallowing it.
-        deadline = time.time() + 10
+        # On macOS, a writer that just finished can still race the removal:
+        # retry it a bounded number of times and let a real error surface on
+        # the last attempt rather than swallowing it.
+        deadline = time.time() + 20
         while True:
             try:
                 self._tmp.cleanup()
@@ -794,7 +794,7 @@ print('leak guard: clean (shape patterns only)')
             except OSError:
                 if time.time() >= deadline:
                     raise
-                time.sleep(0.2)
+                time.sleep(0.1)
 
     @staticmethod
     def write_tool(path, text):
