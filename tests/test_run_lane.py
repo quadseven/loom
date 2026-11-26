@@ -780,6 +780,11 @@ print('leak guard: clean (shape patterns only)')
             stop.set()
             thread.join(10)
             self.assertFalse(thread.is_alive(), "the fake station thread did not stop")
+        # The station thread writes under state/remote-checks; remove that
+        # tree explicitly so the temp directory cleanup never races it.
+        rc = self.loom / "state" / "remote-checks"
+        if rc.exists():
+            shutil.rmtree(rc)
         self._tmp.cleanup()
 
     @staticmethod
