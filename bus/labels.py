@@ -45,6 +45,10 @@ SLOTS = ["anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5", "anthropic-
          # 2026-10-16, so a second slot runs beside the first instead of
          # queueing (operator: use the Sparks much more).
          "spark-3", "spark-4",
+         # Four more, spark-5 to spark-8 (loom#3605): both boxes run vLLM at
+         # several engine slots each and the spark-gateway sends a request to
+         # a box with a free one, so eight slots keep both Sparks full.
+         "spark-5", "spark-6", "spark-7", "spark-8",
          # One slot per free provider in the spark-gateway's pool (infra#5617),
          # each a spark-type slot at the gateway's pinned free route, waiting
          # out its own provider's reset. Not Sparks. free-ollama Ollama Cloud and
