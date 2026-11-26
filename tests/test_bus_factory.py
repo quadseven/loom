@@ -4999,6 +4999,31 @@ class Helpers(unittest.TestCase):
             self.assertIsNone(f._association(REPO, other))
         say.assert_not_called()
 
+    def test_ticket_references_to_multiple_repos_have_no_association_or_log(self):
+        f = factory.Factory(FakeGitHub(), [REPO], NOW)
+        for repos in ((REPO, "example-org/other-repo"),
+                      ("example-org/other-repo", "example-org/third-repo")):
+            for branch in ("pin-image", "loom/7-update"):
+                with self.subTest(repos=repos, branch=branch):
+                    pr = {"number": 50, "body": "Refs %s#5\nRefs %s#6\n" % repos,
+                          "head": {"ref": branch}}
+                    with mock.patch("bus.factory._say") as say:
+                        self.assertIsNone(f._association(REPO, pr))
+                    say.assert_not_called()
+
+    def test_a_merged_pull_request_has_no_association_or_log(self):
+        f = factory.Factory(FakeGitHub(), [REPO], NOW)
+        bodies = ("Refs #5", "Refs #5\nRefs #6", "Refs %s#5" % REPO,
+                  "Refs %s#5\nRefs %s#6" % (REPO, REPO))
+        for merged in ({"merged_at": iso(0)}, {"merged": True}):
+            for body in bodies:
+                with self.subTest(merged=merged, body=body):
+                    pr = dict(merged, number=50, state="closed", body=body,
+                              head={"ref": "pin-image"})
+                    with mock.patch("bus.factory._say") as say:
+                        self.assertIsNone(f._association(REPO, pr))
+                    say.assert_not_called()
+
     def test_conflicting_ticket_references_still_log_their_line(self):
         f = factory.Factory(FakeGitHub(), [REPO], NOW)
         both = {"number": 50, "body": "Refs %s#5\nRefs %s#6\n" % (REPO, REPO),
