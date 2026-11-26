@@ -1912,8 +1912,15 @@ with no reload. A bulk cleanup uses it so its relabels and moves draw no bot
 comments. Each paused step logs `step <name> paused (LOOM_PAUSED_STEPS)` once a
 pass and counts as done, so the rotation moves on and nothing carries over. A
 name that is not a pass step logs `unknown paused step <name>, ignored` and
-pauses nothing. The rotating steps and the scheduled metrics step can be
-paused through `Station._run_steps`.
+pauses nothing. The rotating steps (`Station._loop_steps`) and the scheduled
+metrics step can be paused.
+
+The step loop keeps `STEP_LOOP_SHARE` (half) of the pass request target past
+whatever the steps before it spent (loom#3119): it runs until the larger of the
+target and the count at its start plus that share. The budget floor still stops
+it. Each time the rotation passes its last step the station logs
+`step rotation: a full turn of <n> steps took <s>s`, and
+`state/station/step-rotation.json` keeps the turn's start as `turn_started`.
 
 ## Log watch
 
