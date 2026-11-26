@@ -356,6 +356,14 @@ else
   say "could not read the brain's GitHub App login; its journal may not post"
 fi
 
+# Preserve only report queue data before cleaning the disposable checkout.
+# The working copy is inside the tree so sandboxed rungs can update it too.
+if [ -f "$WORK/loom/report-budget.json" ]; then
+  cp "$WORK/loom/report-budget.json" "$WORK/report-budget.json.tmp" &&
+    mv "$WORK/report-budget.json.tmp" "$WORK/report-budget.json" ||
+    { say "could not preserve pending reports"; beat failed 1; exit 1; }
+fi
+
 # A rung may have changed the checkout (a hook, a config, an edited
 # docs/MUSE.md the next tick would follow). Each tick starts from origin's
 # head: fetched and reset with hooks and fsmonitor off, and untracked and
@@ -373,6 +381,10 @@ fi
 if [ ! -d "$WORK/loom/.git" ]; then
   rm -rf "$WORK/loom"
   git clone -q "$ORIGIN" "$WORK/loom" >> "$LOG" 2>&1 || { say "could not clone $ORIGIN"; beat failed 1; exit 1; }
+fi
+if [ -f "$WORK/report-budget.json" ]; then
+  cp "$WORK/report-budget.json" "$WORK/loom/report-budget.json" ||
+    { say "could not restore pending reports"; beat failed 1; exit 1; }
 fi
 
 # The handoff packet (docs/decisions/0002, item 3): the last ticks, the open
@@ -406,7 +418,12 @@ is already held for you as holder $HOLDER by the wrapper, so skip the lock and u
 (never lock or unlock). Record each other tick step with python3 -m bus.brain \
 step NAME --holder $HOLDER --lock-repo $LOCK_REPO --note \"one line: what this \
 step found or decided\" in place of the step \
-command MUSE.md gives; the wrapper records lock and unlock. LOOM_REPOS is \
+command MUSE.md gives; the wrapper records lock and unlock. For the report \
+budget turn use python3 -m bus.brain report-plan --state \"$WORK/loom/report-budget.json\" \
+--holder $HOLDER --lock-repo $LOCK_REPO. The wrapper preserves this queue \
+between ticks. Stop drafting and posting reports at report_until, then give \
+verify, brief, triage and sweep their timed turns before other work. Copy \
+the Reports deferred journal_line into the tick journal. LOOM_REPOS is \
 set in your environment. Work from \
 $WORK/loom. Read each goal's home issue and its rules before acting on that \
 goal. Post each journal, and every other note or evidence a tick leaves on \

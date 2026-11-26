@@ -3025,8 +3025,20 @@ valid report, a measurement (a journal or report with a `Measure:` line that
 is not none) and a completed action (a `Shipped:` line that is not none),
 and its report state: ok, due (from 2 hours 15 minutes before its reading
 time), or overdue (30 minutes past the reading time). Due and overdue goals are listed under "Reports
-owed before unlock"; the tick posts those reports before it unlocks. A due
+owed before unlock"; the tick queues those reports for its capped report turn. A due
 or overdue goal that is quiet (below) is not listed there.
+
+`python3 -m bus.brain report-plan --state REPORT_STATE.json --holder HOLDER
+--owed OWNER/NAME#N` retains owed reports across ticks. It offers one report
+until a fixed deadline: at most half the tick's total time, and half the
+remaining time before the existing work cutoff. It then offers timed turns
+for verify, brief, triage and sweep (docs/MUSE.md, Report budget turn).
+The queue removes a goal only with `--done OWNER/NAME#N`, after a successful
+post or a fresh read proving the report no longer owed. A partial read never
+discards queued goals. Keep the state file across ticks; the lane wrapper
+preserves its working copy across checkout cleanup, including for sandboxed
+rungs. The helper's `- Reports deferred: N` line goes in the tick journal.
+Report contents, the tick's stop, and the per-goal report gap do not change.
 
 Two reports on one goal home stay at least 90 minutes apart (the
 `report-cadence` invariant). A due or overdue goal with a report under 90
