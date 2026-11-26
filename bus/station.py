@@ -128,6 +128,9 @@ HEARTBEAT_MAX_AGE = lane_state.HEARTBEAT_MAX_AGE
 BRIEFED = "loom:briefed"
 RUNNING = "loom:running"
 RUNAWAY = "loom:runaway"
+# Work attempts since a ticket's last brief after which it is held as a runaway
+# (LOOM_FAILED_RUN_CAP sets it; 0 turns it off).
+FAILED_RUN_CAP = 8
 # How often the station moves tickets under no epic or a closed epic into an
 # open intake epic, matching the closed-epic invariant's check interval.
 OUTSIDE_EPIC_EVERY = invariants.CHECK_EVERY
@@ -1800,6 +1803,35 @@ def _int_or_default(raw: str, default: int) -> int:
         return int(raw.strip())
     except ValueError:
         return default
+
+
+def _is_work_attempt(reason: str) -> bool:
+    """Whether an attempt ending counts as a work attempt rather than a
+    non-work exit ([transient], [limit], [auth], or [factory])."""
+    return not reason or failure_class(reason) not in NOT_WORK
+
+
+def _runaway_trigger(now: float, comments: list, work: list, reason: str) -> str:
+    """Return the runaway trigger description when a ticket should be held,
+    or empty string otherwise."""
+    failures = [a[3] for a in work[:-1] if a[3]]
+    same_reason = bool(failures) and (
+        failures[-1] == reason
+        or (factory.is_timeout(failures[-1]) and factory.is_timeout(reason))
+    )
+    if same_reason:
+        return "repeated failure reason"
+    recent = [a for a in work if a[0] >= now - 6 * 3600]
+    if len(recent) >= 3:
+        return "three attempts within six hours"
+    # Failures that differ and spread over days trip neither test above: a
+    # ticket reached its fiftieth run that way. Work attempts since the
+    # last brief past the cap hold it; a new brief starts the count again.
+    cap = _int_or_default(os.environ.get("LOOM_FAILED_RUN_CAP", ""), FAILED_RUN_CAP)
+    since_brief = [a for a in history.attempts_since_brief(comments) if _is_work_attempt(a[3])]
+    if 0 < cap <= len(since_brief):
+        return "%d failed runs since the last brief" % len(since_brief)
+    return ""
 
 
 DECISION_DEFAULT_CHECK_EVERY = 3600
@@ -10172,8 +10204,9 @@ class Station:
         return factory.timeouts_in_a_row(earlier) + 1 >= factory.TIMEOUT_STRIKES
 
     def _flag_repeated_failure(self, repo: str, number: int, lane: str, reason: str) -> bool:
-        """Hold a ticket after the same consecutive failure or three attempts in
-        six hours, and record its attempt table."""
+        """Hold a ticket after the same consecutive failure, three attempts in
+        six hours, or the failed-run cap since its last brief, and record its
+        attempt table."""
         if ending_class(reason) in NOT_WORK:
             # An incident is the factory's problem repeating, a transient or
             # limit exit is the lane's, and an expired key is the operator's:
@@ -10192,23 +10225,15 @@ class Station:
         comments = [c for c in self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
                     if isinstance(c, dict) and tickets._login(c.get("user")).lower() in authors]
         attempts = factory.attempts(comments, reason)
-        def is_work(reason: str) -> bool:
-            return not reason or failure_class(reason) not in NOT_WORK
-        work = [a for a in attempts if is_work(a[3])]
-        failures = [a[3] for a in work[:-1] if a[3]]
-        # Timeouts name their kept branch, which differs each run: one reason.
-        def same(a: str, b: str) -> bool:
-            return a == b or (factory.is_timeout(a) and factory.is_timeout(b))
-        reason_repeat = bool(failures) and same(failures[-1], reason)
-        recent = [a for a in work if a[0] >= self.now - 6 * 3600]
-        if not reason_repeat and len(recent) < 3:
+        work = [a for a in attempts if _is_work_attempt(a[3])]
+        trigger = _runaway_trigger(self.now, comments, work, reason)
+        if not trigger:
             return False
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                      {"labels": sorted(set(_label_names(issue)) | {RUNAWAY})})
-        trigger = "repeated failure reason" if reason_repeat else "three attempts within six hours"
         body = factory.runaway_comment(
             trigger, attempts, factory.issue_model(issue), factory.attempt_models(issue, comments),
-            counted=is_work)
+            counted=_is_work_attempt)
         skipped = len(attempts) - len(work)
         if skipped:
             body += ("\n\nNot counted as work attempts: %d that ended [transient], [limit], "
