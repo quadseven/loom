@@ -5148,6 +5148,8 @@ class Routes:
             return reply(422, {"message": "already has a parent"})
         if method == "POST":
             return reply(201, {})
+        if method == "DELETE" and "/labels/" in path:
+            return reply(200, [])
         return None
 
     def writes(self):
@@ -5244,12 +5246,41 @@ class TriageTests(unittest.TestCase):
         self.run_triage(routes)
         self.assertEqual(routes.labelled(), {9: ["loom:triage"]})
 
+    def test_a_ready_loom_triage_issue_is_queued_with_no_model(self):
+        # loom#3594: brain ticks wrote "no rewrites this tick" while ready
+        # loom:triage issues waited; triage now queues them itself.
+        routes = Routes([item(5, labels=["loom:triage"]), item(6, labels=["loom:triage"],
+                                                                  body="broken")])
+        lines = self.run_triage(routes)
+        self.assertEqual(lines, ["#5 queued under #%d" % INTAKE])
+        self.assertEqual(routes.labelled(), {5: ["loom:ticket", "loom:queued"]})
+        self.assertIn(("DELETE", "/repos/%s/issues/5/labels/loom%%3Atriage" % REPO, None),
+                      routes.calls)
+        # Not ready: left as it is, no write, not counted against the limit.
+        self.assertFalse([c for c in routes.writes() if "/issues/6/" in c[1]])
+
+    def test_a_loom_triage_issue_held_for_the_brain_or_a_person_is_left_alone(self):
+        routes = Routes([item(5, labels=["loom:triage", "needs-brain"]),
+                         item(6, labels=["loom:triage", "loom:queued"]),
+                         item(7, labels=["loom:triage", "claim:someone"])])
+        self.assertEqual(self.run_triage(routes), [])
+        self.assertEqual(routes.writes(), [])
+
+    def test_an_untrusted_ready_loom_triage_issue_stays(self):
+        routes = Routes([item(5, labels=["loom:triage"])])
+        with unittest.mock.patch.object(brain, "intake_epic", return_value=INTAKE), \
+                unittest.mock.patch.object(brain.tickets, "brief_author_trusted", return_value=False), \
+                unittest.mock.patch.object(brain, "_epic_tickets", return_value=[]):
+            lines = brain.triage(GitHub("t", transport=routes), REPO, 1)
+        self.assertEqual(lines, [])
+        self.assertEqual(routes.writes(), [])
+
     def test_pull_requests_epics_and_labelled_issues_are_skipped(self):
         routes = Routes([
             item(2, pull_request={"url": "x"}),
             item(3, labels=["Epic"]),
             item(4, sub_issues_summary={"total": 3, "completed": 0}),
-            item(5, labels=["loom:triage"]),
+            item(5, labels=["loom:triage"], body="broken"),
             item(6, labels=["loom:human"]),
             item(7, labels=["needs-operator"]),
             item(8, labels=["bug"], body="broken"),
