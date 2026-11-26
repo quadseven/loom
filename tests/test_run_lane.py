@@ -776,15 +776,12 @@ print('leak guard: clean (shape patterns only)')
     def tearDown(self):
         # A fake station thread writes inside the temp dir; stop it and wait
         # for it before the dir is removed (cleanups run after tearDown).
-        for stop, thread in self._stations:
+        for stop, thread, cleaned_up in self._stations:
             stop.set()
             thread.join(10)
             self.assertFalse(thread.is_alive(), "the fake station thread did not stop")
-        # The station thread writes under state/remote-checks; remove that
-        # tree explicitly so the temp directory cleanup never races it.
-        rc = self.loom / "state" / "remote-checks"
-        if rc.exists():
-            shutil.rmtree(rc)
+            cleaned_up.wait(10)
+            self.assertTrue(cleaned_up.is_set(), "the fake station thread did not clean up")
         self._tmp.cleanup()
 
     @staticmethod
@@ -9577,17 +9574,24 @@ echo fixed > fix.txt
             return buf.getvalue()
 
         stop = threading.Event()
+        cleaned_up = threading.Event()
+        rc_path = self.loom / "state" / "remote-checks"
 
         def run():
-            while not stop.is_set():
-                remote_checks.RemoteChecks(
-                    FakeGH(), str(self.loom), "example/loom", lambda repo: True, said.append,
-                    actor=self.STATION_ACTOR, fetch=fetch).tend()
-                stop.wait(0.2)
+            try:
+                while not stop.is_set():
+                    remote_checks.RemoteChecks(
+                        FakeGH(), str(self.loom), "example/loom", lambda repo: True, said.append,
+                        actor=self.STATION_ACTOR, fetch=fetch).tend()
+                    stop.wait(0.2)
+            finally:
+                if rc_path.exists():
+                    shutil.rmtree(rc_path)
+                cleaned_up.set()
 
         thread = threading.Thread(target=run, daemon=True)
         thread.start()
-        self._stations.append((stop, thread))
+        self._stations.append((stop, thread, cleaned_up))
         dispatched.said = said
         return stop, dispatched
 
