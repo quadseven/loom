@@ -783,7 +783,18 @@ print('leak guard: clean (shape patterns only)')
             stop.set()
             thread.join(10)
             self.assertFalse(thread.is_alive(), "the fake station thread did not stop")
-        self._tmp.cleanup()
+        # A writer that finished moments ago can still race the removal on
+        # macOS, so retry it a bounded number of times and let a real error
+        # surface on the last attempt rather than swallowing it.
+        deadline = time.time() + 10
+        while True:
+            try:
+                self._tmp.cleanup()
+                return
+            except OSError:
+                if time.time() >= deadline:
+                    raise
+                time.sleep(0.2)
 
     @staticmethod
     def write_tool(path, text):
@@ -857,6 +868,25 @@ print('leak guard: clean (shape patterns only)')
         for agent in sorted((self.loom / "run").glob("*-home/tmp/agent.log")):
             extra += agent.read_text().splitlines()
         return self.log.read_text().splitlines() + extra
+
+    def test_teardown_retries_a_temp_dir_removal_that_races_a_writer(self):
+        # The macOS tearDown removal can race a writer that just finished
+        # (Errno 66). tearDown retries the removal a bounded number of times.
+        real = self._tmp.cleanup
+        seen = []
+
+        def flaky():
+            seen.append(1)
+            if len(seen) == 1:
+                raise OSError(66, "Directory not empty")
+            real()
+
+        from unittest.mock import patch
+
+        with patch.object(self._tmp, "cleanup", flaky):
+            self.tearDown()
+        self.assertEqual(len(seen), 2)
+        self.assertFalse(Path(self._tmp.name).exists())
 
     def test_fix_items_ignores_dispositions_before_a_finding(self):
         brief = Path(self._tmp.name) / "fix-items.md"
