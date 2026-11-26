@@ -70,7 +70,7 @@ from functools import cache
 from typing import Any, Callable, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import answer, decision_claim, proof, status, tickets
+from . import answer, criteria_gate, decision_claim, proof, status, tickets
 from .github import GitHubError
 
 STALE = "stale"
@@ -249,6 +249,21 @@ def criteria_verdict(body: str) -> Optional[Verdict]:
     return Verdict(CRITERIA, "criteria-" + stamp,
                    "its body names no acceptance criteria, so no criterion can be "
                    "restated as the check that proves it")
+
+
+def live_only_hold(body: str) -> str:
+    """Why an all-live build brief waits for a buildable deliverable, or empty."""
+    body = brief_text(body)
+    live = criteria_gate.live_criteria(body)
+    if not live or len(live) != len(tickets._criteria_texts(body)):
+        return ""
+    try:
+        headers, _ = tickets.parse(body)
+    except ValueError:
+        headers = {}
+    if headers.get("Deliverable") == "answer":
+        return ""
+    return "all acceptance criteria require live evidence"
 
 
 # -- the test that proves the ticket ------------------------------------------
