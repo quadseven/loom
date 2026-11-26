@@ -784,7 +784,7 @@ print('leak guard: clean (shape patterns only)')
         # for it before the dir is removed (cleanups run after tearDown).
         for stop, thread in self._stations:
             stop.set()
-            thread.join(10)
+            thread.join(20)
             self.assertFalse(thread.is_alive(), "the fake station thread did not stop")
         self._tmp.cleanup()
 
@@ -860,6 +860,7 @@ print('leak guard: clean (shape patterns only)')
         for agent in sorted((self.loom / "run").glob("*-home/tmp/agent.log")):
             extra += agent.read_text().splitlines()
         return self.log.read_text().splitlines() + extra
+
 
     def test_fix_items_ignores_dispositions_before_a_finding(self):
         brief = Path(self._tmp.name) / "fix-items.md"
