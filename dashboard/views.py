@@ -4,6 +4,7 @@ from __future__ import annotations
 import html
 import re
 import os
+from bisect import bisect_left
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from urllib.parse import quote
@@ -136,7 +137,8 @@ _LINK = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)|<?(https?://[^\s>)]+)>?|(\S*issueco
 _WHY_SECTION = re.compile(r"##\s*Why\s*\n(.*?)(?=\n##|\Z)", re.S | re.I)
 _ISSUECOMMENT_ID = re.compile(r"issuecomment-(\w+)")
 _REFS_LINE = re.compile(r"Refs\b([^\n]*)")
-_URL_TOKEN = re.compile(r"https?://[^\s<>)\"'\]]+")
+_URL_SCHEME = re.compile(r"https?://")
+_URL_TOKEN = re.compile(_URL_SCHEME.pattern + r"(\S*)")
 _WORD_TOKEN = re.compile(r"\w+")
 
 
@@ -150,11 +152,13 @@ class _TicketIndex:
         self.by_comment_id = {}
         self.by_refs_token = {}
         self.by_url = {}
+        self.embedded_url_indices = set()
         self.noticed_by_idx = {}
         self.why_entries = []
         self._quote_cache = {}
         for idx, row in enumerate(self.tickets):
             self._index_ticket(idx, row)
+        self.sorted_urls = sorted(self.by_url)
 
     def _index_ticket(self, idx, row):
         self.by_ref.setdefault((row.get("repo"), str(row.get("number"))), row)
@@ -180,14 +184,11 @@ class _TicketIndex:
             self.by_comment_id.setdefault(cid, []).append(idx)
         for tok in {tok for tail in _REFS_LINE.findall(ticket_body) for tok in _WORD_TOKEN.findall(tail)}:
             self.by_refs_token.setdefault(tok, []).append(idx)
-        urls = set()
-        for raw in _URL_TOKEN.findall(ticket_body):
-            urls.add(raw)
-            stripped = raw.rstrip(".,;:!?")
-            if stripped:
-                urls.add(stripped)
-        for url in urls:
-            self.by_url.setdefault(url, []).append(idx)
+        for match in _URL_TOKEN.finditer(ticket_body):
+            self.by_url.setdefault(match[0], set()).add(idx)
+            if _URL_SCHEME.search(ticket_body, match.start(1), match.end()):
+                # Recheck these tickets for URLs embedded inside a token.
+                self.embedded_url_indices.add(idx)
 
     def find_ticket(self, refs):
         for ref in refs:
@@ -197,13 +198,21 @@ class _TicketIndex:
         return None
 
     def _candidate_indices(self, journal_url, journal_id):
-        if journal_url and not journal_url.startswith(("http://", "https://")):
+        if journal_url and not _URL_TOKEN.fullmatch(journal_url):
             return range(len(self.tickets))
         if journal_id and not _WORD_TOKEN.fullmatch(journal_id):
             return range(len(self.tickets))
         found = set()
         if journal_url:
-            found.update(self.by_url.get(journal_url, ()))
+            found.update(self.embedded_url_indices)
+            # The legacy URL check accepts any suffix that starts with a nondigit.
+            end = len(journal_url)
+            for pos in range(bisect_left(self.sorted_urls, journal_url), len(self.sorted_urls)):
+                token = self.sorted_urls[pos]
+                if not token.startswith(journal_url):
+                    break
+                if len(token) == end or not token[end].isdecimal():
+                    found.update(self.by_url[token])
         if journal_id:
             found.update(self.by_comment_id.get(journal_id, ()))
             found.update(self.by_refs_token.get(journal_id, ()))

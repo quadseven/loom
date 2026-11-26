@@ -266,6 +266,45 @@ class Wave4OptimizationParityTest(unittest.TestCase):
         matched_numbers = [r["ticket"]["number"] for r in built["records"]]
         self.assertEqual(matched_numbers, [10, 21, 22, 23, 30, 60, 70])
 
+    def test_journal_url_prefix_keeps_the_legacy_digit_boundary(self):
+        url = "https://example.com/issues/1#issuecomment-123"
+        journal = {"html_url": url}
+        for suffix, matches in (("", True), (" appendix", True), ("extra", True), ("4", False)):
+            with self.subTest(suffix=suffix):
+                ticket = {"body": url + suffix}
+                expected = ticket if matches else None
+                self.assertIs(views._ticket_refs_journal([ticket], journal), expected)
+                index = views._TicketIndex([{"body": "Unrelated ticket"}, ticket])
+                with patch.object(index, "_ticket_matches_journal", wraps=index._ticket_matches_journal) as matcher:
+                    self.assertIs(index.ticket_refs_journal(journal, ""), expected)
+                self.assertEqual([call.args[0] for call in matcher.call_args_list], [1] if matches else [])
+
+    def test_journal_url_embedded_in_another_url_matches(self):
+        url = "https://example.com/issues/1#issuecomment-123"
+        journal = {"html_url": url}
+        ticket = {"body": "https://example.com/redirect?target=" + url}
+        self.assertIs(views._ticket_refs_journal([ticket], journal), ticket)
+        self.assertIs(views._TicketIndex([ticket]).ticket_refs_journal(journal, ""), ticket)
+
+    def test_journal_id_matches_without_a_url(self):
+        journal = {"id": 123}
+        ticket = {"body": "See issuecomment-123."}
+        tickets = [{"body": "See issuecomment-1234."}, ticket]
+        self.assertIs(views._ticket_refs_journal(tickets, journal), ticket)
+        self.assertIs(views._TicketIndex(tickets).ticket_refs_journal(journal, ""), ticket)
+
+    def test_noticed_quote_stays_with_its_journal_across_unlinked_lines(self):
+        url = "https://example.com/issues/1#issuecomment-123"
+        journal = {"html_url": url, "id": 123}
+        friction = "runner cache miss during compile"
+        wrong = {"body": f"Noticed in {url}: slow dashboard redraw after refresh\n"
+                         "Noticed in: no linked comment on this line\n"
+                         "Noticed in https://example.com/issues/1#issuecomment-567: " + friction}
+        right = {"body": f"Noticed in {url}: {friction}"}
+        tickets = [wrong, right]
+        self.assertIs(views._ticket_refs_journal(tickets, journal, friction), right)
+        self.assertIs(views._TicketIndex(tickets).ticket_refs_journal(journal, friction), right)
+
     def test_summarize_prs_matches_scoreboard_and_lane_view_uses_precomputed(self):
         repo = "example-owner/sample"
         tickets = [
