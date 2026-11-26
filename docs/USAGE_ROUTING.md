@@ -65,6 +65,21 @@ Each reading names the machine that collected it (`host`).
   recorded; when every anthropic slot reports "out of credit", the credit
   reads as used up.
 
+## Pace (bus/pace.py)
+
+After collecting, the station paces each provider with a current reading
+of a window of known length (its longest such window, weekly where there
+is one): used share minus elapsed share, against `LOOM_PACE_SLACK`
+(default 10 points). Behind with a ticket waiting for a free lane, it asks
+for one more slot than the provider's slots running now (fresh
+heartbeats), up to its most: the registry's slots of that provider, or
+`LOOM_PACE_MAX_<PROVIDER>`. On or ahead of pace it asks for none. A
+reading that is stale or from a window that has reset gives no verdict.
+The plan is written to `state/usage/pace.json` and shown as the `Pace`
+line of the lane status comment. It is data only: a lane container runs
+the slots its deployment names, so the request is what a pod that can
+start slots at runtime would read.
+
 Subscription meters in `state/usage/<lane>.meter.json` carry the observed
 time, percent used, and reset time when the provider supplies them. A
 figure over two hours old or from a window that has reset is marked stale.
