@@ -180,6 +180,13 @@ def key(text: str) -> str:
     return hashlib.sha256(" ".join((text or "").split()).encode("utf-8")).hexdigest()[:16]
 
 
+def live_criteria(body: str) -> List[str]:
+    """The ticket's live criteria, read as the brief reads them: the texts its
+    Proof checks section marks as proved by the verify run after the change
+    ships (tickets.proof_checks), which a lane never ticks."""
+    return [text for text in tickets._criteria_texts(body or "") if kind(text) == LIVE]
+
+
 def needing_evidence(body: str) -> List[Tuple[str, str]]:
     """(kind, text) for each live or operator criterion of the ticket, ticked
     or not: a tick is nobody's evidence."""
