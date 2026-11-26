@@ -204,6 +204,11 @@ is_lane_runner_pid() {
   command="$(ps -o command= -p "$pid" 2>/dev/null)" || return 2
   [ -n "$command" ] || return 2
   case "$command" in *"run_lane.sh $SLOT") return 0 ;; esac
+  # The sign-in probe holds the lock of every slot it names while it proves
+  # the sign-in in place (lanes/signin_probe.sh, loom#3572).
+  case "$command" in
+    *"/signin_probe.sh "*) case " ${command#*/signin_probe.sh} " in *" $SLOT "*) return 0 ;; esac ;;
+  esac
   return 1
 }
 

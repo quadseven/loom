@@ -856,7 +856,9 @@ open `loom:lanes` issue in `LOOM_STATUS_REPO` (default: this checkout's
 when a lane state or its public reason changes, when an Anthropic run is recorded, and when
 the table is older than 15 minutes (`LANES_REPUBLISH`), which it does at the
 start of the pass so a pass that stops at its request target still publishes.
-The table uses fixed reason text so raw runner details stay local. The
+The table uses fixed reason text so raw runner details stay local. Its
+sign-in column is each slot's last sign-in probe, result and time ("Lane
+pods" below). The
 launchd station removes stale heartbeat files for slots with no loaded job.
 Remote and cluster slots keep their own heartbeat sources. `bus.brain status`
 prints the table's age beside `Updated` and calls it stale past the same age. With Anthropic
@@ -2335,7 +2337,9 @@ anthropic slot reports itself unavailable with that reason, and the station
 sends the anthropic slots nothing more. Ephemeral runners return their spend
 rows in the sealed report. The station appends them once per report to the
 same ledger and checks the shared balance before dispatching more Anthropic
-briefs.
+briefs. The floor holds the anthropic slots only: the spend line says every
+other lane takes briefs as usual, and `bus.brain brief --lane` refuses only
+an anthropic slot under the floor (loom#3593).
 
 ## Skills on every lane
 
@@ -2841,6 +2845,28 @@ What changes in a pod:
   kept in step with SSM by the cluster. `ssm_value` reads the file and makes
   no AWS call, so the pod holds no AWS key. The GitHub App key comes from
   `LOOM_GITHUB_APP_KEY_FILE`, also under HOME.
+- A sign-in probe (loom#3572): at start and every
+  `LOOM_SIGNIN_PROBE_INTERVAL` seconds (default 1800; 0 turns it off), for
+  each lane in `LOOM_SIGNIN_LANES` (default `codex claude`) with a slot in
+  the pod, `lanes/signin_probe.sh` runs the CLI's cheapest real call (a
+  one-word prompt) in place on the lane's own sign-in, while it holds the
+  run lock of every slot of that lane. A slot whose lock is taken makes it
+  let go and try again every `LOOM_SIGNIN_PROBE_POLL` seconds (default 15)
+  for up to `LOOM_SIGNIN_PROBE_WAIT` (default 1500); a runner that starts
+  while the probe holds its lock exits at once. The result (pass; unknown on
+  a usage limit, the network or `LOOM_SIGNIN_PROBE_TIMEOUT`, default 180;
+  fail otherwise) goes to `state/signin/<first slot>.json` with a masked
+  tail of what the CLI said, and the probe's own log to
+  `logs/signin-probe.log`. Every pass the station (`tend_signin`,
+  `bus/signin.py`) reads the records: the first fail after a pass sends one
+  alert line (`LOOM_SIGNIN_ALERT_CMD`, a command given the line on stdin,
+  when set; else the ask webhook with the operator mention) and files or
+  counts on the single key-ask for that sign-in, titled as
+  `ask_renew_key` titles it, so lanes and probes share one ask. The first
+  pass after a fail sends a recovery line and closes the ask; a pass with no
+  failure before it closes an ask left open too. At most hourly a key-ask
+  whose lanes have all had no heartbeat for 24 hours is closed as off. The
+  lane status table's sign-in column shows each slot's last probe.
 
 Everything the agent must not read (the copied parameters, the App key,
 `LOOM_HOME`) sits under HOME, outside the system folders bwrap binds; the

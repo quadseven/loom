@@ -109,21 +109,24 @@ def heartbeat_fields(slot: str, beat: Dict[str, Any], home: str) -> Dict[str, An
 
 
 ROW = re.compile(r"\|\s*([a-z0-9_.-]+)\s*\|\s*(serving|limited|parked|off|busy|yes|no)\s*"
-                 r"\|\s*([^|]+)\|(?:\s*([^|]+)\|)?", re.I)
+                 r"\|\s*([^|]+)\|(?:\s*([^|]+)\|)?(?:\s*([^|]+)\|)?", re.I)
 
 
 def published_rows(body: str) -> list[dict[str, Any]]:
-    """Read a station lane table, including older yes/no rows."""
+    """Read a station lane table, including older yes/no rows and rows
+    before the sign-in column (loom#3572)."""
     rows = []
     for line in (body or "").splitlines():
         match = ROW.fullmatch(line.rstrip())
         if match is None or match[1].lower() == "lane":
             continue
-        lane, state, at, reason = match.groups()
+        lane, state, at, reason, signin = match.groups()
         state = state.lower()
         row = {"lane": lane, "available": state in ("serving", "yes"), "heartbeat": at.strip()}
         if state in STATES:
             row.update(state=state, reason=(reason or "").strip())
+        if signin is not None:
+            row["signin"] = signin.strip()
         rows.append(row)
     return rows
 

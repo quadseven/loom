@@ -1738,6 +1738,26 @@ have their own slot (see Regression slot). Write the journal, report when
 due, and release the lock. A failed step goes in the journal and waits for
 the next tick.
 
+A tick runs every step (loom#3593). The tick record keeps the steps whose
+last note was refused for deferring on budget (`refused`); such a step
+counts as not run. For a tick whose record starts with a timed `lock` step,
+`bus.brain step journal` is refused and nothing is recorded while a step
+from `status` to `sweep` is not run and the tick has used less than its
+budget minutes; the refusal names the next step. Past the budget the
+journal goes through and the tick may end. `python3 -m bus.brain
+step-pending` prints the elapsed line and the steps not run, and exits 0
+only while steps are left and the clock is open. `lanes/mac/brain.sh` reads
+it after an agent that ended well and runs the agent again with the steps
+named, at most `LOOM_BRAIN_CONTINUES` times (default 2) and only with 5 or
+more minutes left. On 2026-11-25 every lane machine tick ended after merge
+with 10 of its 12 minutes left, so brief and triage never ran.
+
+The Anthropic spend floor (docs/LANES.md, Anthropic spend) parks the
+anthropic slots only. `bus.brain brief --lane L` is refused under the floor
+when L is an anthropic slot (its lane status row is parked for Anthropic
+credit, or the status spend line says it is under the floor); a brief to any
+other lane, or with no lane, is never held by it.
+
 ## Tickets no lane takes
 
 A ticket the factory leaves waiting because no lane takes it (no free lane
@@ -1760,9 +1780,11 @@ no-lane reasons and dropped when a lane takes it), and the factory acts on it:
   (`PIN_FALLBACK_MAX`): a fallback run that fails climbs the ladder as any
   failure does. The status comment says `Not a failure` with a
   `loom:pin-fallback <model>` marker, and the station log says `pin fallback
-  from model <model> after N minutes`. Hard pins wait instead: a ticket a
-  person opened (the operator wrote its `Model:` line), and one carrying
-  `class:sensitive` or `tier:security` (docs/BRIEF_FORMAT.md). No demotion is
+  from model <model> after N minutes`. Hard pins wait instead: a ticket
+  carrying `class:sensitive` or `tier:security` (docs/BRIEF_FORMAT.md). A
+  ticket a person account opened is no hard pin: agent sessions post as that
+  account (loom#3592). The clock is kept in the station's state store, so a
+  station restart does not reset it. No demotion is
   lifted and no credit spent: the fallback routes around both. On
   2026-11-17 one pass assigned 0 of 86 queued tickets, each pinned to a codex
   or anthropic model with no lane up, while about 30 other lanes sat idle.
