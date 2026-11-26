@@ -10664,7 +10664,8 @@ class SpendTest(Base):
                       body=BODY_WITH_CRITERIA.replace("Model: model-x", "Model: claude-sonnet-5-5"))
         st.run_pass()
         self.assertEqual(self.listing("anthropic-4"), [])
-        self.assertIn("Under the $5.00 floor: the anthropic slots take no work.",
+        self.assertIn("Under the $5.00 floor: only the anthropic slots (anthropic to "
+                      "anthropic-8) take no work; every other lane takes briefs as usual.",
                       self.fake.posts[0])
         self.assertIn("| anthropic-4 | parked |", self.fake.posts[0])
         # Above the floor, the same heartbeat takes work again.
