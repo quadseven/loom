@@ -594,49 +594,85 @@ def sync(home: str, slots: List[str], rows: Any, principal: str, now: float,
     `home` is the pod's loom home; `principal` the name the station knows
     this pod by (its database role)."""
     for slot in slots:
-        beat = _usage_row(home, slot, now)
+        _PodSlot(home, slot, rows, principal, now, say).round()
+
+
+class _PodSlot:
+    """One pod round for one slot (sync)."""
+
+    def __init__(self, home: str, slot: str, rows: Any, principal: str, now: float,
+                 say: Callable[[str], None]) -> None:
+        self.home, self.slot, self.rows = home, slot, rows
+        self.principal, self.now, self.say = principal, now, say
+        self.inbox = os.path.join(home, "briefs", slot)
+
+    def round(self) -> None:
+        beat = _usage_row(self.home, self.slot, self.now)
         if beat is not None:
-            rows.write(slot, "beat", beat)
-        claim = _value(rows, slot, "claim")
-        inbox = os.path.join(home, "briefs", slot)
+            self.rows.write(self.slot, "beat", beat)
+        claim = self._report(_value(self.rows, self.slot, "claim"))
+        offer = _value(self.rows, self.slot, "offer")
+        if offer.get("pod") != self.principal:
+            return   # not offered to this pod
+        if offer.get("state") == "withdrawn":
+            self._withdraw(offer, claim)
+        elif self._may_take(offer, claim):
+            self._take(offer)
+
+    def _open(self, claim: Dict[str, Any]) -> str:
+        """The ticket of a claim not yet reported, or ''."""
         ticket = str(claim.get("ticket") or "")
         if claim.get("id") and not claim.get("reported") and runners.TICKET_RE.fullmatch(ticket):
-            if any(os.path.exists(os.path.join(inbox, kind, ticket + ".md"))
-                   for kind in ("done", "failed")):
-                rows.write(slot, "report", {"id": claim["id"], "ticket": ticket, "at": now,
-                                            "files": report_files(home, slot, ticket)})
-                claim = dict(claim, reported=True)
-                rows.write(slot, "claim", claim)
-                say("reported %s/%s to the station" % (slot, ticket))
-        offer = _value(rows, slot, "offer")
-        if offer.get("pod") != principal:
-            continue   # not offered to this pod
-        if (offer.get("state") == "withdrawn" and offer.get("id") == claim.get("id")
-                and not claim.get("reported")):
-            brief = os.path.join(inbox, ticket + ".md")
-            if os.path.exists(brief):
-                os.makedirs(os.path.join(inbox, "returned"), exist_ok=True)
-                os.replace(brief, os.path.join(inbox, "returned", ticket + ".md"))
-            rows.write(slot, "claim", dict(claim, reported=True, withdrawn=True))
-            say("%s/%s withdrawn by the station" % (slot, ticket))
-            continue
+            return ticket
+        return ""
+
+    def _report(self, claim: Dict[str, Any]) -> Dict[str, Any]:
+        """Write a finished run's report once its brief left the inbox."""
+        ticket = self._open(claim)
+        if not ticket or not any(os.path.exists(os.path.join(self.inbox, kind, ticket + ".md"))
+                                 for kind in ("done", "failed")):
+            return claim
+        self.rows.write(self.slot, "report", {"id": claim["id"], "ticket": ticket, "at": self.now,
+                                              "files": report_files(self.home, self.slot, ticket)})
+        claim = dict(claim, reported=True)
+        self.rows.write(self.slot, "claim", claim)
+        self.say("reported %s/%s to the station" % (self.slot, ticket))
+        return claim
+
+    def _withdraw(self, offer: Dict[str, Any], claim: Dict[str, Any]) -> None:
+        """Set aside a withdrawn brief this pod claimed and has not started."""
+        ticket = self._open(claim)
+        if not ticket or offer.get("id") != claim.get("id"):
+            return
+        brief = os.path.join(self.inbox, ticket + ".md")
+        if os.path.exists(brief):
+            os.makedirs(os.path.join(self.inbox, "returned"), exist_ok=True)
+            os.replace(brief, os.path.join(self.inbox, "returned", ticket + ".md"))
+        self.rows.write(self.slot, "claim", dict(claim, reported=True, withdrawn=True))
+        self.say("%s/%s withdrawn by the station" % (self.slot, ticket))
+
+    def _may_take(self, offer: Dict[str, Any], claim: Dict[str, Any]) -> bool:
+        """A new offer, the last run reported, the brief well formed and no
+        brief already waiting here."""
         if offer.get("state") != "offered" or offer.get("id") == claim.get("id"):
-            continue
-        if claim.get("id") and not claim.get("reported"):
-            continue   # the last run has not reported yet
-        offered = str(offer.get("ticket") or "")
-        if not runners.TICKET_RE.fullmatch(offered) or not isinstance(offer.get("brief"), str):
-            say("%s: the offered brief is malformed; not taken" % slot)
-            continue
+            return False
+        if self._open(claim):
+            return False   # the last run has not reported yet
+        if (not runners.TICKET_RE.fullmatch(str(offer.get("ticket") or ""))
+                or not isinstance(offer.get("brief"), str)):
+            self.say("%s: the offered brief is malformed; not taken" % self.slot)
+            return False
         try:
-            if any(n.endswith(".md") for n in os.listdir(inbox)):
-                continue   # a brief already waits here
+            return not any(n.endswith(".md") for n in os.listdir(self.inbox))
         except FileNotFoundError:
-            pass
-        _write(os.path.join(inbox, offered + ".md"), offer["brief"].encode("utf-8"))
-        rows.write(slot, "claim", {"id": offer["id"], "ticket": offered, "at": now,
-                                   "reported": False})
-        say("claimed %s/%s from the station" % (slot, offered))
+            return True
+
+    def _take(self, offer: Dict[str, Any]) -> None:
+        ticket = str(offer["ticket"])
+        _write(os.path.join(self.inbox, ticket + ".md"), offer["brief"].encode("utf-8"))
+        self.rows.write(self.slot, "claim", {"id": offer["id"], "ticket": ticket, "at": self.now,
+                                             "reported": False})
+        self.say("claimed %s/%s from the station" % (self.slot, ticket))
 
 
 def main(argv: List[str]) -> int:

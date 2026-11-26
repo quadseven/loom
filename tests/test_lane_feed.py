@@ -66,50 +66,58 @@ class FeedDb:
 
     def execute(self, role, sql, params):
         self.sent.append((role, sql))
-        owner = role == self.OWNER
         if sql == lane_feed.STATEMENT_TIMEOUT:
             return [], 0
         if sql in lane_feed.SETUP:
-            if not owner:
-                self.refuse("must be owner of table lane_feed")
-            self.setup_done = True
-            return [], 0
-        if sql == lane_feed.GET_ROW:
-            slot, name = params
-            if not owner and self.grants.get(slot) != role:
-                return [], 0
-            row = self.rows.get((slot, name))
-            return ([row] if row else []), 0
-        if sql == lane_feed.PUT_ROW:
-            slot, name, value, _ = params
-            if not owner and (name not in lane_feed.POD_ROWS or self.grants.get(slot) != role):
-                self.refuse("new row violates row-level security policy for table lane_feed")
-            self.rows[(slot, name)] = (value, role)
-            return [], 1
-        if sql == lane_feed.PUT_ROW_FENCED:
-            slot, name, value, _, epoch = params
-            if not owner:
-                self.refuse("permission denied for table station_lease")
-            if self.epoch != epoch:
-                return [], 0
-            self.rows[(slot, name)] = (value, role)
-            return [], 1
-        if sql == lane_feed.PUT_GRANT:
-            if not owner:
-                self.refuse("permission denied for table lane_feed_grant")
-            self.grants[params[0]] = params[1]
-            return [], 1
-        if sql == lane_feed.DROP_GRANTS:
-            if not owner:
-                self.refuse("permission denied for table lane_feed_grant")
-            self.grants = {s: p for s, p in self.grants.items() if s in params[0]}
-            return [], 0
-        if sql == lane_feed.DROP_ALL_GRANTS:
-            if not owner:
-                self.refuse("permission denied for table lane_feed_grant")
-            self.grants = {}
-            return [], 0
+            return self.setup(role)
+        handler = {lane_feed.GET_ROW: self.get_row, lane_feed.PUT_ROW: self.put_row,
+                   lane_feed.PUT_ROW_FENCED: self.put_row_fenced}.get(sql)
+        if handler is not None:
+            return handler(role, params)
+        if sql in (lane_feed.PUT_GRANT, lane_feed.DROP_GRANTS, lane_feed.DROP_ALL_GRANTS):
+            return self.change_grants(role, sql, params)
         self.refuse("permission denied: %s" % sql[:40])
+
+    def setup(self, role):
+        if role != self.OWNER:
+            self.refuse("must be owner of table lane_feed")
+        self.setup_done = True
+        return [], 0
+
+    def get_row(self, role, params):
+        slot, name = params
+        if role != self.OWNER and self.grants.get(slot) != role:
+            return [], 0
+        row = self.rows.get((slot, name))
+        return ([row] if row else []), 0
+
+    def put_row(self, role, params):
+        slot, name, value, _ = params
+        if role != self.OWNER and (name not in lane_feed.POD_ROWS
+                                   or self.grants.get(slot) != role):
+            self.refuse("new row violates row-level security policy for table lane_feed")
+        self.rows[(slot, name)] = (value, role)
+        return [], 1
+
+    def put_row_fenced(self, role, params):
+        slot, name, value, _, epoch = params
+        if role != self.OWNER:
+            self.refuse("permission denied for table station_lease")
+        if self.epoch != epoch:
+            return [], 0
+        self.rows[(slot, name)] = (value, role)
+        return [], 1
+
+    def change_grants(self, role, sql, params):
+        if role != self.OWNER:
+            self.refuse("permission denied for table lane_feed_grant")
+        if sql == lane_feed.PUT_GRANT:
+            self.grants[params[0]] = params[1]
+        elif sql == lane_feed.DROP_GRANTS:
+            self.grants = {s: p for s, p in self.grants.items() if s in params[0]}
+        else:
+            self.grants = {}
+        return [], 1
 
 
 class FakeCursor:
