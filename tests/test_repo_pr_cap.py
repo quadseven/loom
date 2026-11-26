@@ -157,6 +157,18 @@ class RepoPrCapTest(Base):
         self.assertTrue(claimed)
         self.assertEqual(runner._repo_pr_count(REPO), 1)
 
+    def test_other_bots_do_not_count_toward_the_cap(self):
+        # loom#3533: dependabot, the actions sync job and another agent's App
+        # must not hold Loom's lanes, whatever their branch or body says.
+        self.pulls(4)
+        for pr, login in zip(self.fake.pulls[1:], ("dependabot[bot]", "github-actions[bot]",
+                                                    "other-agent-app[bot]")):
+            pr["user"] = {"login": login, "type": "Bot"}
+            pr["head"]["ref"] = "dependabot/npm_and_yarn/x"
+        self.fake.pulls[0]["user"]["type"] = "Bot"
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        self.assertEqual(runner._repo_pr_count(REPO), 1)
+
     def test_loom_head_counts_whatever_the_author_type(self):
         self.pulls(2)
         self.fake.pulls[0]["user"]["type"] = "User"
