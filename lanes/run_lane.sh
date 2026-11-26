@@ -2768,8 +2768,8 @@ base_verdict_read() {  # key, now
   case "$at:$exit" in *[!0-9:]*|:*) return 1 ;; esac
   # The verdict can outlive the packages: the shared uv cache goes with a
   # new pod or a bound (bound_check_uv_cache). Rerun a passing check for a
-  # codex agent if the shared uv cache existed when it was written, or the
-  # verdict predates this marker.
+  # codex agent if the repo's uv cache held anything when it was written, or
+  # the verdict predates this marker.
   if [ "$exit" -eq 0 ] && [ "$LANE" = codex ] && [ "$DELIVERABLE" != base-check ] &&
      [ "$uv_cache" != plain ]; then
     return 1
@@ -2781,7 +2781,9 @@ base_verdict_read() {  # key, now
 }
 base_verdict_write() {  # key, exit
   local uv_cache=plain
-  [ -d "$CHECK_UV_DIR/cache" ] && uv_cache=uv
+  local key
+  key="$(check_uv_key 2> /dev/null)" &&
+    [ -n "$(ls -A "$CHECK_UV_DIR/repos/$key/cache" 2> /dev/null)" ] && uv_cache=uv
   mkdir -p "$BASE_VERDICT_DIR" || return 1
   printf '%s %s %s\n' "$(date +%s)" "$2" "$uv_cache" > "$BASE_VERDICT_DIR/$1" || return 1
   # Every revision mints a new file; sweep the ones no read can use. A
@@ -3312,36 +3314,68 @@ runner_uv() {
   [ -x "$uv_bin" ] && printf '%s' "$uv_bin"
   return 0
 }
-# Whether directory $1 holds more than $2 MB.
-check_uv_cache_over() {
-  local kb
-  [ -d "$1" ] || return 1
-  kb="$(du -sk "$1" 2>/dev/null | cut -f1)"
-  [[ "$kb" =~ ^[0-9]+$ ]] && [ "$kb" -gt "$(( $2 * 1024 ))" ]
+# The key of this repo's uv cache under CHECK_UV_DIR/repos: owner_name in
+# lower case (an owner name has no underscore, so the first one splits it).
+# Fails for a REPO that is not owner/name.
+check_uv_key() {
+  local key
+  key="$(printf '%s' "${REPO:-}" | tr '[:upper:]' '[:lower:]')"
+  [[ "$key" =~ ^[a-z0-9-]+/[a-z0-9._-]+$ ]] || return 1
+  printf '%s_%s' "${key%%/*}" "${key#*/}"
 }
-# The bound on the checks' shared uv cache (CHECK_UV_DIR, loom#3591): after
-# each check, a cache over LOOM_CHECK_UV_CACHE_MB (default 8192) is pruned
-# with `uv cache prune`, which drops what no current package needs, and
-# emptied with `uv cache clean` if it is still over. uv takes the cache's
-# lock for both, so another slot's check that is using the cache is waited
-# for, not broken. With no uv on the runner the cache is removed instead.
-# The managed Pythons beside it are not counted: one per version a contract
-# asks for. Never fails the check.
-bound_check_uv_cache() {
-  local cache="$CHECK_UV_DIR/cache" max_mb="${LOOM_CHECK_UV_CACHE_MB:-8192}" uv_bin
-  [[ "$max_mb" =~ ^[0-9]+$ ]] || max_mb=8192
-  check_uv_cache_over "$cache" "$max_mb" || return 0
+# Ready the shared uv directory (CHECK_UV_DIR, loom#3591) for a check of
+# this repo. A check runs code its tree holds, so nothing it may write is
+# read by another repo's check: the cache is one per repo
+# (repos/<key>/cache, CHECK_UV_CACHE), and the managed Pythons (python/)
+# are installed here, by the runner outside the sandbox, and are read-only
+# to every check and agent. uv is given the versions the tree asks for, read
+# as plain version strings (`.python-version`, else `requires-python` in
+# pyproject.toml), with --no-config so no setting in the tree (a download
+# mirror) reaches it. A tree that asks for none gets uv's default Python
+# when the contract runs uv and no Python is installed yet. A failed install
+# is logged; the check then finds the Pythons already there or fails itself.
+check_uv_prepare() {
+  local key uv_bin line req spec_re='^[0-9.,<>=!~ *]+$' reqs=()
+  key="$(check_uv_key)" || { echo "contract_run: no uv cache for repo '${REPO:-}'" >> "$LOG"; return 1; }
+  CHECK_UV_CACHE="$CHECK_UV_DIR/repos/$key/cache" CHECK_UV_LOCK="$CHECK_UV_DIR/locks/$key.lock"
+  mkdir -p "$CHECK_UV_CACHE" "$CHECK_UV_DIR/python" "$CHECK_UV_DIR/locks" || return 1
   uv_bin="$(runner_uv)"
-  if [ -z "$uv_bin" ]; then
-    echo "the shared uv cache is over ${max_mb} MB and the runner has no uv; removing it" >> "$LOG"
-    rm -rf "$cache"
-    return 0
+  [ -n "$uv_bin" ] || return 0
+  if [ -f "$TREE/.python-version" ] && [ ! -L "$TREE/.python-version" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      line="$(printf '%s' "${line%%#*}" | tr -d ' \t\r')"
+      [[ "$line" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]] && reqs+=("$line")
+    done < <(head -n 5 "$TREE/.python-version")
   fi
-  echo "the shared uv cache is over ${max_mb} MB; pruning it" >> "$LOG"
-  UV_CACHE_DIR="$cache" "$uv_bin" cache prune >> "$LOG" 2>&1
-  check_uv_cache_over "$cache" "$max_mb" || return 0
-  echo "the shared uv cache is still over ${max_mb} MB; cleaning it" >> "$LOG"
-  UV_CACHE_DIR="$cache" "$uv_bin" cache clean >> "$LOG" 2>&1
+  if [ "${#reqs[@]}" -eq 0 ] && [ -f "$TREE/pyproject.toml" ] && [ ! -L "$TREE/pyproject.toml" ]; then
+    req="$(sed -n 's/^requires-python[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$TREE/pyproject.toml" | head -n 1)"
+    [ -n "$req" ] && [[ "$req" =~ $spec_re ]] && reqs+=("$req")
+  fi
+  if [ "${#reqs[@]}" -eq 0 ]; then
+    case " ${C_SETUP:-} ${C_CHECK:-} " in *" uv "*|*" uvx "*) ;; *) return 0 ;; esac
+    [ -z "$(ls -A "$CHECK_UV_DIR/python" 2>/dev/null)" ] || return 0
+  fi
+  UV_PYTHON_INSTALL_DIR="$CHECK_UV_DIR/python" timeout "$NET_TIMEOUT" "$uv_bin" python install \
+    --no-config --no-bin --no-cache ${reqs[@]+"${reqs[@]}"} >> "$LOG" 2>&1 ||
+    echo "contract_run: uv could not install the Python this check asks for (${reqs[*]:-default})" >> "$LOG"
+  return 0
+}
+# The bound on this repo's uv cache: after each check, a cache over
+# LOOM_CHECK_UV_CACHE_MB (default 8192) gets `uv cache prune`, then
+# `uv cache clean` if it is still over (no uv on the runner: removed).
+# lanes/uv_cache.py does it under the cache's lock, taken exclusively and
+# without waiting (a check of the same repo still running holds it shared,
+# and the next check bounds it), and refuses a cache any part of whose path
+# is a symlink. The lock and every parent of the cache sit where no sandbox
+# can write. The managed Pythons are not counted. Never fails the check.
+bound_check_uv_cache() {
+  local key uv_bin max_mb="${LOOM_CHECK_UV_CACHE_MB:-8192}"
+  key="$(check_uv_key)" || return 0
+  [[ "$max_mb" =~ ^[0-9]+$ ]] || max_mb=8192
+  uv_bin="$(runner_uv)"
+  python3 -B "$LOOM_ROOT/lanes/uv_cache.py" bound "$CHECK_UV_DIR" "$key" "$max_mb" \
+    ${uv_bin:+"$uv_bin"} >> "$LOG" 2>&1 ||
+    echo "contract_run: the uv cache bound failed" >> "$LOG"
   return 0
 }
 contract_run_sandboxed() {
@@ -3351,7 +3385,7 @@ contract_run_sandboxed() {
   # so the final check's environment matches the base check's even when
   # no earlier step prepared the check home.
   mkdir -p "$CHECK_HOME/tmp" || { echo "contract_run: could not create the check temp dir" >> "$LOG"; return 125; }
-  mkdir -p "$CHECK_UV_DIR" || { echo "contract_run: could not create the shared uv directory" >> "$LOG"; return 125; }
+  check_uv_prepare || { echo "contract_run: could not prepare the shared uv directory" >> "$LOG"; return 125; }
   contract_command_ok "$1" || { echo "contract_run: refusing a command that is not printable ASCII" >> "$LOG"; return 125; }
   # A contract that runs `uvx` failed every check with 127 on the unmodified
   # base: the lane machine keeps uv and uvx in the runner's .local/bin,
@@ -3369,25 +3403,28 @@ contract_run_sandboxed() {
       uv_path_dirs="${uv_path_dirs:+$uv_path_dirs:}$uv_dir" ;; esac
     uv_bins="${uv_bins:+$uv_bins }$uv_bin"
   done
-  profile="$(AGENT_HOME="$CHECK_HOME" CHECK_UV_BINS="$uv_bins" CHECK_UV_SHARED="$CHECK_UV_DIR" \
-    sandbox_profile "$TREE" "$CHECK_CLI" check)" || return 125
+  profile="$(AGENT_HOME="$CHECK_HOME" CHECK_UV_BINS="$uv_bins" CHECK_UV_CACHE="$CHECK_UV_CACHE" \
+    CHECK_UV_PYTHON="$CHECK_UV_DIR/python" sandbox_profile "$TREE" "$CHECK_CLI" check)" || return 125
   sandbox_command "$profile" || return 125
   # shellcheck disable=SC2030,SC2031 # deliberately local to the check's subshell
   (
     cd "$TREE" || exit 125
-    keep_path="$PATH" keep_lang="${LANG:-en_US.UTF-8}" home="$CHECK_HOME" uv_shared="$CHECK_UV_DIR"
+    keep_path="$PATH" keep_lang="${LANG:-en_US.UTF-8}" home="$CHECK_HOME" uv_cache="$CHECK_UV_CACHE"
+    uv_python="$CHECK_UV_DIR/python" uv_lock="$CHECK_UV_LOCK" uv_tool="$LOOM_ROOT/lanes/uv_cache.py"
+    py="$(command -v python3)" || exit 125
     for v in $(compgen -e); do unset "$v"; done
     # UV_MANAGED_PYTHON: uv uses only the Pythons it installs, never one
     # found on PATH. A PATH interpreter it cannot run (an x86_64 Homebrew
     # python3 on an arm64 host without Rosetta) made uv exit 2 before any
     # test, so every muster lane run failed on the unmodified base
     # (2026-10-16).
-    # UV_CACHE_DIR and UV_PYTHON_INSTALL_DIR name the host's shared uv
-    # directory (CHECK_UV_DIR), not the scratch home: one cache and one
-    # set of managed Pythons for every slot's check, so a check no longer
-    # downloads them again into its own home (loom#3591).
+    # UV_CACHE_DIR is this repo's cache in the shared uv directory and
+    # UV_PYTHON_INSTALL_DIR its read-only managed Pythons (check_uv_prepare),
+    # not the scratch home, so a check no longer downloads them again into
+    # its own home (loom#3591). UV_PYTHON_DOWNLOADS=never: a check never
+    # installs a Python; the runner did.
     export PATH="${BUILD_JOBS_BIN:+$BUILD_JOBS_BIN:}${uv_path_dirs:+$uv_path_dirs:}$keep_path" HOME="$home" TMPDIR="$home/tmp" TERM=dumb LANG="$keep_lang" UV_MANAGED_PYTHON=1
-    export UV_CACHE_DIR="$uv_shared/cache" UV_PYTHON_INSTALL_DIR="$uv_shared/python"
+    export UV_CACHE_DIR="$uv_cache" UV_PYTHON_INSTALL_DIR="$uv_python" UV_PYTHON_DOWNLOADS=never
     # LOOM_CHECK_SANDBOX=1 tells a repo's tests they run in this sandbox,
     # which denies localhost, so a test that needs a loopback connection can
     # skip here and still run on CI (docs/LANES.md, "Validation").
@@ -3416,7 +3453,10 @@ contract_run_sandboxed() {
       LOOM_CHANGED_FILES="$(cat "$input")" || exit 125
       export LOOM_CHANGED_FILES
     fi
-    exec timeout "$CHECK_TIMEOUT" "${SANDBOX_CMD[@]}" /bin/bash -c "$1" < "$input"
+    # The check holds its cache's lock shared while it runs, so the bound
+    # (bound_check_uv_cache) never prunes a cache a check is using.
+    exec "$py" -B "$uv_tool" shared "$uv_lock" -- \
+      timeout "$CHECK_TIMEOUT" "${SANDBOX_CMD[@]}" /bin/bash -c "$1" < "$input"
   ) 2>&1 | timeout "$((CHECK_TIMEOUT + 60))" cat >> "$LOG"
 }
 
@@ -4677,17 +4717,21 @@ markers_left() {
 }
 
 # A codex agent has no network, so its tests could not fetch the packages
-# the base check had already downloaded (loom#1665). Give it the checks'
-# shared uv directory (CHECK_UV_DIR): uv must write the cache it reads.
-# This was a per-run copy of the check home's cache, a clone on APFS but a
-# second full copy on a lane pod's disk (loom#3591). The final check
-# already runs the agent's code with that directory writable, so the copy
-# kept nothing from it. Sets AGENT_UV_DIR and AGENT_UV_PYTHON for
-# agent_cli, or leaves them empty when no check has filled a uv cache.
+# the base check had already downloaded (loom#1665). Give it this repo's
+# uv cache in the checks' shared uv directory (loom#3591): uv must write
+# the cache it reads, and the agent's code is this repo's, which this
+# repo's checks already run with that cache writable. The managed Pythons
+# stay read-only to it. This was a per-run copy of the check home's cache,
+# a clone on APFS but a second full copy on a lane pod's disk. Sets
+# AGENT_UV_DIR (the repo's directory, holding cache/) and AGENT_UV_PYTHON
+# for agent_cli, or leaves them empty when the repo's cache is empty.
 agent_uv_cache() {
+  local key
   AGENT_UV_DIR="" AGENT_UV_PYTHON=""
-  [ "$LANE" = codex ] && [ -n "$HAS_CONTRACT" ] && [ -d "$CHECK_UV_DIR/cache" ] || return 0
-  AGENT_UV_DIR="$CHECK_UV_DIR" AGENT_UV_PYTHON="$CHECK_UV_DIR/python"
+  [ "$LANE" = codex ] && [ -n "$HAS_CONTRACT" ] || return 0
+  key="$(check_uv_key)" || return 0
+  [ -n "$(ls -A "$CHECK_UV_DIR/repos/$key/cache" 2> /dev/null)" ] || return 0
+  AGENT_UV_DIR="$CHECK_UV_DIR/repos/$key" AGENT_UV_PYTHON="$CHECK_UV_DIR/python"
 }
 
 workersai_request() (
@@ -5037,11 +5081,13 @@ fi
 
 AGENT_HOME="$LOOM_HOME/run/$SLOT-home"
 CHECK_HOME="$LOOM_HOME/run/$SLOT-check"
-# One uv cache (cache/) and one managed-Python directory (python/) for every
-# slot's checks on this host or pod, beside the check homes, never in one
-# (loom#3591). Per-home caches downloaded a Python and every wheel again
-# for each check, and a pod's run/ volume filled until the pod was evicted.
-# uv's cache is safe for concurrent use; bound_check_uv_cache bounds it.
+# The checks' shared uv directory on this host or pod, beside the check
+# homes, never in one (loom#3591): one uv cache per repo, shared by every
+# slot's checks of that repo, and one read-only set of managed Pythons
+# (check_uv_prepare). Per-home caches downloaded a Python and every wheel
+# again for each check, and a pod's run/ volume filled until the pod was
+# evicted. uv's cache is safe for concurrent use; bound_check_uv_cache
+# bounds it.
 CHECK_UV_DIR="$LOOM_HOME/run/uv-shared"
 # The run's own TMPDIR, exported before anything else runs: the runner's
 # git calls and the subscription lanes' agents (which inherit this

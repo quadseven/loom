@@ -169,8 +169,8 @@ unset variables.
   command and interpreter identity. Green verdicts last 24 hours; red
   verdicts last five minutes and still follow the base-check incident path.
   Before running a Codex agent, the lane reruns green checks written while
-  the shared uv cache existed, so the agent has packages for offline tests
-  even after a new pod or a bound emptied it.
+  the repo's uv cache held packages, so the agent has packages for offline
+  tests even after a new pod or a bound emptied it.
   Setup still runs for each brief, and the final check on the agent's commit
   is never cached. A new run whose agent commits nothing runs no final
   check: its tree is the base the base check covered, so it goes straight
@@ -269,21 +269,36 @@ unset variables.
   setup may need (an API-lane agent has neither). A machine without `sandbox-exec` fails setup
   for repos with a contract. Each step has `LOOM_CHECK_TIMEOUT` seconds
   (default 1800).
-- uv is shared, not per check (loom#3591). Every slot's check on a host or
-  pod points `UV_CACHE_DIR` at `run/uv-shared/cache` and
-  `UV_PYTHON_INSTALL_DIR` at `run/uv-shared/python`, with
-  `UV_MANAGED_PYTHON=1`, so a check downloads a managed Python or a wheel
-  only once. The check home keeps the per-slot HOME and TMPDIR and holds no
-  uv cache or Python. uv's cache is safe for concurrent use. The check
-  profile (seatbelt and bwrap) adds `run/uv-shared` to what a check may
-  write; an agent's profile never gets it. Per-home caches made each check
-  fetch everything again, and three codex slots filled a lane pod's 20Gi
-  `run/` volume until the pod was evicted.
-- The shared cache is bounded. After each check, a cache over
-  `LOOM_CHECK_UV_CACHE_MB` (default 8192) gets `uv cache prune`, and
-  `uv cache clean` if it is still over; uv waits for any check using the
-  cache. With no uv on the runner, the cache is removed. The managed
-  Pythons are not counted.
+- uv is shared per repo, not per check (loom#3591). Per-home caches made
+  each check fetch a managed Python and every wheel again, and three codex
+  slots filled a lane pod's 20Gi `run/` volume until the pod was evicted.
+  Under `run/uv-shared` (lanes/uv_cache.py):
+  - `repos/<owner>_<name>/cache` is one repo's uv cache (`UV_CACHE_DIR`),
+    shared by every slot's checks of that repo and writable by them only. A
+    check runs its tree's code, so no repo's check writes a cache another
+    repo's check reads.
+  - `python/` holds the managed Pythons (`UV_PYTHON_INSTALL_DIR`, with
+    `UV_MANAGED_PYTHON=1` and `UV_PYTHON_DOWNLOADS=never`). The runner
+    installs them before the check, outside the sandbox: `uv python install
+    --no-config --no-bin` with the versions in `.python-version`, else
+    `requires-python` in `pyproject.toml`, read as plain version strings,
+    so no uv setting in the tree reaches the install. A tree that asks for
+    none gets uv's default Python when its contract runs `uv` or `uvx` and
+    none is installed yet. Every check and agent reads them; none may write
+    them.
+  - `locks/<owner>_<name>.lock`: a check holds its repo's lock shared while
+    it runs.
+  The check home keeps the per-slot HOME and TMPDIR and holds no uv cache or
+  Python. The check profile (seatbelt and bwrap) adds the repo's cache to
+  what a check may write and the Pythons to what it may read; an agent's
+  profile gets neither.
+- Each repo's cache is bounded. After each check, `lanes/uv_cache.py bound`
+  takes the repo's lock exclusively without waiting (a check of that repo
+  still running skips it; the next check bounds it) and refuses a cache
+  any part of whose path is a symlink. A cache over
+  `LOOM_CHECK_UV_CACHE_MB` (default 8192) gets `uv cache prune`, then
+  `uv cache clean` if it is still over; with no uv on the runner it is
+  removed without following links. The managed Pythons are not counted.
 - Before claiming a ticket for a local lane, the station checks the same
   host load limits as lane checks. A high reading leaves the ticket for
   the next station pass. The local runner checks before preparing a brief
@@ -2435,12 +2450,13 @@ lookup leaves the brief for the next pass. The rule covers:
 
 - Tool: `codex exec --sandbox workspace-write` on a logged-in box: no network and
  no .git writes, so the agent edits and the runner commits and pushes.
- When the checks' shared uv cache exists (`run/uv-shared`), the agent gets
- that directory as its one extra writable directory and runs uv offline
- (`UV_OFFLINE`, `PIP_NO_INDEX`), so tests that need packages run without
- network (loom#1665). It was a per-run copy of the check's cache, a second
- full copy on a pod's disk (loom#3591); the final check already runs the
- agent's code with that directory writable.
+ When the repo's uv cache holds packages (`run/uv-shared/repos/<owner>_<name>/cache`),
+ the agent gets that cache as its one extra writable directory and runs uv
+ offline (`UV_OFFLINE`, `PIP_NO_INDEX`, `UV_PYTHON_DOWNLOADS=never`), so
+ tests that need packages run without network (loom#1665). The managed
+ Pythons stay read-only to it. It was a per-run copy of the check's cache,
+ a second full copy on a pod's disk (loom#3591); that repo's checks already
+ run the agent's code with its cache writable.
 - A lane run points `CODEX_HOME` at a lane-only home under the run's scratch
  home: the operator's `config.toml` (model and provider config) and sign-in
  are copied in, and the user-level `AGENTS.md` is not, so a personal startup
@@ -2820,8 +2836,9 @@ What changes in a pod:
   with empty tmpfs). The run's tree and scratch home are the only writable
   binds, `.git` stays read-only, the CLI's folder and the skill snapshot are
   read-only, and `/tmp` is private. A validation run gets the same root:
-  its writes go to the tree, its check home, the pod's shared uv directory
-  (`run/uv-shared`) and `/tmp`. A fresh `/proc` in a
+  its writes go to the tree, its check home, its repo's uv cache under
+  `run/uv-shared` and `/tmp`, and the managed Pythons there are bound
+  read-only. A fresh `/proc` in a
   new PID namespace hides the runner's processes. bwrap needs user
   namespaces inside the container; a lane whose bwrap cannot start reports
   itself unavailable (`sandbox_ready`). The agy lane stays on the Mac.

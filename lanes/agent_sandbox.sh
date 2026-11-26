@@ -147,8 +147,8 @@ bwrap_profile() {
   printf '%s\n' --bind "$tree" "$tree"
   [ -e "$tree/.git" ] && printf '%s\n' --ro-bind "$tree/.git" "$tree/.git"
   printf '%s\n' --bind "$agent_home" "$agent_home"
-  [ -z "${uv_shared:-}" ] || printf '%s\n' --bind "$uv_shared" "$uv_shared"
-  for p in "$cli_root" "$cli_link" ${skills:+"$skills"} ${jobs_bin:+"$jobs_bin"} $uv_files; do
+  [ -z "${uv_cache:-}" ] || printf '%s\n' --bind "$uv_cache" "$uv_cache"
+  for p in "$cli_root" "$cli_link" ${skills:+"$skills"} ${jobs_bin:+"$jobs_bin"} $uv_files ${uv_python:+"$uv_python"}; do
     printf '%s\n' --ro-bind "$p" "$p"
   done
   # The root tmpfs itself takes no writes (remount-ro does not reach the
@@ -361,23 +361,31 @@ sandbox_profile() {
       uv_files="$uv_files $uv_real"
     done
   fi
-  # The check profile also lets a contract write the host's shared uv
-  # directory (CHECK_UV_SHARED; CHECK_UV_DIR in lanes/run_lane.sh): the one
-  # uv cache and managed-Python directory every slot's check uses
-  # (loom#3591). It sits in the loom home, under HOME, which the profile
-  # otherwise hides. An agent run never gets it.
-  local uv_shared=""
-  if [ "${3:-}" = check ] && [ -n "${CHECK_UV_SHARED:-}" ]; then
-    uv_shared="$(cd "$CHECK_UV_SHARED" 2>/dev/null && pwd -P)" && [ -n "$uv_shared" ] ||
-      { echo "refusing sandbox: shared uv directory $CHECK_UV_SHARED is missing" >&2; return 1; }
-    # shellcheck disable=SC1003 # matching a literal backslash
-    case "$uv_shared" in *'"'*|*'\'*|*$'\n'*)
-      echo "refusing sandbox: unsafe path $uv_shared" >&2; return 1 ;; esac
-    allow_rw="$allow_rw (subpath \"$uv_shared\")"
+  # The check profile also reaches the checks' shared uv directory
+  # (CHECK_UV_DIR in lanes/run_lane.sh, loom#3591), which sits in the loom
+  # home, under HOME, which the profile otherwise hides: this repo's uv
+  # cache (CHECK_UV_CACHE) writable, the managed Pythons the runner
+  # installed (CHECK_UV_PYTHON) readable and never writable, since every
+  # repo's check runs them. An agent run gets neither.
+  local uv_cache="" uv_python="" uv_dir_var uv_dir_real
+  if [ "${3:-}" = check ]; then
+    for uv_dir_var in CHECK_UV_CACHE CHECK_UV_PYTHON; do
+      [ -n "${!uv_dir_var:-}" ] || continue
+      uv_dir_real="$(cd "${!uv_dir_var}" 2>/dev/null && pwd -P)" && [ -n "$uv_dir_real" ] ||
+        { echo "refusing sandbox: uv directory ${!uv_dir_var} is missing" >&2; return 1; }
+      # shellcheck disable=SC1003 # matching a literal backslash
+      case "$uv_dir_real" in *'"'*|*'\'*|*$'\n'*)
+        echo "refusing sandbox: unsafe path $uv_dir_real" >&2; return 1 ;; esac
+      if [ "$uv_dir_var" = CHECK_UV_CACHE ]; then uv_cache="$uv_dir_real"; else uv_python="$uv_dir_real"; fi
+    done
   fi
+  [ -n "$uv_cache" ] && allow_rw="$allow_rw (subpath \"$uv_cache\")"
   # The skill snapshot: readable, never writable, wherever LOOM_HOME lives.
   [ -n "$skills" ] && skills_rules="(allow file-read* (subpath \"$skills\"))
 (deny file-write* (subpath \"$skills\"))
+"
+  [ -n "$uv_python" ] && skills_rules="$skills_rules(allow file-read* (subpath \"$uv_python\"))
+(deny file-write* (subpath \"$uv_python\"))
 "
   [ -n "$jobs_bin" ] && skills_rules="$skills_rules(allow file-read* (subpath \"$jobs_bin\"))
 (deny file-write* (subpath \"$jobs_bin\"))
@@ -388,14 +396,14 @@ sandbox_profile() {
     # A bind at or above HOME would hand the agent all of HOME (the loom
     # home, the copied SSM values): writable for the tree or scratch home,
     # readable for the rest. Every bind must sit below HOME or beside it.
-    for p in "$tree" "$agent_home" "$cli_root" ${skills:+"$skills"} ${jobs_bin:+"$jobs_bin"} $uv_files ${uv_shared:+"$uv_shared"}; do
+    for p in "$tree" "$agent_home" "$cli_root" ${skills:+"$skills"} ${jobs_bin:+"$jobs_bin"} $uv_files ${uv_cache:+"$uv_cache"} ${uv_python:+"$uv_python"}; do
       case "$p" in /) echo "refusing sandbox: $p is the root" >&2; return 1 ;; esac
       case "$home/" in "$p"/*) echo "refusing sandbox: $p sits at or above HOME" >&2; return 1 ;; esac
     done
     bwrap_profile
     return 0
   fi
-  for p in "$tree" "$AGENT_HOME" "$cli_root" "$cli_link" ${skills:+"$skills"} ${jobs_bin:+"$jobs_bin"} $uv_files ${uv_shared:+"$uv_shared"}; do
+  for p in "$tree" "$AGENT_HOME" "$cli_root" "$cli_link" ${skills:+"$skills"} ${jobs_bin:+"$jobs_bin"} $uv_files ${uv_cache:+"$uv_cache"} ${uv_python:+"$uv_python"}; do
     p="$(dirname "$p")"
     while [ "${p#"$home"}" != "$p" ] && [ "$p" != "/" ]; do
       meta="$meta (literal \"$p\")"
