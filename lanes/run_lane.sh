@@ -2672,15 +2672,28 @@ check_failure_set() {  # log offset
     -e 's/^(FAILED|ERROR) ([^ ]+::[^ ]+).*/\2/p' \
     -e 's/^--- FAIL: ([^ ]+).*/\1/p' | LC_ALL=C sort -u
 }
-# Whether GitHub's own checks passed on a commit: at least one check run,
-# and every one completed as success, neutral or skipped.
-github_checks_green() {  # sha
-  local runs
+# GitHub's completed verdict: 0 green, 1 red, 2 no settled answer.
+github_checks_verdict() {  # sha, optional fix-base mode
+  local runs query='.check_runs[] | "\(.status) \(.conclusion)"'
+  if [ "${2:-}" = fix-base ]; then
+    query='.check_runs[] | "\(.status) \(.conclusion)\t\(.name)"'
+  fi
   runs="$(timeout "$CHECK_TIMEOUT" gh api --paginate "repos/$REPO/commits/$1/check-runs?per_page=100" \
-    --jq '.check_runs[] | "\(.status) \(.conclusion)"' 2>>"$LOG")" || return 1
-  [ -n "$runs" ] || return 1
+    --jq "$query" 2>>"$LOG")" || return 2
+  if [ "${2:-}" = fix-base ]; then
+    # Review verdicts trigger fix rounds; they do not describe the test base.
+    runs="$(printf '%s\n' "$runs" | awk -F '\t' -v review="${LOOM_REVIEW_CHECK:-Grug - Elder}" \
+      -v plan="${LOOM_PLAN_CHECK:-Grug - Chief}" '$2 != review && $2 != plan { print $1 }')"
+  fi
+  [ -n "$runs" ] || return 2
+  if printf '%s\n' "$runs" | LC_ALL=C grep -qvxE \
+       'completed (success|neutral|skipped|failure|cancelled|timed_out|action_required|stale|startup_failure)'; then
+    return 2
+  fi
   ! printf '%s\n' "$runs" | LC_ALL=C grep -qvxE 'completed (success|neutral|skipped)'
 }
+# Preserve the boolean interface for callers that only accept green.
+github_checks_green() { github_checks_verdict "$1"; [ "$?" -eq 0 ]; }
 # At most this many host-red tests may be set aside; a base red in more
 # places is not a sandbox quirk, and stays a factory incident.
 HOST_RED_MAX=20
@@ -3169,8 +3182,9 @@ release_check_slot() {
 # takes a host check slot. The lanes' App cannot dispatch a workflow, so the
 # request goes to the station through files (bus/remote_checks.py). A private
 # repo, a fix round, a repo with no check contract, a lane on a cluster runner
-# (no station files) and any dispatch error or timeout keep the local slot
-# path. docs/LANES.md, "Remote checks".
+# (no station files) and any dispatch error or timeout keep the local final
+# check. Public fix rounds can read an existing GitHub base verdict on any
+# runner. docs/LANES.md, "Remote checks".
 REMOTE_CHECKS="${LOOM_REMOTE_CHECKS:-0}"
 REMOTE_CHECK_WAIT="${LOOM_REMOTE_CHECK_WAIT:-1800}"
 REMOTE_CHECK_START_WAIT="${LOOM_REMOTE_CHECK_START_WAIT:-180}"
@@ -3179,6 +3193,18 @@ REMOTE_CHECK_POLL="${LOOM_REMOTE_CHECK_POLL:-10}"
 [[ "$REMOTE_CHECK_START_WAIT" =~ ^[0-9]+$ ]] || REMOTE_CHECK_START_WAIT=180
 [[ "$REMOTE_CHECK_POLL" =~ ^[0-9]+(\.[0-9]+)?$ ]] || REMOTE_CHECK_POLL=10
 remote_checks_on() { [ "$REMOTE_CHECKS" = 1 ] && [ "${LOOM_CLUSTER_RUNNER:-}" != 1 ] && repo_is_public; }
+# Reading existing fix-head checks needs no station dispatch, including on
+# a cluster runner. A settled red still goes through the default-branch gate.
+remote_base_verdict() {  # sha
+  if [ -n "$FIX_PR" ]; then
+    [ "$REMOTE_CHECKS" = 1 ] && repo_is_public || return 1
+    github_checks_verdict "$1" fix-base; BASELINE_EXIT=$?
+    [ "$BASELINE_EXIT" -lt 2 ]
+  else
+    remote_checks_on && github_checks_green "$1" || return 1
+    BASELINE_EXIT=0
+  fi
+}
 # Ask for the check of a pushed commit on GitHub and wait, bounded. Returns 0
 # green, 1 red (the failing test names are appended to the log as FAIL: lines,
 # the ones check_failures reads), 2 when the remote cannot answer: the caller
@@ -3604,13 +3630,15 @@ sys.exit(0 if valid else 1)
 }
 
 # Before the agent: interpreter, submodules, setup, then the check on the
-# current tree. A fix round checks the branch after merging the default
-# branch; a red result is compared with the default branch's own head.
+# current tree. A fix round can use its saved pull request head's GitHub
+# verdict when remote checks are enabled. Otherwise it checks the branch
+# after merging the default branch; a red result is compared with the
+# default branch's own head.
 # Only a red default branch check is a base-check factory incident. Returns
 # 1 with SETUP_REASON when the environment cannot be prepared.
 prepare_validation() {
   local rc interp="" subs="" changed what baseline_rev tool="" verdict_key interpreter_id now cached_verdict=0
-  local check_start="" failures=""
+  local check_start="" failures="" remote_rev
   SETUP_REASON="" HOST_RED_BASE="" CHECK_DESELECT=""
   BASELINE_SOURCE="base"
   load_contract || { record prepare "$CONTRACT_FILE" 1 "$BASE" false "$SETUP_REASON"; return 1; }
@@ -3674,6 +3702,8 @@ prepare_validation() {
     [ "$rc" -eq 0 ] || { SETUP_REASON="setup exited $rc"; return 1; }
   fi
   baseline_rev="$(safe_git rev-parse HEAD)"
+  remote_rev="$baseline_rev"
+  [ -z "$FIX_PR" ] || remote_rev="$BASE"
   # interp already holds "path version" (set above), so it is the identity as
   # it stands; running it again would hand its own output to the key.
   interpreter_id="${interp:-${C_INTERP:-none}}"
@@ -3684,19 +3714,21 @@ prepare_validation() {
     changed=""
     echo "base check reused cached verdict for $baseline_rev" >> "$LOG"
     record baseline "$C_CHECK" "$BASELINE_EXIT" "$baseline_rev" "$([ "$BASELINE_EXIT" -eq 0 ] && echo true || echo false)" "cached verdict"
-  elif [ -z "$FIX_PR" ] && remote_checks_on && github_checks_green "$baseline_rev"; then
-    # A public repo's base that GitHub's checks already passed needs no run
-    # (and no slot) here; any other state runs the check on the host below.
-    cached_verdict=1 BASELINE_EXIT=0 changed=""
-    echo "base check not run: GitHub's checks passed on $baseline_rev (LOOM_REMOTE_CHECKS)" >> "$LOG"
-    record baseline "$C_CHECK" 0 "$baseline_rev" true "GitHub checks green; no host check slot taken"
+  elif remote_base_verdict "$remote_rev"; then
+    baseline_rev="$remote_rev"
+    cached_verdict=1 changed=""
+    what=passed
+    [ "$BASELINE_EXIT" -eq 0 ] || what=failed
+    echo "base check not run: GitHub's checks $what on $baseline_rev (LOOM_REMOTE_CHECKS)" >> "$LOG"
+    record baseline "$C_CHECK" "$BASELINE_EXIT" "$baseline_rev" "$([ "$BASELINE_EXIT" -eq 0 ] && echo true || echo false)" \
+      "GitHub checks $what; no host check slot taken"
   else
     check_start="$(log_size)"
     contract_run "$C_CHECK"; BASELINE_EXIT=$?
     changed="$(tracked_changes)"
     [ "$BASELINE_EXIT" -eq 0 ] || failures="$(check_failures "$check_start")"
     record baseline "$C_CHECK" "$BASELINE_EXIT" "$baseline_rev" "$([ "$BASELINE_EXIT" -eq 0 ] && [ -z "$changed" ] && echo true || echo false)" \
-      "$(join_detail "${changed:+changed tracked files: $changed}" "$failures")"
+      "$(join_detail "host check" "${changed:+changed tracked files: $changed}" "$failures")"
   fi
   if [ "$BASELINE_EXIT" -eq 143 ]; then
     PARK_CLASS=transient
