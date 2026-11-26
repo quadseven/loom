@@ -137,6 +137,35 @@ echo "agent-exit $slot $status" >> "$FAKE_LOG"
         self.assertIn("drain-seen zen", lines)
         self.assertLess(took, 15)
 
+    # A pod fed by the station (bus/lane_feed.py, loom#3621): each
+    # round first pushes the slots' heartbeats and reports and takes their
+    # next briefs, then starts the runners. A fake module records the call.
+    FAKE_FEED = """import os, sys
+with open(os.environ["FAKE_LOG"], "a") as fh:
+    fh.write("feed %s\\n" % " ".join(sys.argv[1:]))
+"""
+
+    def with_fake_feed(self):
+        bus = self.root / "bus"
+        bus.mkdir()
+        (bus / "__init__.py").write_text("")
+        (bus / "lane_feed.py").write_text(self.FAKE_FEED)
+
+    def test_a_fed_pod_syncs_its_slots_before_each_round(self):
+        self.with_fake_feed()
+        result = self.pod(LOOM_POD_SLOTS="zen opencode-go-5", LOOM_POD_FEED="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = self.log.read_text().splitlines()
+        self.assertEqual(lines[0], "feed sync zen opencode-go-5")
+        self.assertEqual(sorted(lines[1:]), ["opencode-go-5 sandbox=bwrap drop=1",
+                                             "zen sandbox=bwrap drop=1"])
+
+    def test_a_pod_not_fed_runs_no_sync(self):
+        self.with_fake_feed()
+        result = self.pod(LOOM_POD_SLOTS="zen")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("feed", self.log.read_text())
+
     def test_bad_settings_start_nothing(self):
         for env in ({}, {"LOOM_POD_SLOTS": "zen ../x"}, {"LOOM_POD_SLOTS": "zen", "LOOM_POD_INTERVAL": "0"},
                     {"LOOM_POD_SLOTS": "zen", "LOOM_POD_DRAIN_SECONDS": "x"},
