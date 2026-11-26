@@ -6132,6 +6132,18 @@ for BRIEF in "$INBOX"/*.md; do
   # brief's branch moved by someone else during the run (another lane's
   # round, a person's commit) is not this run's failure: it is parked as
   # "branch moved", and the station hands the new head back to the factory.
+  # A commit whose author email ends in @local has no GitHub login: the merge
+  # gate refuses it as an unknown writer, and the pull request then waits a
+  # fix round. Refuse it here, before anything is pushed.
+  if [ "$COMMITTED" -eq 1 ]; then
+    if ! LOCAL_AUTHORS="$(safe_git log --format='%h %ae' "$BASE..$BRANCH" 2>> "$LOG")"; then
+      park "$BRIEF" "could not read the commit authors before the push" transient; continue
+    fi
+    LOCAL_AUTHORS="$(awk '$2 ~ /@local$/ {print $1}' <<<"$LOCAL_AUTHORS" | head -3 | tr '\n' ' ')"
+    if [ -n "$LOCAL_AUTHORS" ]; then
+      park "$BRIEF" "nothing pushed: commit ${LOCAL_AUTHORS% } has an author email ending in @local, which has no GitHub login"; continue
+    fi
+  fi
   if [ "$COMMITTED" -eq 1 ]; then
     fresh_app_token || { park "$BRIEF" "the GitHub App token could not be refreshed before the push; the edits are committed in the lane tree" transient; continue; }
     if ! PUSH_OUT="$(timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false push -q -u origin "$BRANCH" 2>&1)"; then

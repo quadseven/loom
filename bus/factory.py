@@ -2089,6 +2089,7 @@ class Factory:
         self._merged_prs: Dict[str, Dict[int, int]] = {}
         # Each repo's open pull requests, read once a pass by _open_lane_pull.
         self._open_pulls: Dict[str, List[Dict[str, Any]]] = {}
+        self._closed_pulls: Dict[str, List[Dict[str, Any]]] = {}
         self._stack_checked: set = set()
         self._overlap_unknown: set = set()
         self._overlap_health: Dict[Tuple[str, int, str], bool] = {}
@@ -5474,6 +5475,8 @@ class Factory:
             return "%s is claimed by the claim:%s label" % (ref, label_claim)
         if self._move_queued_refs_pr(repo, issue):
             return "%s has an open trusted pull request" % ref
+        if self._move_queued_merged_pr(repo, issue):
+            return "%s has a merged trusted pull request" % ref
         briefer_pr = self._briefer_refs_pr(repo, issue)
         if briefer_pr:
             reason = "an open pull request #%s names it" % briefer_pr
@@ -5561,6 +5564,37 @@ class Factory:
             _say("%s: linked pull request #%s is open" % (ref, pr.get("number", "?")))
             return True
         return False
+
+    def _move_queued_merged_pr(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """Move a queued ticket to loom:merged when a merged same-repo PR from
+        a trusted author or briefer names it with a bare Refs line, so its work
+        is not given a lane again."""
+        number = int(issue["number"])
+        ref = "%s#%d" % (repo, number)
+        authors = self.trusted | self.briefers
+        for pr in self._closed_pull_requests(repo):
+            login = str((pr.get("user") or {}).get("login") or "").lower()
+            if (not pr.get("merged_at") or login not in authors
+                    or ((pr.get("head") or {}).get("repo") or {}).get("full_name") != repo
+                    or not self._refs_ticket(str(pr.get("body") or ""), number)):
+                continue
+            labels = brain._moved_labels(_labels(issue), "merged", "")
+            self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": labels})
+            issue["labels"] = [{"name": name} for name in labels]
+            _say("%s: linked pull request #%s is merged" % (ref, pr.get("number", "?")))
+            return True
+        return False
+
+    def _closed_pull_requests(self, repo: str) -> List[Dict[str, Any]]:
+        """The repo's most recently updated closed pull requests (first page
+        only), read once a pass for queued ticket checks."""
+        if repo not in self._closed_pulls:
+            rows = self.gh.rest("GET", "/repos/%s/pulls?state=closed&sort=updated"
+                                "&direction=desc&per_page=100" % repo).data
+            self._closed_pulls[repo] = [pr for pr in rows if isinstance(pr, dict)] \
+                if isinstance(rows, list) else []
+        return self._closed_pulls[repo]
 
     def _briefer_refs_pr(self, repo: str, issue: Dict[str, Any]) -> Any:
         """The number of an open same-repo pull request, opened by a
