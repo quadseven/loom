@@ -506,6 +506,19 @@ only, and posts no comment: it never closes or retitles an issue, and edits noth
 line below, because an automated pass over old issues over-calls work as
 done.
 
+A `loom:triage` issue is read again on every run (loom#3594): one whose
+only Loom label is `loom:triage`, with no `needs:human` ask, no
+`needs-brain` hold, no `claim:` label and no assignee, is queued as above
+when its body is ready and its author trusted, and `loom:triage` comes off.
+One still not ready is left as it is, with no write, and does not count
+against `--limit`. So an issue an intake labelled without reading it
+(`ready-for-agent`, or any unseen issue, docs/LANES.md), or one whose body
+was completed later, becomes a ticket at the station's hourly triage with
+no model call, and the station gives the queued ticket the first free lane
+of its tier, cheapest first. On 2026-11-25 brain ticks recorded "no
+rewrites this tick, the hourly station triage covers intake" while ready
+`loom:triage` issues waited: this makes that true for the plain case.
+
 GitHub holds at most 100 sub-issues under one issue and refuses the next one
 (422). The sub-issue link is best effort everywhere: any refusal is logged,
 not raised, and the ticket is still queued. A ticket a goal refuses, from
