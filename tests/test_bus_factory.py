@@ -3739,7 +3739,7 @@ class EveryLaneTriesEveryTicket(Base):
     def test_one_lane_list_ordered_by_cost(self):
         kinds = [factory.KINDS.index(factory.lane_kind(x)) for x in factory.LANE_ORDER]
         self.assertEqual(kinds, sorted(kinds))
-        self.assertEqual(factory.LANE_ORDER[:4], factory.SPARKS)
+        self.assertEqual(factory.LANE_ORDER[:len(factory.SPARKS)], factory.SPARKS)
         self.assertEqual(factory.LANE_ORDER[-len(factory.ANTHROPIC):], factory.ANTHROPIC)
         self.assertEqual(len(set(factory.LANE_ORDER)), len(factory.LANE_ORDER))
         paid = [x for x in factory.LANE_ORDER if factory.lane_kind(x) == "subscription"]
@@ -4441,7 +4441,7 @@ class Tickets(Base):
         self.assertNotIn("opencode-go-4", factory.lanes_for(True))
 
     def test_a_private_easy_ticket_goes_to_spark_2_when_spark_is_busy(self):
-        self.assertEqual(factory.lanes_for(True)[:4], factory.SPARKS)
+        self.assertEqual(factory.lanes_for(True)[:len(factory.SPARKS)], factory.SPARKS)
         self.gh.private = True
         self.limited_easy(limited=("spark",))
         self.assertEqual(self.lane(7), "spark-2")
@@ -4451,9 +4451,10 @@ class Tickets(Base):
         # free provider slots: on a private repo only the two allowed private
         # code, then opencode-go: the free lanes openrouter and workersai take
         # public repos only (loom#2358).
-        self.assertEqual(factory.LANE_ORDER[:4], factory.SPARKS)
-        self.assertEqual(factory.LANE_ORDER[4:10], factory.FREE_POOL)
-        self.assertEqual(factory.lanes_for(True)[4:7],
+        self.assertEqual(factory.LANE_ORDER[:len(factory.SPARKS)], factory.SPARKS)
+        n = len(factory.SPARKS)
+        self.assertEqual(factory.LANE_ORDER[n:n + 6], factory.FREE_POOL)
+        self.assertEqual(factory.lanes_for(True)[n:n + 3],
                          ("free-ollama", "free-gemma", "opencode-go"))
 
     def test_a_slot_on_cluster_runners_never_takes_a_private_repos_ticket(self):
@@ -4997,6 +4998,31 @@ class Helpers(unittest.TestCase):
         with mock.patch("bus.factory._say") as say:
             self.assertIsNone(f._association(REPO, other))
         say.assert_not_called()
+
+    def test_ticket_references_to_multiple_repos_have_no_association_or_log(self):
+        f = factory.Factory(FakeGitHub(), [REPO], NOW)
+        for repos in ((REPO, "example-org/other-repo"),
+                      ("example-org/other-repo", "example-org/third-repo")):
+            for branch in ("pin-image", "loom/7-update"):
+                with self.subTest(repos=repos, branch=branch):
+                    pr = {"number": 50, "body": "Refs %s#5\nRefs %s#6\n" % repos,
+                          "head": {"ref": branch}}
+                    with mock.patch("bus.factory._say") as say:
+                        self.assertIsNone(f._association(REPO, pr))
+                    say.assert_not_called()
+
+    def test_a_merged_pull_request_has_no_association_or_log(self):
+        f = factory.Factory(FakeGitHub(), [REPO], NOW)
+        bodies = ("Refs #5", "Refs #5\nRefs #6", "Refs %s#5" % REPO,
+                  "Refs %s#5\nRefs %s#6" % (REPO, REPO))
+        for merged in ({"merged_at": iso(0)}, {"merged": True}):
+            for body in bodies:
+                with self.subTest(merged=merged, body=body):
+                    pr = dict(merged, number=50, state="closed", body=body,
+                              head={"ref": "pin-image"})
+                    with mock.patch("bus.factory._say") as say:
+                        self.assertIsNone(f._association(REPO, pr))
+                    say.assert_not_called()
 
     def test_conflicting_ticket_references_still_log_their_line(self):
         f = factory.Factory(FakeGitHub(), [REPO], NOW)

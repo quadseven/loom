@@ -996,9 +996,10 @@ nothing, and a ticket without one gets a lane like any other. The factory
 gives each ticket the first free lane of one list, cheapest first (the
 tuple `LANE_ORDER` in bus/factory.py):
 
-- Every ticket: `spark` to `spark-4` first (own hardware, the operator's
-  priority since 2026-10-17: two slots per Spark box, `LOOM_SPARK_URL` and
-  `LOOM_SPARK_2_URL` to `LOOM_SPARK_4_URL`, Nemotron 3.5 Super VL on vLLM,
+- Every ticket: `spark` to `spark-8` first (own hardware, the operator's
+  priority since 2026-10-17: eight slots shared by both Spark boxes through
+  the spark-gateway, `LOOM_SPARK_URL`, and `LOOM_SPARK_2_URL` to
+  `LOOM_SPARK_8_URL` each falling back to it, Nemotron 3.5 Super VL on vLLM,
   model `spark/...`, any repo, private ones included); then the free lanes
   (the operator wants every free tier used up, 2026-10-19): one slot per
   free provider (`free-ollama`, `free-gemma`, `free-nvidia`, `free-kilo`,

@@ -454,11 +454,15 @@ result artifact: the exit code and up to twenty failing test names.
   `remote-check.yml` on `main` as a `workflow_dispatch` triggered by the
   station's own App, and its conclusion agrees with the artifact. Any other
   run is ignored, and the lane runs the check on the host.
-- **Base check.** When the base commit's GitHub checks already passed (those
-  repos do run CI on a push to their default branch; the test
-  `github_checks_green` gives a host-only red), the base check is not run and
-  takes no slot. Any other state runs it on the host as before. The `setup`
-  step still runs on the host, since the agent works in that tree.
+- **Base check.** When the base commit's GitHub checks already passed, the
+  base check is not run and takes no slot. Public-repo fix rounds also read
+  completed GitHub checks for the pull request head saved before merging the
+  default branch, including on cluster runners. A red fix-head verdict still
+  goes through the default-branch check before the agent can start.
+  Missing, pending or unreadable checks
+  fall back to the host check. The validation record names GitHub or the
+  host as the verdict source. The `setup` step still runs on the host, since
+  the agent works in that tree. The fix round's final check stays on the host.
 - **Final check.** A new run does the pre-push gates, pushes its work branch
   (fast-forward only, never the default branch, after the leak scans), then
   asks for the remote check and waits, bounded: `LOOM_REMOTE_CHECK_WAIT`

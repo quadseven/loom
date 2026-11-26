@@ -411,10 +411,11 @@ LADDER: Tuple[Tuple[Tuple[str, ...], str], ...] = (
 # this list). Difficulty: no longer routes. Review on the head, CI, live
 # verification, the merge gate and the model ladder judge the work; on
 # 2026-11-24 the old per-difficulty lists assigned 0 of 176 queued.
-# The Sparks first (operator 2026-10-17: "I wanna use my sparks"): four slots
-# on the operator's own hardware, open to private repos. A ticket a lane
-# fails still climbs the model ladder, so nothing waits on a cheap lane.
-SPARKS = ("spark", "spark-2", "spark-3", "spark-4")
+# The Sparks first (operator 2026-10-17: "I wanna use my sparks"): eight slots
+# on the operator's own hardware (spark to spark-8, loom#3605), open to private
+# repos. A ticket a lane fails still climbs the model ladder, so nothing waits
+# on a cheap lane.
+SPARKS = ("spark",) + tuple("spark-%d" % n for n in range(2, 9))
 # One slot per free provider in the spark-gateway's pool (infra#5617): spark-
 # type slots whose endpoint is the gateway's route pinned to that provider,
 # never a Spark. Operator 2026-10-19: make every free provider a lane, spend
@@ -2974,7 +2975,12 @@ class Factory:
                     continue
                 if pr.get("merged_at") is None and not pr.get("merged"):
                     continue
-                assoc = self._association(repo, pr)
+                # This historical lookup needs merged PRs; the normal
+                # association path skips them without logging conflicts.
+                try:
+                    assoc = brain._ticket_association(repo, pr)
+                except ValueError:
+                    continue
                 if assoc and assoc[0] == repo:
                     t_num = assoc[1]
                     if t_num not in merged or int(pr["number"]) > merged[t_num]:
@@ -3124,6 +3130,8 @@ class Factory:
         return issue if issue is not None and _state(issue) == "pr" else None
 
     def _association(self, repo: str, pr: Dict[str, Any]) -> Optional[Tuple[str, int]]:
+        if pr.get("merged_at") is not None or pr.get("merged"):
+            return None
         try:
             return brain._ticket_association(repo, pr)
         except brain.OtherRepoTicket:
