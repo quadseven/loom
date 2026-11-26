@@ -181,6 +181,8 @@ class FakeGitHub:
             if number not in self.issues:
                 return Response(404, {"message": "Not Found"})
             return Response(200, self.issues[number])
+        if re.search(r"/pulls\?state=closed&sort=updated&direction=desc&per_page=100$", path):
+            return Response(200, [p for p in self.pulls.values() if p.get("state") == "closed"])
         m = re.search(r"/pulls/(\d+)$", path)
         if m:
             return Response(200, self.pulls[int(m.group(1))])
