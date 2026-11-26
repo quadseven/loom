@@ -56,6 +56,9 @@ codex_lane_home() {
     else
       rm -f "$dest/auth.json" || return 2
     fi
+    # A Codex home with no sessions folder yet gets one, so the first run's
+    # session lands where the lane meter reads it (loom#3630).
+    mkdir -p "$src/sessions" 2> /dev/null || true
     if [ -d "$src/sessions" ]; then
       if [ -L "$dest/sessions" ]; then
         rm -f "$dest/sessions" || return 2

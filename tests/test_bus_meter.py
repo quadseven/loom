@@ -245,5 +245,74 @@ class UsageMeterTests(unittest.TestCase):
         self.assertIn("the lane holds itself when Copilot says the allowance is spent", note)
 
 
+class CodexMeterTests(unittest.TestCase):
+    """The codex lane turns its own session logs into codex.meter.json, which
+    the station reads from the shared Loom home: in the cluster the sessions
+    live in the lane's Codex home, which the station does not mount (loom#3630)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = self.tmp.name
+        self.sessions = Path(self.home) / "codex-home" / "sessions" / "2026" / "10" / "18"
+        self.sessions.mkdir(parents=True)
+        self.out = str(Path(self.home) / "state" / "usage" / "codex.meter.json")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write_session(self, weekly_used, five_hour_used=4):
+        (self.sessions / "rollout.jsonl").write_text(json.dumps({
+            "timestamp": "2026-10-18T11:50:00Z", "type": "event_msg", "payload": {
+                "type": "token_count", "rate_limits": {
+                    "primary": {"used_percent": five_hour_used, "window_minutes": 300,
+                                "resets_at": NOW + 3600},
+                    "secondary": {"used_percent": weekly_used, "window_minutes": 10080,
+                                  "resets_at": NOW + 6 * 86400}}}}) + "\n")
+
+    def run_meter(self, now=NOW, *extra):
+        return meter.main(["--codex-sessions", str(Path(self.home) / "codex-home" / "sessions"),
+                           self.out, *extra], now=now)
+
+    def test_the_newest_session_reading_is_written_as_a_meter(self):
+        self.write_session(weekly_used=7)
+        self.assertEqual(self.run_meter(), 0)
+        written = json.loads(Path(self.out).read_text())
+        self.assertEqual(written["at"], NOW)
+        self.assertIsNone(written["error"])
+        weekly = next(w for w in written["windows"] if w["window"] == "weekly")
+        self.assertEqual((weekly["used_pct"], weekly["window_minutes"], weekly["unit"]),
+                         (7.0, 10080, "percent"))
+        self.assertEqual(weekly["resets_at"], "2026-10-24T12:00:00+00:00")
+        self.assertEqual(weekly["at"], "2026-10-18T11:50:00+00:00")
+
+    def test_the_station_reads_the_lane_meter_without_session_logs_of_its_own(self):
+        self.write_session(weekly_used=7)
+        self.run_meter()
+        rows = usage.collect(self.home, env={}, now=NOW + 60, lane_names=["codex", "codex-2"],
+                             sessions=Path(self.home) / "station-has-no-sessions")
+        weekly = next(r for r in rows if r["provider"] == "codex" and r["window"] == "weekly")
+        self.assertEqual(weekly["used_pct"], 7.0)
+        self.assertEqual(weekly["window_minutes"], 10080)
+        self.assertEqual(weekly["resets_at"], "2026-10-24T12:00:00+00:00")
+        self.assertEqual(weekly["observed_at"], "2026-10-18T11:50:00+00:00")
+        self.assertNotIn("no codex session logs on this machine",
+                         [r["note"] for r in rows if r["provider"] == "codex"])
+
+    def test_a_fresh_meter_is_not_read_again_unless_refreshed(self):
+        self.write_session(weekly_used=7)
+        self.run_meter()
+        self.write_session(weekly_used=9)
+        self.run_meter(NOW + 60)
+        self.assertEqual(json.loads(Path(self.out).read_text())["windows"][1]["used_pct"], 7.0)
+        self.run_meter(NOW + 60, "--refresh")
+        self.assertEqual(json.loads(Path(self.out).read_text())["windows"][1]["used_pct"], 9.0)
+
+    def test_no_session_logs_writes_a_meter_that_says_why(self):
+        self.run_meter()
+        written = json.loads(Path(self.out).read_text())
+        self.assertEqual(written["windows"], [])
+        self.assertIn("no codex session", written["error"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3049,7 +3049,8 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
 
     def beats(self):
         usage = self.loom / "state" / "usage"
-        return {p.stem: json.loads(p.read_text()) for p in usage.glob("*.json")}
+        # Heartbeats only: a codex pass also writes its codex.meter.json.
+        return {p.stem: json.loads(p.read_text()) for p in usage.glob("*.json") if "." not in p.stem}
 
     def test_empty_credit_on_one_anthropic_slot_holds_all_eight(self):
         self.hold_credit("anthropic-3")
@@ -7000,6 +7001,32 @@ exit %d
         self.assertTrue(beat["available"])
         self.assertEqual(beat["lane"], "codex")
         self.assertGreaterEqual(beat["at"], before)
+
+    def test_an_idle_codex_pass_writes_its_session_usage_to_the_shared_home(self):
+        # loom#3630: in the cluster the sessions live in the lane's own Codex
+        # home, which the station does not mount; the lane writes the meter
+        # into the Loom home the station reads.
+        sessions = self.home / "codex-lane-home" / "sessions" / "2026" / "11" / "26"
+        sessions.mkdir(parents=True)
+        (sessions / "rollout.jsonl").write_text(json.dumps({
+            "timestamp": "2026-11-26T14:40:00Z", "type": "event_msg", "payload": {
+                "type": "token_count", "rate_limits": {"secondary": {
+                    "used_percent": 3, "window_minutes": 10080, "resets_at": 1795000000}}}}) + "\n")
+        self.run_lane(CODEX_HOME=str(self.home / "codex-lane-home"))
+        written = json.loads((self.loom / "state" / "usage" / "codex.meter.json").read_text())
+        self.assertEqual([(w["window"], w["used_pct"], w["window_minutes"]) for w in written["windows"]],
+                         [("weekly", 3.0, 10080)])
+
+    def test_a_codex_run_keeps_its_session_in_the_lanes_codex_home(self):
+        # A Codex home with no sessions folder yet: the run's session must
+        # still land where the lane meter reads it, not in the run's scratch
+        # home that is removed after the run.
+        codex_home = self.home / "fresh-codex-home"
+        codex_home.mkdir()
+        self.drop_brief()
+        self.run_lane(CODEX_HOME=str(codex_home))
+        self.assertTrue(any(c.startswith("codex ") for c in self.calls()))
+        self.assertTrue((codex_home / "sessions").is_dir())
 
     def test_failed_run_is_parked_once_and_the_next_brief_still_runs(self):
         self.drop_brief("T001-broken.md", BRIEF.replace("T042-fix-the-thing", "T001-broken"))

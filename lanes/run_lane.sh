@@ -1882,8 +1882,16 @@ lift_provider_limit() {
 # Usage view through bus/meter.py, at most every five minutes. The key and the
 # account id go on stdin, so they reach no argv and no log. LOOM_<SLOT>_METER_URL
 # overrides the provider's endpoint. A failed read is recorded, never fatal.
+# A codex lane reads no provider: it copies the newest rate-limit reading in
+# its Codex home's session logs into the same file, because the station does
+# not mount that home in the cluster (loom#3630).
 lane_meter() {
   local url
+  if [ "$LANE" = codex ]; then
+    PYTHONPATH="$LOOM_ROOT" timeout "$PROBE_TIMEOUT" python3 -B -m bus.meter --codex-sessions \
+      "${CODEX_HOME:-$HOME/.codex}/sessions" "$LOOM_HOME/state/usage/$SLOT.meter.json" "$@" > /dev/null 2>&1 || true
+    return 0
+  fi
   case "$LANE" in openrouter|workersai) ;; *) return 0 ;; esac
   [ -n "$API_KEY" ] || return 0
   url="$(lane_setting METER_URL)"
@@ -5573,6 +5581,8 @@ for BRIEF in "$INBOX"/*.md; do
     # The pod gets no idle heartbeat after this job to sample its usage.
     lane_meter --refresh
   fi
+  # A codex run's own session holds the newest reading, limited or not.
+  [ "$LANE" != codex ] || lane_meter --refresh
   if [ "$MODEL_KIND" = paid ] && [ -f "$WORKDIR/$TICKET.opencode-events" ]; then
     # An unknown spend fails closed: the marker stops paid picks for an hour.
     if ! model_pick settle "$MODEL" < "$WORKDIR/$TICKET.opencode-events" 2>> "$LOG"; then
