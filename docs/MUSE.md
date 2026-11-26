@@ -820,10 +820,13 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    home onboard opens for a repo carries the `loom:backlog` label; one opened
    before that label existed has a title starting `Backlog:`), with the
    default limit of 25 issues a run, oldest first. It skips pull requests,
-   epics, asks and anything with a `loom:` label; a ready issue (every brief
-   section, checkboxes under Acceptance criteria) becomes a `loom:queued`
-   ticket under the goal's intake epic, the rest get `loom:triage` (no comment;
-   the printed line names what is missing). Where the station has `LOOM_REWRITE_CMD` set it rewrites
+   epics, asks and anything with a `loom:` label other than `loom:triage`; a
+   ready issue (every brief section, checkboxes under Acceptance criteria)
+   becomes a `loom:queued` ticket under the goal's intake epic, a
+   `loom:triage` one included, the rest get `loom:triage` (no comment;
+   the printed line names what is missing). A `loom:triage` issue left after
+   that is not ready: it needs a rewrite, so the station's run never covers
+   it. Where the station has `LOOM_REWRITE_CMD` set it rewrites
    `loom:triage` issues itself (docs/BRAIN.md, Agent rewrites); the brain
    takes what is left (the `needs-brain` ones first: the station's rewrite
    model judged them person-only, and you decide), and only rewrites

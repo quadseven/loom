@@ -4943,11 +4943,28 @@ def _oldest_open_issues(gh: GitHub, repo: str):
         url = _next_link(resp.headers.get("link", ""))
 
 
+def _triage_again(issue: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The issue without its loom:triage label when that is its one Loom
+    state (loom:factory aside), it holds no ask, no needs-brain hold, no
+    claim: label and no assignee, else None: triage reads such an issue
+    again (loom#3594)."""
+    names = _labels(issue)
+    loom = {n for n in names if n.startswith("loom:") and n != "loom:factory"}
+    if (loom != {"loom:triage"} or needs_human(names) or "needs-brain" in names
+            or any(n.startswith("claim:") for n in names)
+            or issue.get("assignees") or issue.get("assignee")):
+        return None
+    return dict(issue, labels=[x for x in issue.get("labels") or []
+                               if x.get("name") != "loom:triage"])
+
+
 def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[str]:
     """Label at most limit open issues that Loom has not seen, oldest first.
 
     Skips pull requests, epics (an epic label or sub-issues), asks and
-    anything with a loom: label. A trusted author's ready issue (every brief section,
+    anything with a loom: label but a plain loom:triage one (_triage_again),
+    which is queued when ready and otherwise left with no write and not
+    counted. A trusted author's ready issue (every brief section,
     checkboxes under Acceptance criteria) becomes a loom:queued ticket under
     the goal, while the goal has room; the rest get loom:triage, and the
     returned line names the reason. No comment: each one emailed the
@@ -4973,11 +4990,18 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
         if done >= limit:
             break
         number = int(issue["number"])
-        skip = _triage_skip(issue, authors, briefers, journals)
+        # A loom:triage issue is read again (loom#3594): one whose body
+        # became ready, or that an intake labelled without reading it, is
+        # queued here with no model; one still not ready is left as it is.
+        again = _triage_again(issue)
+        skip = _triage_skip(again or issue, authors, briefers, journals)
         if skip or _human_holder(gh, repo, issue):
             continue
         missing = missing_sections(issue.get("body"))
-        if not missing and tickets.brief_author_trusted(issue, authors, briefers, as_ticket=True):
+        trusted = tickets.brief_author_trusted(issue, authors, briefers, as_ticket=True)
+        if again and (missing or not trusted):
+            continue
+        if not missing and trusted:
             if in_flight >= cap:
                 lines.append("#%d held: ready, but the goal has %d tickets in flight (cap %d)"
                              % (number, in_flight, cap))
@@ -5000,6 +5024,8 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
             gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
                     {"labels": ["loom:ticket", "loom:queued"] +
                      (["area:" + area] if area and "area:" + area not in _labels(issue) else [])})
+            if again:
+                _remove_label(gh, repo, number, "loom:triage")
             in_flight += 1
             intake = (intake[0], intake[1] + 1)
             lines.append("#%d queued under #%d" % (number, intake[0]))
