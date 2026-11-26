@@ -353,7 +353,7 @@ class SweepTest(Base):
         # spent request target kept from running (#3120).
         import inspect
         self.assertIn("self.sweep_reviews", inspect.getsource(station.Station.run_pass))
-        self.assertNotIn("self.sweep_reviews", inspect.getsource(station.Station._run_steps))
+        self.assertNotIn("self.sweep_reviews", inspect.getsource(station.Station._loop_steps))
 
 
 class ReportTest(Base):

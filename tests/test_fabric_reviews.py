@@ -431,7 +431,7 @@ class FabricReviewsTest(unittest.TestCase):
         settings = station.Settings.from_env({"LOOM_HOME": "/example/home",
                                               "LOOM_FABRIC_REVIEW_NOTES": raw})
         self.assertEqual(settings.fabric_review_notes, raw)
-        self.assertIn("self.check_fabric_reviews", inspect.getsource(station.Station._run_steps))
+        self.assertIn("self.check_fabric_reviews", inspect.getsource(station.Station._loop_steps))
 
 
 if __name__ == "__main__":
