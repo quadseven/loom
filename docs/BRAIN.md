@@ -2725,6 +2725,13 @@ post-merge watch found its deploy failed. Failed proof audits count against
 the lane that made the proof. The 2026-10-22 audit's verdicts seed the
 scorecard, aggregated per lane and model.
 
+An `intent-mismatch` finding whose every quoted criterion is one the brief
+marks live (`criteria_gate.kind`, the brief's Proof checks) is recorded as a
+finding, not bad work (loom#3625): no diff can meet a live criterion, so the
+finding is the ticket's, not the lane's. A finding that quotes no criterion,
+or any criterion that is not live, still counts, as does any other bad-work
+rule beside it.
+
 A bad outcome is a bad-work finding, a revert, a failed deploy, a failed
 proof audit or a damaging audit verdict. A lane (all its slots) whose bad
 outcomes over the last `LOOM_LANE_DEMOTE_DAYS` days (default 7) reach
