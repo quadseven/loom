@@ -646,6 +646,11 @@ class Base(unittest.TestCase):
         # disk (loom#2403). The disk-guard tests set their own floor.
         self.settings = station.Settings(self.home, [REPO], list(AUTHORS), list(OWNERS),
                                          disk_free_min_gb=0)
+        # The Usage pass reads codex session logs; never the test machine's
+        # own, whose readings would change the pace line between passes.
+        sessions = mock.patch.dict(os.environ, {"LOOM_CODEX_SESSIONS": os.path.join(self._tmp.name, "no-sessions")})
+        sessions.start()
+        self.addCleanup(sessions.stop)
         self.heartbeat("codex")
 
     def heartbeat(self, lane, available=True, age=0, limited_models=None):
@@ -16323,6 +16328,33 @@ class RemoteClaimCountTest(unittest.TestCase):
             runner = self.runner()
             body = runner._lanes_body(runner._lane_rows())
         self.assertIn("Remote claims: muse 1/4", body)
+
+
+class PaceTest(Base):
+    """loom#3630: each pass the station paces every windowed subscription and
+    the lane status shows used, elapsed and verdict per subscription."""
+
+    def test_a_pass_writes_the_pace_plan_and_the_status_shows_it(self):
+        from bus import pace
+        now = time.time()
+        reset = datetime.fromtimestamp(now + 0.5 * 10080 * 60, timezone.utc).isoformat()
+        rows = [{"provider": "codex", "lanes": ["codex", "codex-2"], "window": "weekly",
+                 "used_pct": 2.0, "window_minutes": 10080, "resets_at": reset,
+                 "observed_at": datetime.fromtimestamp(now - 60, timezone.utc).isoformat()}]
+        waits = {"%s#%d" % (REPO, 7): {"reason": "no free lane", "since": now, "seen": now}}
+        self.write(os.path.join(self.home, "state", "station", "ticket-waits.json"), json.dumps(waits))
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        with mock.patch.object(station.usage, "collect", return_value=rows), \
+                mock.patch.object(runner, "_refresh_model_catalogue"), \
+                mock.patch.object(runner, "post_chain"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            runner._tend_usage()
+            body = runner._lanes_body(runner._lane_rows())
+        plan = pace.read(self.home)["providers"]["codex"]
+        self.assertEqual((plan["verdict"], plan["open"], plan["max"], plan["want"]),
+                         (pace.BEHIND, 1, 2, 2))
+        self.assertIn("Pace (slack 10 points): codex weekly 2% used, 50% elapsed, behind; "
+                      "slots 1 of 2, asks for 2", body)
 
 
 class RunnerSlotClaimTest(Base):
