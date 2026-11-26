@@ -11,7 +11,7 @@
 # LOOM_DROP_TREES=1 (each run's scratch goes when it ends). LOOM_POD_ONCE=1
 # runs one round, waits for it and exits (tests). LOOM_POD_FEED=1 starts each
 # round with `python3 -m bus.lane_feed sync`, for a pod fed by the station
-# through the state store instead of its disk. What the pod needs:
+# through its lane_feed table instead of its disk. What the pod needs:
 # docs/LANES.md, "Lane pods".
 #
 # A stopping pod drains: on SIGTERM it starts no runner and
@@ -115,7 +115,7 @@ trap drain TERM INT
 
 while :; do
   # A pod on another node takes its briefs from the station through the
-  # state store and sends back each heartbeat and report the same way
+  # lane_feed table and sends back each heartbeat and report the same way
   # (bus/lane_feed.py, loom#3621). A failed round is logged; the runners
   # still start and work any brief already here.
   if [ "${LOOM_POD_FEED:-}" = 1 ]; then

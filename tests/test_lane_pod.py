@@ -137,7 +137,7 @@ echo "agent-exit $slot $status" >> "$FAKE_LOG"
         self.assertIn("drain-seen zen", lines)
         self.assertLess(took, 15)
 
-    # A pod fed through the state store (bus/lane_feed.py, loom#3621): each
+    # A pod fed by the station (bus/lane_feed.py, loom#3621): each
     # round first pushes the slots' heartbeats and reports and takes their
     # next briefs, then starts the runners. A fake module records the call.
     FAKE_FEED = """import os, sys

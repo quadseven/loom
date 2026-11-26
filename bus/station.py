@@ -19400,17 +19400,26 @@ class Station:
 
     def tend_lane_feed(self) -> None:
         """The slots in LOOM_POD_FEED_SLOTS: offer their briefs to lane pods
-        on other nodes through the state store and mirror back each pod's
-        heartbeat and outcome (bus/lane_feed.py). A bad setting or an
+        on other nodes through the lane_feed table and mirror back each
+        pod's heartbeat and outcome (bus/lane_feed.py). A bad setting or an
         unreadable row is logged and feeds nothing this pass; a lost lease
         still stops the pass."""
+        env = dict(os.environ)
+        store = state_store.active()
+        rows = None
         try:
-            lane_feed.Feed(self.s.home, dict(os.environ), state_store.active(), _say,
-                           now=self.now).tend()
+            if not lane_feed.feed_slots(env):
+                return
+            rows = lane_feed.station_rows(env, self.s.home)
+            lane_feed.Feed(self.s.home, env, rows, _say, now=self.now,
+                           lease=getattr(store, "lease", None)).tend()
         except station_lease.LeaseLost:
             raise
         except (ValueError, state_store.StateError) as err:
             _say("lane feed: %s" % err)
+        finally:
+            if rows is not None:
+                rows.close()
 
     def tend_remote_checks(self) -> None:
         """Dispatch the check requests lanes filed under LOOM_REMOTE_CHECKS and
