@@ -432,7 +432,7 @@ OPENCODE_GO = ("opencode-go", "opencode-go-1", "opencode-go-2", "opencode-go-3",
 # anthropic credit last.
 LANE_ORDER: Tuple[str, ...] = (
     SPARKS
-    + FREE_POOL + ("openrouter", "workersai", "zen", "zai", "copilot")
+    + FREE_POOL + ("openrouter", "tinker", "workersai", "zen", "zai", "copilot")
     + OPENCODE_GO + CODEX + ("claude", "agy", "muse")
     + ANTHROPIC)
 # What a lane costs, for the dashboard's Tiers and allowances page (loom#968):
@@ -445,7 +445,7 @@ LANE_ORDER: Tuple[str, ...] = (
 KINDS = ("own-hardware", "free", "subscription", "never-paid")
 LANE_KINDS: Dict[str, str] = {
     "spark": "own-hardware",
-    **{lane: "free" for lane in FREE_POOL + ("openrouter", "workersai", "zen", "zai", "copilot")},
+    **{lane: "free" for lane in FREE_POOL + ("openrouter", "tinker", "workersai", "zen", "zai", "copilot")},
     **{lane: "subscription" for lane in ("claude", "codex", "opencode-go", "agy", "muse")},
     "anthropic": "never-paid",
 }
@@ -2011,6 +2011,7 @@ class Factory:
         # Lanes whose heartbeat says available; None trusts every lane not
         # at a limit.
         self.available = None if available is None else set(available)
+        self.preferred_lanes: Set[str] = set()
         # The tickets the station holds, "owner/repo#n": held for a factory
         # incident (they keep their running label and lane, but no lane is
         # working them) or refused this pass by the unproven-work gate.
@@ -2202,6 +2203,9 @@ class Factory:
         running ticket."""
         return self._takes_work(lane) and self.load.get(lane, 0) == 0
 
+    def _preferred_first(self, lanes: Iterable[str]) -> List[str]:
+        return sorted(lanes, key=lambda lane: lane not in self.preferred_lanes)
+
     def _runner_stops(self, lane: str, repo: str, base: str) -> bool:
         """Whether the runner ledger stops `repo` on `lane`'s slot for
         `base`, through the station's runner_stops (bus/runners.py
@@ -2223,7 +2227,7 @@ class Factory:
         when it should wait."""
         base = base_of(issue)
         agy_ok = agy_takes_header(issue, rung_only=True)
-        return next((x for x in lanes_for(self._is_private(repo))
+        return next((x for x in self._preferred_first(lanes_for(self._is_private(repo)))
                      if x != old and (allow_remote or x not in REMOTE_LANES)
                      and (x != "agy" or agy_ok) and not self._runner_stops(x, repo, base)
                      and self._free(x)), None)
@@ -5377,7 +5381,7 @@ class Factory:
         """The first lane that takes `model` and is free; with `busy_ok`, the
         first that is merely up and not limited for the model, busy or not."""
         from .station import model_lanes, needs_public_repo
-        return next((candidate for candidate in model_lanes(model)
+        return next((candidate for candidate in self._preferred_first(model_lanes(model))
                      if ((self._takes_work(candidate) and self._serves(candidate, model))
                          if busy_ok else (self._free(candidate) and self._serves(candidate, model)))
                      and (not needs_public_repo(candidate, model)
@@ -5783,7 +5787,7 @@ class Factory:
         """The lane for a pin fallback: the first free local lane by cost its
         repo may run on, not in `skip`."""
         base = base_of(issue)
-        return next((x for x in lanes_for(self._is_private(repo))
+        return next((x for x in self._preferred_first(lanes_for(self._is_private(repo)))
                      if x not in REMOTE_LANES and x not in skip and self._free(x)
                      and not self._runner_stops(x, repo, base)), None)
 

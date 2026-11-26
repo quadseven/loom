@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import brain, handoff, invariants, journal, station  # noqa: E402
+from bus import brain, handoff, invariants, journal, station, usage  # noqa: E402
 from bus.github import GitHub  # noqa: E402
 
 REPO = "example-owner/example-repo"
@@ -54,6 +54,26 @@ def comment(ident, body, created, login="me"):
 
 
 class WriterTests(unittest.TestCase):
+    def test_current_tick_journals_weekly_fuel_and_keeps_earlier_ticks(self):
+        previous = tick("2030-05-07T11:00:00Z", "lane-machine", "- Fuel: earlier reading")
+        fake = Fake([comment(41, previous, "2030-05-07T11:00:05Z")])
+        with tempfile.TemporaryDirectory() as home, unittest.mock.patch.dict(os.environ, LOOM_HOME=home):
+            usage.write(home, [
+                {"lanes": ["codex"], "window": "weekly", "used_pct": 37,
+                 "resets_at": "2030-05-07T19:00:00+00:00", "observed_at": "2030-05-07T11:45:00Z"},
+                {"lanes": ["claude"], "window": "weekly", "used_pct": 64,
+                 "resets_at": "2030-05-08T03:00:00Z", "observed_at": "2030-05-07T08:00:00Z"},
+            ])
+            journal.post(GitHub("t", transport=fake), REPO, 7, "- Fuel: old draft\n- Briefed: none",
+                         "lane-machine", now=NOW)
+        [(_, _, body)] = fake.writes()
+        current, _, earlier = body["body"].partition(handoff.EARLIER_OPEN)
+        self.assertIn("- Fuel: codex weekly 37% used, resets 2030-05-07T19:00:00Z", current)
+        self.assertIn("claude weekly 64% used, resets 2030-05-08T03:00:00Z (stale: read 4h ago)", current)
+        self.assertEqual(current.count("- Fuel:"), 1)
+        self.assertNotIn("old draft", current)
+        self.assertIn("- Fuel: earlier reading", earlier)
+
     def test_a_second_tick_the_same_day_edits_the_first_newest_first(self):
         first = tick("2030-01-01T09:00:00Z", "lane-machine", "- Decided: first")
         fake = Fake([comment(41, first, "2030-01-01T09:00:05Z")])

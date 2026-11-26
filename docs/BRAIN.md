@@ -1502,8 +1502,9 @@ that fails posts nothing, so a bad API answer cannot start a second comment.
   `<!-- loom:key-repeat v1 -->` comment on the open issue: a running count, the
   first and last time, the tickets (or lanes) seen, and the latest detail.
 - A factory incident is filed on the public factory repo, so it names only a
-  repo known to be public. Any other repo is `private repo <alias>` (a random
-  id the lane machine keeps per repo), and its ticket and failing line are
+  repo known to be public. Any other repo is `private repo <alias>` (8 hex
+  digits every host derives from the repo's GitHub id; a host that cannot
+  read the id falls back to a random one it keeps), and its ticket and failing line are
   withheld; they stay in the lane log and on the ticket. A public repo's
   detail that fails the public repo leak scan is withheld the same way.
 
@@ -1736,6 +1737,26 @@ rewrites, and a marker in its brief is dropped. Measured regressions
 have their own slot (see Regression slot). Write the journal, report when
 due, and release the lock. A failed step goes in the journal and waits for
 the next tick.
+
+A tick runs every step (loom#3593). The tick record keeps the steps whose
+last note was refused for deferring on budget (`refused`); such a step
+counts as not run. For a tick whose record starts with a timed `lock` step,
+`bus.brain step journal` is refused and nothing is recorded while a step
+from `status` to `sweep` is not run and the tick has used less than its
+budget minutes; the refusal names the next step. Past the budget the
+journal goes through and the tick may end. `python3 -m bus.brain
+step-pending` prints the elapsed line and the steps not run, and exits 0
+only while steps are left and the clock is open. `lanes/mac/brain.sh` reads
+it after an agent that ended well and runs the agent again with the steps
+named, at most `LOOM_BRAIN_CONTINUES` times (default 2) and only with 5 or
+more minutes left. On 2026-11-25 every lane machine tick ended after merge
+with 10 of its 12 minutes left, so brief and triage never ran.
+
+The Anthropic spend floor (docs/LANES.md, Anthropic spend) parks the
+anthropic slots only. `bus.brain brief --lane L` is refused under the floor
+when L is an anthropic slot (its lane status row is parked for Anthropic
+credit, or the status spend line says it is under the floor); a brief to any
+other lane, or with no lane, is never held by it.
 
 ## Tickets no lane takes
 
@@ -1989,8 +2010,11 @@ for the head. Nobody who opened the pull request or authored or committed
 any of its commits approves it, the review bot included. Commit author and
 committer are client-set, so a commit whose author or committer has no
 GitHub login (an unknown writer) refuses, and so does a pull request of 250
-or more commits, past what GitHub lists. No automation login
-approves by marker: `LOOM_GITHUB_LOGIN`, `LOOM_BRIEF_AUTHORS`,
+or more commits, past what GitHub lists. A marker approval also bars
+whoever pushed to the head branch, read from the repository's push activity
+(the pusher is set by GitHub, not the client); activity that cannot be read,
+a push with no login, or no push ending at the head refuses (loom#3548). No
+automation login approves by marker: `LOOM_GITHUB_LOGIN`, `LOOM_BRIEF_AUTHORS`,
 `LOOM_TRUSTED_BRIEFERS`, any `agent-` login, any App and the check bots
 (github-actions, copilot, dependabot, renovate). A review check that
 concluded success, neutral or skipped is no approval, an approval on an
@@ -2793,6 +2817,7 @@ Tick <UTC time>, <holder>
 - Shipped: <links or none>
 - Shipped backlog: <shipped count and median wait, or not read>
 - Briefed: <links with lanes or none>
+- Fuel: <weekly percent used and reset time for lanes with readings>
 - Waiting: <what is in flight and on whom>
 - Asks: <links or none>
 - Friction: <what slowed the factory this tick, or none>
@@ -2815,6 +2840,10 @@ but a new journal writes `- Friction:`.
 `- Shipped backlog:` copies the count and median wait from the same canonical
 waits read used by the Hot spots page. The brain status command prints the
 same line under `## Shipped backlog`; a failed read stays explicit.
+
+`- Fuel:` comes from the station's usage snapshot on the lane machine.
+A remote brain can copy the line printed by `python3 -m bus.usage --live`
+into its tick. The line marks stale readings.
 
 A step that failed or ran degraded adds a line `- Step <name>: failed <why>`
 or `- Step <name>: degraded <why>` (the step names are in docs/MUSE.md); a

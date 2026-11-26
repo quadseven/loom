@@ -171,7 +171,10 @@ unset variables.
   Before running a Codex agent, the lane reruns green checks that populated
   uv's scratch cache so the agent has packages for offline tests.
   Setup still runs for each brief, and the final check on the agent's commit
-  is never cached. Verdicts live under the host's `state/base-verdicts/`;
+  is never cached. A new run whose agent commits nothing runs no final
+  check: its tree is the base the base check covered, so it goes straight
+  to its no-commit outcome and holds no check slot. Verdicts live under
+  the host's `state/base-verdicts/`;
   each write sweeps the ones older than a day.
 - A passing base check closes the repo's open base-check and contract
   incidents from any lane host. The host keeps one file per incident under
@@ -180,7 +183,18 @@ unset variables.
   cluster runner or a second machine releases tickets an absent host filed.
   Environment incidents describe the machine that filed them and still close
   only from that machine's own file. A private repo's incident title carries
-  a per-host alias, so it still closes only from the host that filed it.
+  an alias derived from the repo's GitHub id (`bus/incident_probe.py`
+  `repo_alias`), the same on every host and in the station, so it closes
+  from any host too. A host that cannot read the id files under its own
+  per-host alias and says so in the lane log; a pass that finds no open
+  incident to close logs that as well (loom#3573).
+- The station releases holds from GitHub's labels as well as from its own
+  `factory_held.json`: a `loom:queued` + `wait:incident` ticket with no
+  ledger entry (a station that moved hosts left its ledger behind) goes back
+  to its lane once its repo has no open base-check or contract incident, the
+  incident its status names (if any) is closed, and the default branch's CI
+  is green. An operator claim keeps it held. The status file's Held tickets
+  section counts such tickets (loom#3573).
 - An open base-check incident holds every ticket of its repo, so no ticket
   run would ever check that repo again (loom#3084). While an incident holds
   tickets, the station gives one free local lane (never a cluster runner
@@ -242,7 +256,12 @@ unset variables.
   127 as `validation environment unavailable: ...`), opens no pull request
   and pushes nothing to the ticket's branch or an open pull request. The
   edits go to a side branch `<branch>-unvalidated-<time>` so they can be
-  recovered.
+  recovered. When that branch is ahead of the default branch and no later
+  attempt opened a pull request or kept a newer branch, the next new brief's
+  "Earlier attempt" section names it with the failing tests from the reason
+  (at most 10, plain test names only), and the runner merges it before the
+  agent starts, as it does a `-timedout-` branch. A fix brief resumes only a
+  `-timedout-` branch.
 - Every step runs like an API-lane agent: an emptied environment, a scratch
   HOME (`run/<lane>-check`), under `sandbox-exec`, with no access to the
   runner's HOME, but with the network and the writes outside HOME a step's
@@ -728,7 +747,12 @@ token. The station mints before its deploy step and reuses its
 `state/station/app-token.json` (`bus app token --cache-file`). Its Python pass
 refuses to start without the App settings, and a pass whose mint fails reads
 nothing from GitHub. A brain tick mints before it takes the lock and again
-once it holds it. Two reads still use the operator's own token on purpose:
+once it holds it. A lane run mints when it takes a brief and again after its
+agent. An installation token lasts an hour, so each late GitHub write (filing
+or closing a factory incident, a park note, an answer, a push) first mints
+again once the token is older than `LOOM_APP_TOKEN_MAX_AGE` seconds (default
+2700); an incident whose filing fails after a failed mint names the mint, not
+the 401 (loom#3571). Two reads still use the operator's own token on purpose:
 the pin pass (`bus/pin.py`, loom#612) and the operator budget sample
 (`bus/operator_budget.py`). Each reads `LOOM_GITHUB_TOKEN` from its own
 environment, since the wrapper refuses `gh auth token`.
@@ -832,7 +856,9 @@ open `loom:lanes` issue in `LOOM_STATUS_REPO` (default: this checkout's
 when a lane state or its public reason changes, when an Anthropic run is recorded, and when
 the table is older than 15 minutes (`LANES_REPUBLISH`), which it does at the
 start of the pass so a pass that stops at its request target still publishes.
-The table uses fixed reason text so raw runner details stay local. The
+The table uses fixed reason text so raw runner details stay local. Its
+sign-in column is each slot's last sign-in probe, result and time ("Lane
+pods" below). The
 launchd station removes stale heartbeat files for slots with no loaded job.
 Remote and cluster slots keep their own heartbeat sources. `bus.brain status`
 prints the table's age beside `Updated` and calls it stale past the same age. With Anthropic
@@ -2311,7 +2337,9 @@ anthropic slot reports itself unavailable with that reason, and the station
 sends the anthropic slots nothing more. Ephemeral runners return their spend
 rows in the sealed report. The station appends them once per report to the
 same ledger and checks the shared balance before dispatching more Anthropic
-briefs.
+briefs. The floor holds the anthropic slots only: the spend line says every
+other lane takes briefs as usual, and `bus.brain brief --lane` refuses only
+an anthropic slot under the floor (loom#3593).
 
 ## Skills on every lane
 
@@ -2542,6 +2570,29 @@ reply at 1,024 tokens. The runner checks the daily neuron meter before sending
 the request. Larger verify briefs stay eligible for other lanes. Cluster
 dispatch requires both provider parameter settings, and a successful cluster
 run refreshes the meter for its report.
+
+## tinker: the Tinker free tier
+
+- Tinker's OpenAI-compatible endpoint (`LOOM_TINKER_URL`, default Tinker's
+  `/oai/api/v1` base) through an opencode provider named `tinker`, with the key
+  named by `LOOM_TINKER_KEY_SSM`, handed to the agent as `TINKER_API_KEY`.
+- One model, `LOOM_TINKER_MODEL`, written `tinker/<id>`, for example
+  `tinker/thinkingmachines/Inkling-2-Mini:peft:65536:free`. Tinker serves an id
+  ending in `:free` at no charge, within a rate limit and only while a prepaid
+  account's balance is positive; every other id is billed against that balance.
+- Fail closed (`tinker_free_model` in lanes/agent_sandbox.sh): the lane does not
+  start, and its heartbeat says `REFUSED`, when `LOOM_TINKER_MODEL` is unset or
+  does not end in `:free`, when `LOOM_TINKER_MODELS` is set, or when the URL is
+  not https. A brief's `Model:` line is ignored: the lane runs its own model.
+  `opencode_config` checks the id again before every opencode run, so no other
+  id reaches the network.
+- An HTTP 429 or "too many requests" rests the lane for `LIMIT_WAIT` (an hour);
+  an HTTP 402 or "insufficient balance" rests it a day. Either is the usual
+  limit hold: the heartbeat is unavailable with a retry time, the brief is
+  parked as a limit and handed on, and the lane takes nothing until then.
+- A free lane (station `FREE_LANES`): public repos only, tried after openrouter
+  in `LANE_ORDER`. Its pull requests name lane `tinker`, so the scorecard counts
+  them on a row of their own.
 
 ## free provider slots on the spark-gateway
 
@@ -2779,11 +2830,43 @@ What changes in a pod:
 - `LOOM_DROP_TREES=1`: each run's tree, the runner's files beside it and the
   scratch homes are removed when the run ends, whatever its outcome
   (`drop_run_scratch`). Logs and the brief stay under `LOOM_HOME`.
+- A drain on SIGTERM: a stopping pod starts no runner and marks
+  `run/<slot>.drain`, so each runner takes no new brief. It waits
+  `LOOM_POD_DRAIN_SECONDS` (default 240) for the runs in flight, then stops
+  each agent still running and waits `LOOM_POD_PRESERVE_SECONDS` (default
+  90) while its runner keeps the run (`keep_drained_run`): the edits go to a
+  `-timedout-` branch, the brief gains an "Earlier attempt" section naming
+  it, and the brief stays in the inbox. With `LOOM_HOME` on a volume that
+  outlives the pod, the next pod's runner takes the same brief and merges the
+  branch, and the station keeps the ticket running. The pod's termination
+  grace period must cover both waits.
 - `LOOM_SSM_DIR`: a folder under HOME holding a copy of each SSM parameter
   the pod reads, at the parameter's name (`/a/b` is `$LOOM_SSM_DIR/a/b`),
   kept in step with SSM by the cluster. `ssm_value` reads the file and makes
   no AWS call, so the pod holds no AWS key. The GitHub App key comes from
   `LOOM_GITHUB_APP_KEY_FILE`, also under HOME.
+- A sign-in probe (loom#3572): at start and every
+  `LOOM_SIGNIN_PROBE_INTERVAL` seconds (default 1800; 0 turns it off), for
+  each lane in `LOOM_SIGNIN_LANES` (default `codex claude`) with a slot in
+  the pod, `lanes/signin_probe.sh` runs the CLI's cheapest real call (a
+  one-word prompt) in place on the lane's own sign-in, while it holds the
+  run lock of every slot of that lane. A slot whose lock is taken makes it
+  let go and try again every `LOOM_SIGNIN_PROBE_POLL` seconds (default 15)
+  for up to `LOOM_SIGNIN_PROBE_WAIT` (default 1500); a runner that starts
+  while the probe holds its lock exits at once. The result (pass; unknown on
+  a usage limit, the network or `LOOM_SIGNIN_PROBE_TIMEOUT`, default 180;
+  fail otherwise) goes to `state/signin/<first slot>.json` with a masked
+  tail of what the CLI said, and the probe's own log to
+  `logs/signin-probe.log`. Every pass the station (`tend_signin`,
+  `bus/signin.py`) reads the records: the first fail after a pass sends one
+  alert line (`LOOM_SIGNIN_ALERT_CMD`, a command given the line on stdin,
+  when set; else the ask webhook with the operator mention) and files or
+  counts on the single key-ask for that sign-in, titled as
+  `ask_renew_key` titles it, so lanes and probes share one ask. The first
+  pass after a fail sends a recovery line and closes the ask; a pass with no
+  failure before it closes an ask left open too. At most hourly a key-ask
+  whose lanes have all had no heartbeat for 24 hours is closed as off. The
+  lane status table's sign-in column shows each slot's last probe.
 
 Everything the agent must not read (the copied parameters, the App key,
 `LOOM_HOME`) sits under HOME, outside the system folders bwrap binds; the

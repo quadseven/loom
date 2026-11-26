@@ -424,7 +424,7 @@ if [ "${1:-}" = models ]; then
 fi
 args="$*"; args="${args//$'\\n'/ }"
 keyvar=none; key=none
-for v in OPENROUTER_API_KEY OPENCODE_API_KEY ANTHROPIC_API_KEY ZHIPU_API_KEY CLOUDFLARE_API_KEY SPARK_API_KEY; do
+for v in OPENROUTER_API_KEY OPENCODE_API_KEY ANTHROPIC_API_KEY ZHIPU_API_KEY CLOUDFLARE_API_KEY SPARK_API_KEY TINKER_API_KEY; do
   if [ -n "${!v:-}" ]; then keyvar="$v"; key="${!v}"; fi
 done
 real_home="$(cd ../../.. && pwd)"
@@ -655,6 +655,7 @@ def git(*args, cwd=None):
 class LaneRunnerTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
+        self._stations = []
         root = Path(self._tmp.name)
         self.home = root / "home"
         self.loom = self.home / "loom"
@@ -765,6 +766,12 @@ print('leak guard: clean (shape patterns only)')
         self.scanner.chmod(0o755)
 
     def tearDown(self):
+        # A fake station thread writes inside the temp dir; stop it and wait
+        # for it before the dir is removed (cleanups run after tearDown).
+        for stop, thread in self._stations:
+            stop.set()
+            thread.join(10)
+            self.assertFalse(thread.is_alive(), "the fake station thread did not stop")
         self._tmp.cleanup()
 
     @staticmethod
@@ -3257,6 +3264,82 @@ exec /usr/bin/git "$@"
                                capture_output=True, text=True, check=True).stdout
         self.assertNotIn("-timedout-", heads)
 
+    # A lane pod that is stopping (lanes/k8s/pod.sh) marks run/<slot>.drain
+    # and then stops each agent still running. The fake agent
+    # here marks the drain itself, then ends as a stopped agent does.
+    def drained_agent(self, edit=True):
+        marker = self.loom / "run" / "codex.drain"
+        self.write_tool(self.bin / "codex", FAKE_AGENT.replace(
+            "cat > /dev/null\n",
+            "cat > /dev/null\n%s: > '%s'\nexit 143\n"
+            % ("echo partial > fix.txt; " if edit else "", marker), 1))
+        return marker
+
+    def side_branches(self):
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        return [h.split("refs/heads/")[1] for h in heads.splitlines() if "-timedout-" in h]
+
+    def test_a_run_a_pod_drain_stops_keeps_its_edits_and_its_brief_for_the_next_pod(self):
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        self.drained_agent()
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        side = self.side_branches()
+        self.assertEqual(len(side), 1, side)
+        self.assertTrue(side[0].startswith("loom/T042-fix-the-thing-timedout-"), side)
+        # Not parked: the brief waits in the inbox, so the station keeps the
+        # ticket running, and it names the kept branch for the next run.
+        brief = (self.inbox / "T042-fix-the-thing.md").read_text()
+        self.assertTrue(brief.startswith(BRIEF), brief)
+        self.assertIn("## Earlier attempt", brief[len(BRIEF):])
+        self.assertIn("kept its edits on branch %s." % side[0], brief)
+        self.assertFalse((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        log = self.run_log()
+        self.assertNotIn(" failed: ", log)
+        self.assertIn("stopped by a lane pod restart; the brief stays in the inbox", log)
+
+    def test_the_next_pod_merges_the_kept_branch_of_a_drained_run(self):
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        marker = self.drained_agent()
+        self.run_lane()
+        side = self.side_branches()[0]
+        marker.unlink()
+        self.write_tool(self.bin / "codex", FAKE_AGENT)
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("merged the earlier attempt's branch %s" % side, self.run_log())
+
+    def test_the_newest_kept_branch_is_the_one_merged(self):
+        # A station brief may already name an older kept branch; a drained
+        # run of it appends its own, built on top of that one.
+        old, new = "loom/T042-fix-the-thing-timedout-1", "loom/T042-fix-the-thing-timedout-2"
+        self.drop_brief("T042-fix-the-thing.md", BRIEF
+                        + "\n## Earlier attempt\n\nAn earlier attempt kept its edits on branch %s.\n" % old
+                        + "\n## Earlier attempt\n\nA lane pod restart kept its edits on branch %s.\n" % new)
+        self.run_lane()
+        log = self.run_log()
+        self.assertIn(new, log)
+        self.assertNotIn(old, log)
+
+    def test_a_drained_run_that_edited_nothing_leaves_its_brief_as_it_was(self):
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        self.drained_agent(edit=False)
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.side_branches(), [])
+        self.assertEqual((self.inbox / "T042-fix-the-thing.md").read_text(), BRIEF)
+        self.assertNotIn(" failed: ", self.run_log())
+
+    def test_a_draining_pod_takes_no_new_brief(self):
+        self.drop_brief("T042-fix-the-thing.md", BRIEF)
+        (self.loom / "run").mkdir(parents=True, exist_ok=True)
+        (self.loom / "run" / "codex.drain").touch()
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(c.startswith("codex ") for c in self.calls()))
+        self.assertEqual((self.inbox / "T042-fix-the-thing.md").read_text(), BRIEF)
+
     def test_a_non_limit_pattern_is_still_read_from_the_short_tail(self):
         # loom#934: the auth and transient (network) patterns still read the
         # short tail, not the whole output. A key-expiry line buried in the
@@ -3866,6 +3949,27 @@ exec /usr/bin/git "$@"
         git("push", "-q", "origin", side, cwd=work)
         self.drop_brief(text=BRIEF + "\n## Earlier attempt\n\nAn earlier attempt timed out after "
                         "editing, and the runner kept its edits on branch %s.\n" % side)
+        self.write_tool(self.bin / "codex", FAKE_AGENT.replace(
+            "cat > /dev/null\n",
+            "cat > /dev/null\n[ -f earlier.txt ] && echo agent-saw-earlier >> \"$FAKE_LOG\"\n", 1))
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("agent-saw-earlier", self.calls())
+        self.assertIn("merged the earlier attempt's branch %s" % side, self.lane_log())
+
+    def test_an_earlier_red_check_attempts_edits_are_in_the_tree_before_the_agent(self):
+        # A run parked on a red final check keeps its edits on an
+        # -unvalidated- branch; the next attempt fixes them, not starts over.
+        side = "loom/T042-fix-the-thing-unvalidated-1792595837"
+        work = Path(self._tmp.name) / "side-work"
+        git("clone", "-q", str(self.remote), str(work))
+        git("checkout", "-q", "-b", side, cwd=work)
+        (work / "earlier.txt").write_text("from the red-check run\n")
+        git("add", "earlier.txt", cwd=work)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "WIP", cwd=work)
+        git("push", "-q", "origin", side, cwd=work)
+        self.drop_brief(text=BRIEF + "\n## Earlier attempt\n\nAn earlier attempt edited this ticket but "
+                        "its final check failed, and the runner kept its edits on branch %s.\n" % side)
         self.write_tool(self.bin / "codex", FAKE_AGENT.replace(
             "cat > /dev/null\n",
             "cat > /dev/null\n[ -f earlier.txt ] && echo agent-saw-earlier >> \"$FAKE_LOG\"\n", 1))
@@ -5148,6 +5252,150 @@ esac
         self.assertIn("-m opencode-go/beam-free", run)
         self.assertNotIn("-m opencode-go/kimi", run)
         self.assertIn("REFUSED the brief's Model: opencode-go/kimi-k2.7-code", result.stderr)
+
+    # The tinker lane (loom#3579): Tinker bills every model id without :free
+    # against a prepaid balance, so the lane runs its configured :free id only
+    # and no other id ever reaches the network.
+    TINKER_FREE = "tinker/thinkingmachines/Inkling-2-Mini:peft:65536:free"
+    TINKER_PAID = "tinker/thinkingmachines/Inkling-2-Mini:peft:65536"
+
+    def tinker_env(self, **env):
+        return {"LOOM_TINKER_KEY_SSM": "/k/tk", "FAKE_SECRET__k_tk": "fake-tk-key",
+                "LOOM_TINKER_URL": "https://tinker.example.invalid/oai/api/v1",
+                "LOOM_TINKER_MODEL": self.TINKER_FREE, **env}
+
+    def assert_tinker_calls_nothing(self):
+        calls = self.calls()
+        self.assertFalse(any(c.startswith(("opencode ", "curl ")) for c in calls), calls)
+
+    def assert_tinker_refuses(self, why, **env):
+        inbox = self.loom / "briefs" / "tinker"
+        inbox.mkdir(parents=True, exist_ok=True)
+        (inbox / "T042-fix-the-thing.md").write_text(BRIEF.replace("Lane: codex", "Lane: tinker"))
+        result = self.run_lane("tinker", **self.tinker_env(**env))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("REFUSED", result.stderr)
+        self.assert_tinker_calls_nothing()
+        self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
+        beat = self.beat("tinker")
+        self.assertFalse(beat["available"], beat)
+        self.assertIn(why, beat["reason"])
+
+    def test_a_tinker_lane_on_a_paid_model_id_does_not_start_and_calls_nothing(self):
+        self.assert_tinker_refuses("does not end in :free", LOOM_TINKER_MODEL=self.TINKER_PAID)
+
+    def test_a_tinker_lane_whose_id_has_free_before_its_end_does_not_start(self):
+        self.assert_tinker_refuses("does not end in :free", LOOM_TINKER_MODEL=self.TINKER_FREE + ":x")
+
+    def test_a_tinker_lane_whose_id_ends_in_free_in_another_case_does_not_start(self):
+        self.assert_tinker_refuses("does not end in :free", LOOM_TINKER_MODEL=self.TINKER_PAID + ":FREE")
+
+    def test_a_tinker_lane_with_no_model_does_not_start(self):
+        self.assert_tinker_refuses("LOOM_TINKER_MODEL", LOOM_TINKER_MODEL="")
+
+    def test_a_tinker_lane_with_a_model_ladder_does_not_start(self):
+        self.assert_tinker_refuses("LOOM_TINKER_MODELS",
+                                   LOOM_TINKER_MODELS=self.TINKER_FREE + " " + self.TINKER_PAID)
+
+    def test_a_tinker_lane_on_a_plain_http_endpoint_does_not_start(self):
+        self.assert_tinker_refuses("LOOM_TINKER_URL", LOOM_TINKER_URL="http://tinker.example.invalid/v1")
+
+    def tinker_config(self, model):
+        """opencode_config, then opencode_run, for the tinker lane alone, with
+        api_agent standing in for the sandboxed CLI: (stdout, stderr, every
+        call api_agent or the CLI received)."""
+        calls = Path(self._tmp.name) / "tinker-calls"
+        fake = Path(self._tmp.name) / "fake-opencode"
+        self.write_tool(fake, '#!/usr/bin/env bash\necho "opencode $*" >> "%s"\necho 1.18.4\n' % calls)
+        script = "\n".join([
+            '. "$1/lanes/agent_sandbox.sh"',
+            'CALLS="$2"',
+            'api_agent() { echo "api_agent $*" >> "$CALLS"; }',
+            'LANE=tinker MODEL="$3" TINKER_URL=https://tinker.example.invalid/v1 API_KEY=k AGENT_EXTRA_ENV=""',
+            'opencode_config; echo "config=$?"',
+            'printf "env=%s\\n" "${AGENT_EXTRA_ENV:-none}"',
+            'AGENT_EXTRA_ENV=""',
+            'opencode_run TINKER_API_KEY "$4" run hello; echo "run=$?"',
+        ])
+        out = subprocess.run(["bash", "-c", script, "-", str(RUNNER.parent.parent), str(calls), model, str(fake)],
+                             capture_output=True, text=True, timeout=30)
+        return out.stdout, out.stderr, calls.read_text() if calls.exists() else ""
+
+    def test_the_tinker_request_path_refuses_a_paid_model_id_before_any_call(self):
+        for model in (self.TINKER_PAID, self.TINKER_FREE + ":x", "tinker/:free", self.TINKER_PAID + ":FREE",
+                      "openrouter/vendor/model:free"):
+            with self.subTest(model=model):
+                stdout, stderr, calls = self.tinker_config(model)
+                self.assertIn("config=1", stdout)
+                self.assertIn("env=none", stdout)
+                self.assertNotIn("run=0", stdout)
+                self.assertIn("does not end in :free", stderr)
+                self.assertEqual(calls, "")
+
+    def test_the_tinker_provider_serves_only_the_free_model(self):
+        stdout, _, calls = self.tinker_config(self.TINKER_FREE)
+        self.assertIn("config=0", stdout)
+        config = json.loads(re.search(r"OPENCODE_CONFIG_CONTENT=(.*)", stdout).group(1))
+        self.assertEqual(config["model"], self.TINKER_FREE)
+        self.assertEqual(config["small_model"], self.TINKER_FREE)
+        self.assertEqual(list(config["provider"]), ["tinker"])
+        provider = config["provider"]["tinker"]
+        self.assertEqual(provider["options"]["baseURL"], "https://tinker.example.invalid/v1")
+        self.assertEqual(provider["options"]["apiKey"], "{env:TINKER_API_KEY}")
+        self.assertEqual(list(provider["models"]), ["thinkingmachines/Inkling-2-Mini:peft:65536:free"])
+        self.assertIn("run=0", stdout)
+        self.assertIn("api_agent TINKER_API_KEY", calls)
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_tinker_run_uses_the_free_model_on_the_tinker_provider(self):
+        inbox, result = self.api_lane("tinker", **self.tinker_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run = [c for c in self.calls() if c.startswith("opencode ")]
+        self.assertEqual(len(run), 1, self.calls())
+        self.assertIn("-m %s --print-logs" % self.TINKER_FREE, run[0])
+        self.assertIn("keyvar=TINKER_API_KEY key=fake-tk-key", run[0])
+        self.assertIn("small=%s" % self.TINKER_FREE, run[0])
+        config = [c for c in self.calls() if c.startswith("config=")][-1]
+        self.assertIn('"baseURL": "https://tinker.example.invalid/oai/api/v1"', config)
+        self.assertFalse(any(c.startswith("curl ") for c in self.calls()), self.calls())
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists(), result.stderr)
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_tinker_brief_pinning_a_paid_model_runs_the_free_model(self):
+        inbox, result = self.api_lane("tinker", extra="Model: %s\n" % self.TINKER_PAID, **self.tinker_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run = [c for c in self.calls() if c.startswith("opencode ")]
+        self.assertEqual(len(run), 1, self.calls())
+        self.assertIn("-m %s --print-logs" % self.TINKER_FREE, run[0])
+        self.assertNotIn("-m %s " % self.TINKER_PAID, run[0])
+        self.assertIn("REFUSED the brief's Model: %s" % self.TINKER_PAID, result.stderr)
+
+    def assert_tinker_rests(self, line, at_least):
+        self.write_tool(self.bin / "opencode", FAKE_OPENCODE.replace(
+            'args="$*"; args=', 'echo "%s"; exit 1\nargs="$*"; args=' % line, 1))
+        started = time.time()
+        inbox, result = self.api_lane("tinker", **self.tinker_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists(), result.stderr)
+        self.assertTrue(self.failure_line(lane="tinker").startswith("[limit] "), self.failure_line(lane="tinker"))
+        beat = self.beat("tinker")
+        self.assertFalse(beat["available"], beat)
+        self.assertGreaterEqual(beat["retry_at"], started + at_least)
+        # The next pass takes nothing and calls nothing until the rest is over.
+        before = [c for c in self.calls() if c.startswith(("opencode ", "curl "))]
+        (inbox / "T043-next.md").write_text(BRIEF.replace("T042", "T043").replace("Lane: codex", "Lane: tinker"))
+        result = self.run_lane("tinker", **self.tinker_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([c for c in self.calls() if c.startswith(("opencode ", "curl "))], before)
+        self.assertTrue((inbox / "T043-next.md").exists())
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_tinker_rate_limit_rests_the_lane(self):
+        self.assert_tinker_rests("AI_APICallError: Too Many Requests (statusCode: 429)", 3000)
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_tinker_empty_balance_rests_the_lane_a_day(self):
+        self.assert_tinker_rests("AI_APICallError: Payment Required: insufficient balance (statusCode: 402)", 80000)
 
     def test_the_installer_defaults_every_go_slot_to_an_allowed_model(self):
         text = (RUNNER.parent / "mac" / "install.sh").read_text()
@@ -9167,8 +9415,7 @@ echo fixed > fix.txt
 
         thread = threading.Thread(target=run, daemon=True)
         thread.start()
-        self.addCleanup(thread.join, 5)
-        self.addCleanup(stop.set)
+        self._stations.append((stop, thread))
         dispatched.said = said
         return stop, dispatched
 

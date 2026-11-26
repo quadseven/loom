@@ -22,6 +22,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -107,6 +108,7 @@ from . import criteria_gate
 from . import live_adapter, live_proof
 from . import deploy_watch
 from . import scorecard
+from . import signin
 from . import watch
 from . import workersai
 from . import weakened
@@ -613,12 +615,15 @@ HELD_FOR_RE = re.compile(r"factory incident ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([
 # has nothing that can close it, so the station releases it after this long:
 # the ticket is not held forever.
 HELD_NO_INCIDENT_FOR = 2 * 3600
+# How often the station reads GitHub for wait:incident holds its ledger does
+# not know (loom#3573): one label list per repo, so not every pass.
+UNRECORDED_HOLDS_EVERY = 900
 # The brain's lane order for a retry, after the failed lane's own provider.
 # claude is never chosen: it spends the operator's own subscription.
 RETRY_ORDER = ["anthropic", "anthropic-2", "anthropic-3", "anthropic-4",
                "codex", "codex-2", "opencode-go", "agy"]
 # Free lanes take only easy tickets on public repos.
-FREE_LANES = ["openrouter", "zen", "zai", "workersai"]
+FREE_LANES = ["openrouter", "tinker", "zen", "zai", "workersai"]
 # The model families each lane's runner accepts (lanes/run_lane.sh); codex
 # takes any model outside the claude family. agy takes gemini-3.8-flash only:
 # its runner drops any other gemini, claude or gpt-oss pin and runs flash
@@ -629,6 +634,8 @@ LANE_MODELS = {
     "claude": CLAUDE_MODELS,
     "anthropic": ["claude*"],
     "openrouter": ["openrouter/*:free"],
+    # Tinker bills every id without :free (lanes/agent_sandbox.sh tinker_free_model).
+    "tinker": ["tinker/*:free"],
     # Only the allow-listed models (tickets.OPENCODE_GO_MODELS) and free models,
     # so a pin to a low-allowance Go model is never routed to an opencode-go lane.
     "opencode-go": list(tickets.OPENCODE_GO_MODELS) + ["opencode-go/*-free"],
@@ -2557,6 +2564,7 @@ class Station:
         self._claimed_rereviews: Dict[str, Any] = {}
         self._claimed_writes = 0
         self._branch_cache: Dict[str, str] = {}
+        self._repo_cache: Dict[str, Dict[str, Any]] = {}
         self._area_cache: Dict[str, List[str]] = {}
         self._stale_asks_withdrawn = 0
         # Per pass: each path-scoped repo's workflow filters, and its deploy runs.
@@ -3054,7 +3062,7 @@ class Station:
         name = tickets.ticket_name(repo, number, attempt)
         has_contract, checks = self._validation_checks(repo)
         text = tickets.render_brief(repo, issue, lane, attempt, fix, checks, has_contract,
-                                    self._timedout_branch(comments),
+                                    self._earlier_branch(repo, number, comments, fix),
                                     notes=tickets.operator_notes(
                                         comments, list(self.s.authors) + list(self.s.briefers)
                                         + list(self.s.owners)),
@@ -3119,18 +3127,59 @@ class Station:
         return tickets.linked_pulls(self.gh.rest(
             "GET", "/repos/%s/issues/%d/timeline?per_page=100" % (repo, number)).data)
 
+    def _earlier_branch(self, repo: str, number: int, comments: List[Any],
+                        fix: Optional[tickets.Fix]) -> Optional[tickets.KeptBranch]:
+        """The side branch the brief's "Earlier attempt" section names: the
+        newest kept branch, timed out or parked on a red final check
+        (tickets.kept_branch), and only one of this ticket's own branches
+        (tickets.owned_branch). A fix brief resumes only a timed-out
+        branch, as before. An -unvalidated- branch is offered only while it
+        holds commits the default branch lacks: a run with no commit names
+        one that holds only the base."""
+        if fix is not None:
+            side = self._timedout_branch(comments)
+            owned = side and tickets.owned_branch(side, number, fix.branch)
+            return tickets.KeptBranch(side) if owned else None
+        texts = self._factory_texts(comments)
+        kept = tickets.kept_branch(texts, number) if texts is not None else None
+        if kept and kept.unvalidated and not self._side_has_edits(repo, kept.branch):
+            return None
+        return kept
+
+    def _side_has_edits(self, repo: str, branch: str) -> bool:
+        """The side branch exists and is ahead of the default branch (the
+        compare API). An unreadable answer offers nothing: the next attempt
+        starts from the base, as it did before."""
+        base = self._default_branch(repo)
+        if not base:
+            return False
+        try:
+            resp = self.gh.rest("GET", "/repos/%s/compare/%s...%s" % (repo, base, branch), ok=(404,))
+        except GitHubError as err:
+            _say("could not compare %s with %s in %s: %s" % (branch, base, repo, err))
+            return False
+        data = resp.data if resp.status != 404 and isinstance(resp.data, dict) else {}
+        ahead = data.get("ahead_by")
+        return isinstance(ahead, int) and ahead > 0
+
     def _timedout_branch(self, comments: List[Any]) -> Optional[str]:
         """The side branch a timed-out attempt kept its edits on, as the
         factory's own status events name it; None when none did."""
+        texts = self._factory_texts(comments)
+        return tickets.timedout_branch(texts) if texts is not None else None
+
+    def _factory_texts(self, comments: List[Any]) -> Optional[List[str]]:
+        """The bodies of the factory's own comments and status events,
+        oldest first; None, said, when they cannot be read."""
         allowed = {a.lower() for a in self.s.authors}
         # The imported status module expands the factory's event comments.
         expanded = status.expand(comments, self.s.authors)
         if not isinstance(expanded, list):
-            _say("could not find timed-out branch: expanded issue comments are not a list")
+            _say("could not find a kept branch (a timed-out branch or an unvalidated one): "
+                 "expanded issue comments are not a list")
             return None
-        return tickets.timedout_branch(
-            [str(c.get("body") or "") for c in expanded
-             if isinstance(c, dict) and tickets._login(c.get("user")).lower() in allowed])
+        return [str(c.get("body") or "") for c in expanded
+                if isinstance(c, dict) and tickets._login(c.get("user")).lower() in allowed]
 
     def _fix_refusal(self, fix: Optional[tickets.Fix]) -> Optional[str]:
         """Why a fix brief cannot go out yet, or None when it can (no fix, or
@@ -7288,6 +7337,8 @@ class Station:
         """
         if self._deferred():
             return
+        # Every pass: a failed sign-in probe alerts at once (loom#3572).
+        self._tend_signin_due(paused)
         if "score_lanes" not in paused and scorecard.Scorecard(self.state, self.now).due():
             try:
                 self.score_lanes()
@@ -7610,9 +7661,15 @@ class Station:
     def _default_branch(self, repo: str) -> str:
         """The repo's default branch, cached for the pass."""
         if repo not in self._branch_cache:
-            data = self.gh.rest("GET", "/repos/%s" % repo).data or {}
-            self._branch_cache[repo] = str(data.get("default_branch") or "")
+            self._branch_cache[repo] = str(self._repo_data(repo).get("default_branch") or "")
         return self._branch_cache[repo]
+
+    def _repo_data(self, repo: str) -> Dict[str, Any]:
+        """The repo's GitHub record, read once a pass."""
+        if repo not in self._repo_cache:
+            data = self.gh.rest("GET", "/repos/%s" % repo).data
+            self._repo_cache[repo] = data if isinstance(data, dict) else {}
+        return self._repo_cache[repo]
 
     def _hand_reverts(self, repo: str, pulls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """The hand-made revert pull requests among `pulls`, newest first."""
@@ -8550,8 +8607,13 @@ class Station:
         itself, so the release leaves it alone. A failed read of the
         incidents releases nothing this pass; the holds wait for the next."""
         held = self._held_tickets()
-        if not held:
-            return
+        if held:
+            self._release_ledger_holds(held)
+        self._release_unrecorded_holds()
+
+    def _release_ledger_holds(self, held: Dict[str, Any]) -> None:
+        """Walk the station's own hold ledger from where the last pass
+        stopped, releasing each hold whose incident cleared."""
         cursor_path = os.path.join(self.state, "factory_held_cursor.json")
         cursor = _read_json(cursor_path, {}, strict=False)
         start = cursor.get("next", 0) if isinstance(cursor, dict) else 0
@@ -8716,7 +8778,121 @@ class Station:
                 or run.get("conclusion") != "success" for run in runs):
             return False
         status_data = self.gh.rest("GET", "/repos/%s/commits/%s/status" % (repo, sha)).data or {}
-        return isinstance(status_data, dict) and status_data.get("state") == "success"
+        # GitHub answers "pending" with total_count 0 for a commit no status
+        # was ever posted on, so a repo gated by check runs alone read as
+        # never green (loom#3573).
+        return isinstance(status_data, dict) and (
+            status_data.get("state") == "success" or status_data.get("total_count") == 0)
+
+    # -- holds with no ledger entry (loom#3573) -----------------------------
+    def _release_unrecorded_holds(self) -> None:
+        """Release each queued wait:incident ticket the ledger does not know.
+        The label outlives the ledger: the cluster station started with no
+        factory_held.json, so 64 tickets the desktop station had held were
+        never released. GitHub's labels are the holds; one with no ledger
+        entry goes back to its lane once its repo has no open base-check or
+        contract incident, the incident its status names (if any) is closed,
+        and the default branch's CI is green, the rule the no-incident hold
+        already uses. A failed read releases nothing in that repo this pass.
+        It reads one label list per repo, so it runs at most once every
+        UNRECORDED_HOLDS_EVERY seconds."""
+        stamp_path = os.path.join(self.state, "unrecorded_holds.json")
+        stamp = _read_json(stamp_path, {}, strict=False)
+        last = stamp.get("at") if isinstance(stamp, dict) else None
+        if self._num(last) and 0 <= self.now - last < UNRECORDED_HOLDS_EVERY:
+            return
+        _write_json(stamp_path, {"at": self.now})
+        self._open_incidents: Optional[List[Dict[str, Any]]] = None
+        self._named_incidents: Dict[str, Optional[Dict[str, Any]]] = {}
+        for repo in self.scan_repos():
+            try:
+                self._release_repo_unrecorded(repo)
+            except RateLimited:
+                raise
+            except GitHubError as err:
+                _say("factory release: could not check the unrecorded holds of %s: %s"
+                     % (repo, err))
+
+    def _unrecorded_holds(self, repo: str) -> List[Dict[str, Any]]:
+        """The repo's open queued wait:incident tickets with no ledger entry."""
+        held = self._held_tickets()
+        found = self._paginate("/repos/%s/issues?labels=loom:queued,%sincident"
+                               "&state=open&per_page=100" % (repo, WAIT))
+        return [i for i in found if isinstance(i, dict) and "pull_request" not in i
+                and str(i.get("number") or "").isdigit() and self._incident_held(i)
+                and "%s#%d" % (repo, int(i["number"])) not in held]
+
+    def _release_repo_unrecorded(self, repo: str) -> None:
+        orphans = self._unrecorded_holds(repo)
+        if not orphans:
+            return
+        open_ref = self._repo_open_incident(repo)
+        if open_ref:
+            _say("factory release: %d unrecorded wait:incident hold(s) in %s stay: "
+                 "incident %s is open" % (len(orphans), repo, open_ref))
+            return
+        head = self._default_head(repo)
+        if not head or not self._default_commit_checks_green(repo, head):
+            _say("factory release: %d unrecorded wait:incident hold(s) in %s stay: "
+                 "default-branch CI is not green" % (len(orphans), repo))
+            return
+        mine = {a.lower() for a in self.s.authors}
+        for issue in orphans:
+            number = int(issue["number"])
+            key = "%s#%d" % (repo, number)
+            if set(tickets.claimed_by(issue)) & mine:
+                _say("factory release: %s kept: an operator session holds it" % key)
+                continue
+            named = self._named_open_incident(issue)
+            if named:
+                _say("factory release: %s kept: incident %s it names is open" % (key, named))
+                continue
+            cleared = RUNAWAY in _label_names(issue)
+            self._release_one(key, repo, number, issue, cleared,
+                              "held: this station has no record of the incident hold; the "
+                              "repo has no open base-check incident and its default-branch "
+                              "CI is green, so the ticket is back on its lane")
+            _say("factory release: %s re-queued: unrecorded hold, no open incident, "
+                 "default-branch CI green" % key)
+
+    def _repo_subjects(self, repo: str) -> List[str]:
+        """How an incident's Repo: line names `repo` (incident_probe.subjects)."""
+        data = self._repo_data(repo)
+        raw = data.get("id")
+        return incident_probe.subjects(repo, raw if isinstance(raw, int) else None)
+
+    def _repo_open_incident(self, repo: str) -> str:
+        """The ref of an open base-check or contract incident of `repo` on the
+        factory repo, "" when it has none. The factory repo's open incidents
+        are read once a pass."""
+        if self._open_incidents is None:
+            found = self._paginate("/repos/%s/issues?labels=loom:factory&state=open"
+                                   "&per_page=100" % FACTORY_REPO)
+            self._open_incidents = [i for i in found if isinstance(i, dict)]
+        names = self._repo_subjects(repo)
+        for issue in self._open_incidents:
+            if incident_probe.holds_repo(issue, names):
+                return "%s#%s" % (FACTORY_REPO, issue.get("number"))
+        return ""
+
+    def _named_open_incident(self, issue: Dict[str, Any]) -> str:
+        """The factory incident the ticket's newest hold event names, when it
+        is still open; "" when it names none or that one is closed."""
+        for _, text in status.body_events(issue.get("body")):
+            match = HELD_FOR_RE.search(text)
+            if not match:
+                continue
+            ref = "%s#%s" % (match.group(1), match.group(2))
+            if ref not in self._named_incidents:
+                found = self.gh.rest("GET", "/repos/%s/issues/%s"
+                                     % (match.group(1), match.group(2)), ok=(404,))
+                data = found.data if found.status != 404 else None
+                self._named_incidents[ref] = data if isinstance(data, dict) else None
+            data = self._named_incidents[ref]
+            open_incident = (isinstance(data, dict) and data.get("state") == "open"
+                             and INCIDENT_MARKER in str(data.get("body") or "").splitlines())
+            return ref if open_incident else ""
+        return ""
 
     def _release_one(self, key: str, repo: str, number: int, issue: Dict[str, Any],
                      cleared: bool, text: str) -> None:
@@ -11097,6 +11273,64 @@ class Station:
         event is `_routine`, an edit of the status comment."""
         notify.post(self.gh, repo, number, body, kind)
 
+    # -- sign-in probes (bus/signin.py, loom#3572) --------------------------
+    def _tend_signin_due(self, paused: Set[str]) -> None:
+        if "tend_signin" in paused:
+            _say("step tend_signin paused (LOOM_PAUSED_STEPS)")
+            return
+        try:
+            self.tend_signin()
+        except TargetReached as err:
+            _say("step tend_signin carried over to the next pass: %s" % err)
+        except RateLimited:
+            raise
+        except (GitHubError, OSError, ValueError) as err:
+            _say("tend_signin failed: %s" % err)
+
+    def tend_signin(self) -> None:
+        """Alert, ask and close from the lanes' sign-in probe records."""
+        if not tickets.REPO_RE.fullmatch(FACTORY_REPO):
+            return
+        try:
+            own = self.gh.app_login() or ""
+        except RateLimited:
+            raise
+        except (GitHubError, AttributeError):
+            own = ""  # no own login: no repeat comment is edited, a new one is written
+        signin.Watch(self.gh, FACTORY_REPO, self.s.home, self.state, self.now,
+                     self._signin_alert, _say, self._slot_last_beat,
+                     remote=lambda slot: slot in REMOTE_LANES,
+                     own=own, trusted=self.s.authors).tend()
+
+    def _slot_last_beat(self, slot: str) -> Optional[float]:
+        """The slot's latest heartbeat or keepalive stamp, None with neither."""
+        beat = self._local_beat(slot)
+        at = lane_state.epoch(beat.get("at")) if isinstance(beat, dict) else None
+        age = self._keepalive_age(slot)
+        alive = self.now - age if age is not None else None
+        return max((t for t in (at, alive) if t is not None), default=None)
+
+    def _signin_alert(self, line: str) -> bool:
+        """Send one sign-in alert line; whether it went. LOOM_SIGNIN_ALERT_CMD
+        (a command, the line on its stdin) when set, else the ask webhook with
+        the operator mention, else only the station log."""
+        cmd = os.environ.get("LOOM_SIGNIN_ALERT_CMD", "").strip()
+        if cmd:
+            try:
+                done = subprocess.run(shlex.split(cmd), input=line, text=True,
+                                      capture_output=True, timeout=60)
+            except (OSError, ValueError, subprocess.SubprocessError) as err:
+                _say("sign-in alert command failed (%s); next pass" % type(err).__name__)
+                return False
+            if done.returncode != 0:
+                _say("sign-in alert command exited %d; next pass" % done.returncode)
+            return done.returncode == 0
+        _say(line)
+        if not self.s.webhook_ssm:
+            return True
+        url = self._webhook()
+        return url is not None and self._send(url, line, mention=True)
+
     # -- lane status ------------------------------------------------------
     @staticmethod
     def _utc(at: float) -> str:
@@ -11187,12 +11421,15 @@ class Station:
                     pr_lines: Optional[List[str]] = None) -> str:
         summary = self._spend_shown()
         disk = [line for line in (self._disk_status_line(), self._watchdog_notice()) if line]
+        probes = signin.by_slot(signin.read(self.s.home))
         body = "\n".join(
             [LANES_MARKER, "Updated " + self._utc(self.now),
              station_beat.stamp_line(station_beat.station_settings(os.environ)[0]), ""]
             + (disk + [""] if disk else [])
-            + ["| lane | state | heartbeat (UTC) | reason |", "|---|---|---|---|"]
-            + ["| %s | %s | %s | %s |" % row for row in rows]
+            + ["| lane | state | heartbeat (UTC) | reason | sign-in (UTC) |",
+               "|---|---|---|---|---|"]
+            + ["| %s | %s | %s | %s | %s |" % (tuple(row) + (signin.cell(probes.get(row[0])),))
+               for row in rows]
             + ["", "Remote claims: muse %d/%d" % (
                 self._remote_claim_count("muse"), REMOTE_LANES["muse"]["slots"])]
             + (pr_lines or [])
@@ -11282,6 +11519,9 @@ class Station:
             return
         rows = self._lane_rows()
         values = {lane: state + ": " + reason for lane, state, _, reason in rows}
+        # A new probe result republishes the sign-in column.
+        values["sign-in"] = " ".join(sorted(
+            "%s=%s" % (k, signin.cell(p)) for k, p in signin.read(self.s.home).items()))
         summary = self._spend_shown()
         if summary is not None:
             # A new run (or a budget change) republishes; the clock alone waits
@@ -17204,6 +17444,7 @@ class Station:
         """Give ready queued tickets a free lane after this pass's claims."""
         if self.s.factory_on:
             runner = self._load_factory()
+            runner.preferred_lanes = usage.preferred_weekly_lanes(usage.read_snapshot(self.s.home), self.now)
             runner.assign_queued()
             self._record_waits(runner.waits, runner.settled)
 
@@ -19310,7 +19551,12 @@ def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
         from .github import app_auth_from_env
         gh = GitHub(app_auth_from_env())
         gh.status_in_body = True
-        hooks.setdefault("operator_reader", operator_budget.read_core)
+        # The operator budget is read only with an operator credential the
+        # environment names. An App-only station has none, and each read
+        # failed and logged a line every retry (loom#3304).
+        if any(os.environ.get(name, "").strip()
+               for name in ("LOOM_GITHUB_TOKEN", "GITHUB_TOKEN")):
+            hooks.setdefault("operator_reader", operator_budget.read_core)
     if gh.cache_dir is None:
         # Every GET is conditional: a list re-read each pass costs a 304.
         gh.cache_dir = os.path.join(state, "station", "etags")

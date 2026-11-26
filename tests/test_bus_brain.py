@@ -3077,6 +3077,7 @@ class HeadApprovalMergeTests(unittest.TestCase):
         self.merges = []
         self.commits = [{"sha": HEAD, "author": {"login": "example-lane"},
                          "committer": {"login": "web-flow"}}]
+        self.pushes = [{"actor": {"login": "example-lane"}, "after": HEAD}]
 
     @staticmethod
     def grug(state, commit):
@@ -3126,6 +3127,10 @@ class HeadApprovalMergeTests(unittest.TestCase):
             return reply(200, self.reviews)
         if method == "GET" and path.startswith("/repos/%s/pulls/8/commits" % REPO):
             return reply(200, self.commits)
+        if method == "GET" and path.startswith("/repos/%s/activity" % REPO):
+            if self.pushes is None:
+                return reply(500, {"message": "boom"})
+            return reply(200, self.pushes)
         if method == "GET" and path.startswith("/repos/%s/issues/8/comments" % REPO):
             return reply(200, self.pr_comments)
         if method == "GET" and path.startswith("/repos/%s/issues/9/comments" % REPO):
@@ -3202,6 +3207,38 @@ class HeadApprovalMergeTests(unittest.TestCase):
         self.reviews = []
         self.pr_comments = [self.marker("example-lane")]
         self.refused("no approval on head")
+
+    def test_a_marker_from_the_pusher_of_a_head_commit_does_not_merge(self):
+        self.reviews = []
+        self.pushes = [{"actor": {"login": "example-owner"}, "after": HEAD}]
+        self.pr_comments = [self.marker("example-owner")]
+        self.refused("no approval on head")
+
+    def test_a_marker_from_an_earlier_pusher_does_not_merge(self):
+        self.reviews = []
+        self.pushes = [{"actor": {"login": "example-owner"}, "after": OLD_HEAD},
+                       {"actor": {"login": "example-lane"}, "after": HEAD}]
+        self.pr_comments = [self.marker("example-owner")]
+        self.refused("no approval on head")
+
+    def test_a_marker_with_an_unreadable_pusher_refuses_the_merge(self):
+        self.reviews = []
+        self.pr_comments = [self.marker("example-owner")]
+        for pushes, pattern in ((None, "push activity unreadable"),
+                                ([{"actor": None, "after": HEAD}], "no GitHub login"),
+                                ([{"actor": {"login": "example-lane"}, "after": OLD_HEAD}],
+                                 "pusher of the head is unknown")):
+            self.pushes = pushes
+            self.refused(pattern)
+
+    def test_a_marker_from_a_non_pusher_merges(self):
+        self.reviews = []
+        self.pr_comments = [self.marker("example-owner")]
+        self.assertTrue(self.merge()["merged"])
+
+    def test_the_review_bot_path_does_not_read_pushes(self):
+        self.pushes = None
+        self.assertTrue(self.merge()["merged"])
 
     def test_a_marker_for_an_older_head_does_not_merge(self):
         self.reviews = []

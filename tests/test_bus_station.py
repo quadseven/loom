@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from unittest import mock
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -111,6 +112,8 @@ class FakeGitHub:
         self.check_runs = {}
         self.pull_files = {}
         self.carried = set()
+        # Side branches that hold commits the default branch lacks.
+        self.side_edits = set()
         self.check_runs_status = 200
         self.head_files = {}
         # Commit sha -> the files it changed, for a "Fixed in <sha>" answer.
@@ -334,7 +337,9 @@ class FakeGitHub:
                 return reply(200, page_items, headers)
             return reply(200, self.pulls)
         if method == "GET" and rest.startswith("compare/"):
-            base = rest[len("compare/"):].split("...", 1)[0]
+            base, head = (rest[len("compare/"):].split("...", 1) + [""])[:2]
+            if head in self.side_edits:
+                return reply(200, {"status": "ahead", "ahead_by": 1})
             return reply(200, {"status": "ahead" if base in self.carried else "behind"})
         runs = re.match(r"commits/([0-9a-f]{40})/check-runs$", rest)
         if method == "GET" and runs:
@@ -5163,7 +5168,9 @@ class CorruptStateTest(Base):
         # The invariant pass also reads the completed scheduled workflow runs.
         # The invariant pass reads open tickets for verify handoff coverage
         # and stale live checks (loom#3509).
-        self.assertEqual(self.run_pass().requests, 24)
+        # The factory release reads the queued wait:incident tickets the hold
+        # ledger does not know, once every 15 minutes (loom#3573).
+        self.assertEqual(self.run_pass().requests, 25)
 
 
 class TicketsTest(unittest.TestCase):
@@ -6015,6 +6022,46 @@ class ClaimTest(Base):
         self.assertFalse(st._heartbeat_ok("spark"))
         self.assertTrue(st._heartbeat_ok("codex"))
 
+    def test_queued_work_prefers_a_lane_with_unspent_weekly_allowance(self):
+        self.settings.factory_on = True
+        self.heartbeat("spark")
+        now = int(time.time())
+
+        def reading(window, used, reset_in, age=0):
+            def stamp(at):
+                return datetime.fromtimestamp(at, timezone.utc).isoformat()
+
+            return {"lanes": ["codex"], "window": window, "used_pct": used,
+                    "resets_at": stamp(now + reset_in), "observed_at": stamp(now - age)}
+
+        weekly = reading("weekly", 49, 3600)
+        short_at_limit = reading("5-hour", 100, 1800)
+        short_at_limit["as_of"] = short_at_limit.pop("observed_at")
+        for number, (difficulty, rows, available, chosen) in enumerate((
+                ("medium", [weekly], True, "codex"),
+                ("medium", [weekly, short_at_limit], True, "spark"),
+                ("medium", [weekly], False, "spark"),
+                ("medium", [reading("weekly", 50, 3600)], True, "spark"),
+                ("medium", [reading("weekly", 49, 86400)], True, "spark"),
+                ("medium", [reading("weekly", 49, -1)], True, "spark"),
+                ("medium", [reading("weekly", 49, 3600, 7201)], True, "spark"),
+                # Lanes are chosen by cost whatever the Difficulty: line, so the
+                # unspent allowance is preferred for an easy ticket too.
+                ("easy", [weekly], True, "codex"),
+        ), start=20):
+            with self.subTest(number=number):
+                self.heartbeat("codex", available=available)
+                station.usage.write(self.home, rows)
+                self.fake.add(number, state="queued",
+                              body="Difficulty: %s\n\n## Why\nx\n\n## Acceptance criteria\n\n- [ ] x\n"
+                              % difficulty)
+                self.fake.issues[number]["labels"].pop()
+                st = station.Station(GitHub("token", transport=self.fake), self.settings, now=now)
+                st.assign_queued()
+                names = self.fake.names(number)
+                del self.fake.issues[number]
+                self.assertIn("lane:" + chosen, names)
+
     def test_a_half_done_claim_is_dropped_when_the_ticket_is_no_longer_trusted(self):
         self.fake.add(12, editor="stranger")
         name = "example-owner.example-repo-12"
@@ -6249,6 +6296,59 @@ class FixTest(Base):
         self.run_pass()
 
         self.assertIn("kept its edits on branch %s" % side, self.claimed_brief())
+
+    UNVALIDATED = "loom/12-fix-the-thing-unvalidated-1760000000"
+    RED = ("Lane spark failed: [work] validation failed: the remote check was red at b32bd921fc17 "
+           "(failing: test_a.ATest.test_one, test_b.BTest.test_two); the edits are on branch "
+           "%s; no pull request opened" % UNVALIDATED)
+
+    def red_attempt(self, *later):
+        self.fake.add(12)
+        self.comment(12, "Claimed for lane spark (body sha256 0123456789ab)", author="station-example")
+        self.comment(12, self.RED)
+        for body in later:
+            self.comment(12, body)
+
+    def test_a_retry_after_a_red_final_check_resumes_its_branch_and_names_the_tests(self):
+        self.fake.side_edits.add(self.UNVALIDATED)
+        self.red_attempt()
+        self.run_pass()
+        section = self.claimed_brief().split("\n## Earlier attempt\n", 1)[1]
+        self.assertIn("final check failed", section)
+        self.assertIn("kept its edits on branch %s." % self.UNVALIDATED, section)
+        self.assertIn("- `test_a.ATest.test_one`\n- `test_b.BTest.test_two`\n", section)
+
+    def test_a_forged_clause_naming_another_branch_is_not_offered(self):
+        other = "loom/77-another-ticket-unvalidated-1760000000"
+        self.fake.side_edits.add(other)
+        self.fake.side_edits.add(self.UNVALIDATED)
+        self.fake.add(12)
+        self.comment(12, "Claimed for lane spark (body sha256 0123456789ab)", author="station-example")
+        self.comment(12, "Lane spark failed: [work] validation failed: the check exited 1 at abc; "
+                         "the edits are on branch %s; no pull request opened" % other)
+        self.comment(12, "Lane spark failed: [work] note: the edits are on branch %s; then "
+                         "agent exited 1" % self.UNVALIDATED.replace("1760000000", "1"))
+        self.run_pass()
+        self.assertNotIn("Earlier attempt", self.claimed_brief())
+
+    def test_a_red_check_branch_with_no_edits_is_not_offered(self):
+        # A run with no commit still names a side branch, which only holds the base.
+        self.red_attempt()
+        self.run_pass()
+        self.assertNotIn("Earlier attempt", self.claimed_brief())
+
+    def test_a_red_check_branch_older_than_a_pull_request_is_not_offered(self):
+        self.fake.side_edits.add(self.UNVALIDATED)
+        self.red_attempt("Lane codex opened a pull request: https://example.com/pull/99")
+        self.run_pass()
+        self.assertNotIn("Earlier attempt", self.claimed_brief())
+
+    def test_a_fix_brief_resumes_only_a_timed_out_branch(self):
+        self.fake.side_edits.add(self.UNVALIDATED)
+        self.red_attempt("Lane codex opened a pull request: https://example.com/pull/99", FIX_BODY)
+        self.comment(12, self.RED)
+        self.run_pass()
+        self.assertNotIn("Earlier attempt", self.claimed_brief())
 
     def test_a_fix_for_a_pull_request_that_merged_is_never_briefed(self):
         # Three fix rounds in two hours were briefed for pull requests that
@@ -10581,7 +10681,8 @@ class SpendTest(Base):
                       body=BODY_WITH_CRITERIA.replace("Model: model-x", "Model: claude-sonnet-5-5"))
         st.run_pass()
         self.assertEqual(self.listing("anthropic-4"), [])
-        self.assertIn("Under the $5.00 floor: the anthropic slots take no work.",
+        self.assertIn("Under the $5.00 floor: only the anthropic slots (anthropic to "
+                      "anthropic-8) take no work; every other lane takes briefs as usual.",
                       self.fake.posts[0])
         self.assertIn("| anthropic-4 | parked |", self.fake.posts[0])
         # Above the floor, the same heartbeat takes work again.

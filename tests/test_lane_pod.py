@@ -5,8 +5,10 @@ each start."""
 
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -65,12 +67,116 @@ class LanePodTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.log.read_text().splitlines(), ["zen sandbox=seatbelt drop=0"])
 
+    def test_a_drain_mark_left_by_an_earlier_container_is_cleared(self):
+        # run/ outlives a container restart within the pod; a mark left there
+        # would keep the new container's runners from taking any brief.
+        run = self.home / "run"
+        run.mkdir(parents=True)
+        (run / "zen.drain").touch()
+        (run / "codex.drain").touch()
+        result = self.pod(LOOM_POD_SLOTS="zen")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((run / "zen.drain").exists())
+        self.assertTrue((run / "codex.drain").exists())
+
+    # The drain: a stopping pod marks run/<slot>.drain so each
+    # runner takes no new brief, waits LOOM_POD_DRAIN_SECONDS for the runs in
+    # flight, then stops each agent still running (the process group in
+    # run/<slot>.lock/pgid) and waits LOOM_POD_PRESERVE_SECONDS for its runner
+    # to keep the run before the pod exits.
+    DRAIN_RUNNER = """#!/usr/bin/env bash
+slot="$1"
+mkdir -p "$LOOM_HOME/run/$slot.lock"
+set -m
+sleep "$FAKE_AGENT_SECONDS" &
+agent=$!
+set +m
+echo "$agent" > "$LOOM_HOME/run/$slot.lock/pgid"
+echo "start $slot" >> "$FAKE_LOG"
+wait "$agent"
+status=$?
+[ ! -e "$LOOM_HOME/run/$slot.drain" ] || echo "drain-seen $slot" >> "$FAKE_LOG"
+echo "agent-exit $slot $status" >> "$FAKE_LOG"
+"""
+
+    def stop_pod_mid_run(self, timeout=30, **env):
+        (self.root / "lanes" / "run_lane.sh").write_text(self.DRAIN_RUNNER)
+        full = {"PATH": os.environ["PATH"], "LOOM_HOME": str(self.home), "FAKE_LOG": str(self.log),
+                "LOOM_POD_SLOTS": "zen", "LOOM_POD_INTERVAL": "3600", **env}
+        proc = subprocess.Popen(["bash", str(self.root / "lanes" / "k8s" / "pod.sh")], env=full,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            deadline = time.monotonic() + 10
+            while not (self.log.exists() and "start zen" in self.log.read_text()):
+                self.assertLess(time.monotonic(), deadline, "the runner never started")
+                time.sleep(0.05)
+            started = time.monotonic()
+            proc.send_signal(signal.SIGTERM)
+            proc.communicate(timeout=timeout)
+            return proc.returncode, time.monotonic() - started
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+
+    def test_a_stopping_pod_lets_a_run_that_ends_in_time_finish(self):
+        code, _ = self.stop_pod_mid_run(FAKE_AGENT_SECONDS="2", LOOM_POD_DRAIN_SECONDS="20")
+        self.assertEqual(code, 143)
+        lines = self.log.read_text().splitlines()
+        self.assertIn("drain-seen zen", lines)
+        self.assertIn("agent-exit zen 0", lines)
+        self.assertTrue((self.home / "run" / "zen.drain").exists())
+
+    def test_a_stopping_pod_stops_an_agent_past_the_bound_and_lets_its_runner_keep_the_run(self):
+        code, took = self.stop_pod_mid_run(FAKE_AGENT_SECONDS="60", LOOM_POD_DRAIN_SECONDS="1",
+                                           LOOM_POD_PRESERVE_SECONDS="20")
+        self.assertEqual(code, 143)
+        lines = self.log.read_text().splitlines()
+        # The agent got SIGTERM (128 + 15) and its runner went on to the end.
+        self.assertIn("agent-exit zen 143", lines)
+        self.assertIn("drain-seen zen", lines)
+        self.assertLess(took, 15)
+
     def test_bad_settings_start_nothing(self):
-        for env in ({}, {"LOOM_POD_SLOTS": "zen ../x"}, {"LOOM_POD_SLOTS": "zen", "LOOM_POD_INTERVAL": "0"}):
+        for env in ({}, {"LOOM_POD_SLOTS": "zen ../x"}, {"LOOM_POD_SLOTS": "zen", "LOOM_POD_INTERVAL": "0"},
+                    {"LOOM_POD_SLOTS": "zen", "LOOM_POD_DRAIN_SECONDS": "x"},
+                    {"LOOM_POD_SLOTS": "zen", "LOOM_POD_PRESERVE_SECONDS": "-1"}):
             with self.subTest(env=env):
                 result = self.pod(**env)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse(self.log.exists())
+
+    # The sign-in probe (lanes/signin_probe.sh, loom#3572): one per sign-in
+    # lane with a slot here, covering every slot of that lane.
+    FAKE_PROBE = """#!/usr/bin/env bash
+echo "probe $*" >> "$FAKE_LOG"
+"""
+
+    def with_fake_probe(self):
+        probe = self.root / "lanes" / "signin_probe.sh"
+        probe.write_text(self.FAKE_PROBE)
+        probe.chmod(0o755)
+
+    def test_one_round_probes_each_sign_in_lane_over_all_its_slots(self):
+        self.with_fake_probe()
+        result = self.pod(LOOM_POD_SLOTS="codex codex-2 codex-12 zen")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = self.log.read_text().splitlines()
+        self.assertEqual([line for line in lines if line.startswith("probe")],
+                         ["probe codex codex-2 codex-12"])
+
+    def test_no_probe_for_api_lanes_or_when_turned_off(self):
+        self.with_fake_probe()
+        for env in ({"LOOM_POD_SLOTS": "zen opencode-go-5"},
+                    {"LOOM_POD_SLOTS": "claude", "LOOM_SIGNIN_PROBE_INTERVAL": "0"},
+                    {"LOOM_POD_SLOTS": "claude", "LOOM_SIGNIN_LANES": ""}):
+            with self.subTest(env=env):
+                if self.log.exists():
+                    self.log.unlink()
+                result = self.pod(**env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(any(line.startswith("probe")
+                                     for line in self.log.read_text().splitlines()))
 
 
 if __name__ == "__main__":
