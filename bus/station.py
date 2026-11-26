@@ -9105,6 +9105,8 @@ class Station:
             done = flake.rerun_once(self.gh, repo, runs, flaky)
             if not done:
                 return False
+        except GitHubOutage:
+            raise
         except GitHubError as err:
             self._cannot_re_run(repo, err)
             return False
@@ -9208,10 +9210,9 @@ class Station:
 
     def _weakened_tests(self, repo: str, pr_number: int) -> List[str]:
         """The weakened-test lines in a lane pull request's diff
-        (bus/weakened.py), read from the files GitHub lists for it, page
-        by page while a page comes back full. A read that fails names
-        none: the evaluation goes as it did before the pre-check, and the
-        review remains the backstop."""
+        (bus/weakened.py), read from the files GitHub lists for it. Ordinary
+        read errors leave the review as the backstop. A GitHub outage
+        pauses evaluation."""
         try:
             entries = self.gh.rest("GET", "/repos/%s/pulls/%d/files?per_page=100"
                                    % (repo, pr_number)).data
@@ -9224,6 +9225,8 @@ class Station:
                     break
                 entries = entries + more
                 page += 1
+        except GitHubOutage:
+            raise
         except (GitHubError, ValueError, TypeError, AssertionError) as err:
             _say("weakened-test pre-check: could not read %s#%d files (%s)"
                  % (repo, pr_number, err))
@@ -9281,18 +9284,22 @@ class Station:
 
     def _trunk_for(self, repo: str, issue: Dict[str, Any]) -> str:
         """The goal home's Trunk branch, else the repo's default branch, else
-        "". An unreadable goal home or repo reads as no trunk, so a pull
-        request whose base cannot be compared is not blocked here."""
+        "". Ordinary read errors leave the trunk unknown. A GitHub outage
+        pauses evaluation."""
         trunk = ""
         try:
             goal = brain._goal_home_for_ticket(self.gh, repo, issue)
             if isinstance(goal, dict):
                 trunk = str(brain.goal_trunk(goal) or "")
+        except GitHubOutage:
+            raise
         except (GitHubError, ValueError, TypeError):
             trunk = ""
         if not trunk:
             try:
                 trunk = self._default_branch(repo)
+            except GitHubOutage:
+                raise
             except (GitHubError, ValueError, TypeError):
                 trunk = ""
         return trunk
@@ -9300,9 +9307,12 @@ class Station:
     def _has_pull_request_workflow(self, repo: str) -> bool:
         """Whether the repo has a workflow that runs on pull_request: only then
         does the repo's own CI need to have run on a lane pull request's head
-        for it to be ready. An unreadable workflow list reads as none."""
+        for it to be ready. Ordinary read errors fall back to no workflow
+        evidence. A GitHub outage pauses evaluation."""
         try:
             listing = self.gh.rest("GET", "/repos/%s/contents/.github/workflows" % repo).data
+        except GitHubOutage:
+            raise
         except (GitHubError, ValueError, TypeError, AssertionError):
             return False
         if not isinstance(listing, list):
@@ -9315,6 +9325,8 @@ class Station:
                 continue
             try:
                 workflow = self._contents_text(repo, path)
+            except GitHubOutage:
+                raise
             except (GitHubError, ValueError, TypeError, AssertionError):
                 continue
             if workflow is not None and _has_pull_request_trigger(workflow):
@@ -9328,6 +9340,8 @@ class Station:
         try:
             data = self.gh.rest("GET", "/repos/%s/commits/%s/check-runs?per_page=100"
                                 % (repo, sha)).data or {}
+        except GitHubOutage:
+            raise
         except (GitHubError, ValueError, TypeError, AssertionError):
             return False
         runs = data.get("check_runs") or []
@@ -18893,6 +18907,7 @@ class Station:
         # still prunes lane trees, tends the disk and sends its snapshots.
         # From loom#1915 until this change every such pass skipped them, and
         # no lane tree was pruned for hours on 2026-10-26.
+        paused = False
         try:
             self.ask_operator_login()
             self._publish_lanes_when_old()
@@ -18977,8 +18992,14 @@ class Station:
             except (GitHubError, OSError) as err:
                 _say("watch_logs failed: %s" % err)
             self._refresh_shipped_priority_stamp()
+        except GitHubOutage:
+            paused = True
+            raise
         finally:
-            self._end_pass_locally()
+            if paused:
+                self._end_pass_locally(ask_about_disk=False)
+            else:
+                self._end_pass_locally()
 
     def compare_send_back_counts(self) -> None:
         """Run the one seven-day comparison of bus/send_back.py, at most
@@ -19041,19 +19062,18 @@ class Station:
                 self._comment(repo, send_back.TICKET, report, "report")
         _write_json(path, {"completed": True, "compared_at": self.now, "counts": found})
 
-    def _end_pass_locally(self) -> None:
-        """Local housekeeping that needs no GitHub request: finished lane
-        trees, old lane logs, the disk, the usage snapshot and the command
-        chain snapshot."""
+    def _end_pass_locally(self, *, ask_about_disk: bool = True) -> None:
+        """Tend local state, and report a disk warning when GitHub is available."""
         for local in (self.prune_trees, self.tend_watchdog, self.tend_disk):
             try:
                 local()
             except OSError as err:
                 _say("%s failed: %s" % (local.__name__, err))
-        try:
-            self._check_disk_guard_ask()
-        except (GitHubError, OSError) as err:
-            _say("disk guard ask failed: %s" % err)
+        if ask_about_disk:
+            try:
+                self._check_disk_guard_ask()
+            except (GitHubError, OSError) as err:
+                _say("disk guard ask failed: %s" % err)
         self._tend_usage()
 
     def _tend_usage(self) -> None:
@@ -19256,28 +19276,30 @@ def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
     if gh.cache_dir is None:
         # Every GET is conditional: a list re-read each pass costs a 304.
         gh.cache_dir = os.path.join(state, "station", "etags")
+    gh.outage_aware = True
     app = getattr(gh, "app", None)
     if app is not None and getattr(app, "state_file", None) is None:
         # GitHub's ETags differ per token: keep the App token across
         # passes (0600) so last pass's ETags still answer 304 (loom#1306).
         app.state_file = os.path.join(state, "station", "app-token.json")
     beat = None
-    if settings.status_repo and station_beat.enabled(os.environ):
-        # The cross-station guard (loom#3050): stand by while another
-        # station's beat is fresh, whatever backend either one uses.
-        station_id, leased = station_beat.station_settings(os.environ)
-        beat = station_beat.Guard(gh, settings.status_repo, station_id, leased,
-                                  LANES_MARKER, say=_say)
-        reason = beat.verdict()
-        if reason:
-            _say("another station is running: %s; standing by" % reason)
-            return 0
-        beat.stamp()
-    # A 5xx or a dead connection ends the pass on an outage (loom#3567).
-    gh.outage_aware = True
-    st = Station(gh, settings, **hooks)
-    st.priority_repos = list(priority)
+    st = None
+    paused = False
     try:
+        if getattr(gh, "outage", False) is True:
+            raise GitHubOutage("the outage flag is set", 0, "", int(time.time()))
+        if settings.status_repo and station_beat.enabled(os.environ):
+            # Stand by while another station has a fresh beat (loom#3050).
+            station_id, leased = station_beat.station_settings(os.environ)
+            beat = station_beat.Guard(gh, settings.status_repo, station_id, leased,
+                                      LANES_MARKER, say=_say)
+            reason = beat.verdict()
+            if reason:
+                _say("another station is running: %s; standing by" % reason)
+                return 0
+            beat.stamp()
+        st = Station(gh, settings, **hooks)
+        st.priority_repos = list(priority)
         if use_launchd:
             st._refresh_lane_jobs()
         st.sample_operator_budget()
@@ -19289,6 +19311,7 @@ def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
         if outcome is not None:
             outcome["passed"] = True
     except GitHubOutage as err:
+        paused = True
         _say("GitHub outage: %s; the pass paused, nothing parked or failed" % err)
     except (RateLimited, TargetReached) as err:
         _say("%s; the pass stopped there" % err)
@@ -19296,11 +19319,15 @@ def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
         _say("stopping: %s" % err)
         return 1
     finally:
-        try:
-            st.end_pass()
-        finally:
-            # Even when end_pass raises, the beat is renewed, so a slow pass
-            # does not read as a stopped station.
-            if beat is not None:
-                beat.renew()
+        if st is not None:
+            try:
+                st.end_pass()
+            finally:
+                # Renew after a slow pass even when local cleanup fails.
+                # An outage ends GitHub work for this pass.
+                if beat is not None and not paused:
+                    try:
+                        beat.renew()
+                    except GitHubOutage as err:
+                        _say("GitHub outage: %s; could not renew the station beat" % err)
     return 0

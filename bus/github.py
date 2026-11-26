@@ -766,6 +766,7 @@ class GitHub:
         ticket's first comments page makes for its body's status section
         (_with_body_events), so a caller that already holds that issue
         (bus/issue_reads.py) does not read it again (loom#2078)."""
+        self._check_outage(method, path)
         body = self._without_mentions(method, body)
         body = self._keep_status_section(method, path, body)
         body = self._guard_public_write(method, path, body)
@@ -824,6 +825,8 @@ class GitHub:
         if repo not in self._repo_private_cache:
             try:
                 data = self.rest("GET", "/repos/%s" % repo, ok=(403, 404)).data
+            except GitHubOutage:
+                raise
             except GitHubError:
                 data = None
             private = data.get("private") if isinstance(data, dict) else None
@@ -916,6 +919,8 @@ class GitHub:
             data = self.rest("POST", "/graphql",
                              {"query": lookup, "variables": {"id": thread_id}}).data
             repo = data["data"]["node"]["pullRequest"]["repository"]["nameWithOwner"]
+        except GitHubOutage:
+            raise
         except (GitHubError, KeyError, TypeError) as err:
             raise GitHubError(
                 "refusing public review reply: could not identify target repository"
@@ -1143,6 +1148,8 @@ class GitHub:
             return None
         try:
             return self._rest("GET", "/repos/%s/issues/%d" % (found.repo, found.number)).data
+        except GitHubOutage:
+            raise
         except Exception:  # noqa: BLE001 - any failed read holds the action
             return None
 
@@ -1168,13 +1175,14 @@ class GitHub:
         held or it is about to expire; GitHubError when the client has no App."""
         if self.app is None:
             raise GitHubError("this client holds a personal token, not a GitHub App")
+        self._check_outage("POST", "installation access token")
         return self.app.token(self._mint_app_token)
 
     def _bearer(self) -> str:
         """The token for the Authorization header."""
         if self.app is None:
             return str(self._token)
-        return self.app.token(self._mint_app_token)
+        return self.app_token()
 
     def _mint_app_token(self, path: str, jwt: str) -> Tuple[str, Any]:
         """POST for a new installation token, authenticated with the App's
@@ -1184,11 +1192,8 @@ class GitHub:
                    "Accept": "application/vnd.github+json",
                    "X-GitHub-Api-Version": "2022-11-28",
                    "User-Agent": "loom-bus"}
-        url = self._url(path)
-        status, _, raw = self._transport_with_retry("POST", url, headers, None)
-        with self._count_lock:
-            self.kinds["app token"] = self.kinds.get("app token", 0) + 1
-        text = (raw or b"").decode("utf-8", "replace")
+        status, _, text = self._send("POST", self._url(path), headers, None,
+                                     app_kind="app token")
         data = _json_or_none(text)
         if status != 201 or not isinstance(data, dict):
             # GitHub's own reason ("Bad credentials", "Integration not found")
@@ -1211,6 +1216,8 @@ class GitHub:
         if self.app is not None:
             try:
                 login = self.app_login()
+            except GitHubOutage:
+                raise
             except GitHubError:
                 login = None
             if login:
@@ -1225,14 +1232,14 @@ class GitHub:
         if self.app is None:
             return None
         if self._app_login is None:
+            self._check_outage("GET", "/app")
             headers = {"Authorization": "Bearer " + self.app.jwt(),
                        "Accept": "application/vnd.github+json",
                        "X-GitHub-Api-Version": "2022-11-28",
                        "User-Agent": "loom-bus"}
-            status, _, raw = self._transport_with_retry("GET", self._url("/app"), headers, None)
-            with self._count_lock:
-                self.kinds["app login"] = self.kinds.get("app login", 0) + 1
-            data = _json_or_none((raw or b"").decode("utf-8", "replace"))
+            status, _, text = self._send("GET", self._url("/app"), headers, None,
+                                         app_kind="app login")
+            data = _json_or_none(text)
             slug = data.get("slug") if isinstance(data, dict) else None
             if status != 200 or not isinstance(slug, str) or not slug.strip():
                 raise GitHubError("could not read the GitHub App's slug: GET /app -> %d" % status,
@@ -1240,36 +1247,45 @@ class GitHub:
             self._app_login = slug.strip() + "[bot]"
         return self._app_login
 
-    def _send(self, method: str, url: str, headers: Dict[str, str],
-              payload: Optional[bytes]) -> Tuple[int, Dict[str, str], str]:
-        """One request on the wire, counted: status, lower-cased headers, text.
-        A budget refusal raises RateLimited, and so does every later call until
-        the window resets, without a request."""
-        path = urlsplit(url).path
-        if self.limited_until is not None and time.time() < self.limited_until:
-            raise RateLimited("%s %s: GitHub budget exhausted until %s" % (
-                method, path, _utc(self.limited_until)), 403, "", self.limited_until)
+    def _check_outage(self, method: str, path: str) -> None:
         if self.outage_aware and self.outage:
             raise GitHubOutage("%s %s: GitHub outage flag is set" % (method, path),
                                0, "", int(time.time()))
+
+    def _send(self, method: str, url: str, headers: Dict[str, str],
+              payload: Optional[bytes], *,
+              app_kind: Optional[str] = None) -> Tuple[int, Dict[str, str], str]:
+        """One request on the wire, counted: status, lower-cased headers, text.
+        REST and GraphQL budget refusals stop those requests until the
+        window resets. App JWT requests have their own budget and counts."""
+        path = urlsplit(url).path
+        self._check_outage(method, path)
+        if app_kind is None and self.limited_until is not None and time.time() < self.limited_until:
+            raise RateLimited("%s %s: GitHub budget exhausted until %s" % (
+                method, path, _utc(self.limited_until)), 403, "", self.limited_until)
         try:
             status, raw_headers, raw = self._transport_with_retry(
-                method, url, headers, payload, track_rate=True)
+                method, url, headers, payload, track_rate=app_kind is None)
         except GitHubError as err:
             if (self.outage_aware and err.status == 0
                     and not isinstance(err, (RateLimited, ShadowHeld))):
                 raise GitHubOutage("%s %s: GitHub unreachable: %s" % (method, path, err),
                                    0, "", int(time.time())) from None
             raise
-        if self.outage_aware and status >= 500:
+        if app_kind is None:
             self._count(method, url, status)
+        else:
+            with self._count_lock:
+                self.kinds[app_kind] = self.kinds.get(app_kind, 0) + 1
+        if self.outage_aware and status >= 500:
             raise GitHubOutage("%s %s -> %d: GitHub outage" % (method, path, status),
                                status, "", int(time.time()))
         resp_headers = {str(k).lower(): v for k, v in (raw_headers or {}).items()}
+        text = (raw or b"").decode("utf-8", "replace")
+        if app_kind is not None:
+            return status, resp_headers, text
         # Read before any error is raised: a 403 at the limit carries them.
         self._note_rate(resp_headers)
-        self._count(method, url, status)
-        text = (raw or b"").decode("utf-8", "replace")
         until = rate_limit_until(status, resp_headers, text, time.time())
         if until is not None:
             self.limited_until = until
