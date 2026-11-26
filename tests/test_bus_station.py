@@ -646,6 +646,11 @@ class Base(unittest.TestCase):
         # disk (loom#2403). The disk-guard tests set their own floor.
         self.settings = station.Settings(self.home, [REPO], list(AUTHORS), list(OWNERS),
                                          disk_free_min_gb=0)
+        # The Usage pass reads codex session logs; never the test machine's
+        # own, whose readings would change the pace line between passes.
+        sessions = mock.patch.dict(os.environ, {"LOOM_CODEX_SESSIONS": os.path.join(self._tmp.name, "no-sessions")})
+        sessions.start()
+        self.addCleanup(sessions.stop)
         self.heartbeat("codex")
 
     def heartbeat(self, lane, available=True, age=0, limited_models=None):
@@ -7217,6 +7222,31 @@ class RetryTest(Base):
         self.assertEqual(self.bodies()[-1],
                          "Lane codex failed: [work] agent made no commit on loom/12-fix-the-thing")
         self.assertEqual(self.listing("codex-2"), [])
+
+    def _old_failed_runs(self, count):
+        """`count` claims over days, each ended by a different work failure."""
+        rows = []
+        for n in range(count):
+            at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - (30 - n) * 86400))
+            rows.append({"body": "Claimed for lane codex (body sha256 0123456789ab)",
+                         "created_at": at, "user": {"login": "alice-example"}})
+            rows.append({"body": "Lane codex failed: [work] reason number %d" % n,
+                         "created_at": at, "user": {"login": "alice-example"}})
+        return rows
+
+    def test_failed_runs_past_the_cap_hold_the_ticket_though_each_differs(self):
+        self.failed(body=BODY_WITH_CRITERIA, reason="[work] the newest reason")
+        self.fake.comments[12][:0] = self._old_failed_runs(8)
+        self.run_pass()
+        self.assertIn("loom:runaway", self.fake.names(12))
+        self.assertIn("Runaway: ", self.bodies()[-1])
+        self.assertIn("failed runs since the last brief.", self.bodies()[-1])
+
+    def test_failed_runs_under_the_cap_do_not_hold_the_ticket(self):
+        self.failed(body=BODY_WITH_CRITERIA, reason="[work] the newest reason")
+        self.fake.comments[12][:0] = self._old_failed_runs(3)
+        self.run_pass()
+        self.assertNotIn("loom:runaway", self.fake.names(12))
 
     def test_three_recent_attempts_with_no_earlier_failure_flag_the_ticket(self):
         self.failed(body=BODY_WITH_CRITERIA, reason="[work] agent made no commit on loom/12-fix-the-thing")
@@ -16298,6 +16328,33 @@ class RemoteClaimCountTest(unittest.TestCase):
             runner = self.runner()
             body = runner._lanes_body(runner._lane_rows())
         self.assertIn("Remote claims: muse 1/4", body)
+
+
+class PaceTest(Base):
+    """loom#3630: each pass the station paces every windowed subscription and
+    the lane status shows used, elapsed and verdict per subscription."""
+
+    def test_a_pass_writes_the_pace_plan_and_the_status_shows_it(self):
+        from bus import pace
+        now = time.time()
+        reset = datetime.fromtimestamp(now + 0.5 * 10080 * 60, timezone.utc).isoformat()
+        rows = [{"provider": "codex", "lanes": ["codex", "codex-2"], "window": "weekly",
+                 "used_pct": 2.0, "window_minutes": 10080, "resets_at": reset,
+                 "observed_at": datetime.fromtimestamp(now - 60, timezone.utc).isoformat()}]
+        waits = {"%s#%d" % (REPO, 7): {"reason": "no free lane", "since": now, "seen": now}}
+        self.write(os.path.join(self.home, "state", "station", "ticket-waits.json"), json.dumps(waits))
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        with mock.patch.object(station.usage, "collect", return_value=rows), \
+                mock.patch.object(runner, "_refresh_model_catalogue"), \
+                mock.patch.object(runner, "post_chain"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            runner._tend_usage()
+            body = runner._lanes_body(runner._lane_rows())
+        plan = pace.read(self.home)["providers"]["codex"]
+        self.assertEqual((plan["verdict"], plan["open"], plan["max"], plan["want"]),
+                         (pace.BEHIND, 1, 2, 2))
+        self.assertIn("Pace (slack 10 points): codex weekly 2% used, 50% elapsed, behind; "
+                      "slots 1 of 2, asks for 2", body)
 
 
 class RunnerSlotClaimTest(Base):

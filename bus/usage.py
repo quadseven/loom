@@ -146,10 +146,15 @@ def _read_codex_sessions(sessions: Path, now: float) -> Dict[str, Dict[str, Any]
     return readings
 
 
-def codex_records(lanes: List[str], sessions: Path, now: float) -> List[Dict[str, Any]]:
+def codex_records(lanes: List[str], sessions: Path, now: float,
+                  home: Optional[str] = None) -> List[Dict[str, Any]]:
     if not sessions.is_dir():
-        # The collector reads the session logs of the machine it runs on; a
-        # machine where codex never ran has none, and says so.
+        # The collector reads the session logs of the machine it runs on. In
+        # the cluster they live in the codex lane's own Codex home, which the
+        # station does not mount, so the lane writes them to the shared Loom
+        # home as state/usage/<slot>.meter.json (bus/meter.py codex_record).
+        if home is not None and _newest_meter(home, lanes) is not None:
+            return _meter_records("codex", home, lanes, now)
         return [_record("codex", lanes, "all", None, None, None, None, "codex session logs", now,
                         "no codex session logs on this machine")]
     found = _read_codex_sessions(sessions, now)
@@ -451,7 +456,7 @@ def collect(home: str, env: Optional[Dict[str, str]] = None, now: Optional[float
         "anthropic": lambda _home, slots, settings, stamp: anthropic_records(_home, slots, settings, stamp),
         "codex": lambda _home, slots, settings, stamp: codex_records(
             slots, sessions or Path(settings.get("LOOM_CODEX_SESSIONS")
-                                    or Path.home() / ".codex" / "sessions"), stamp),
+                                    or Path.home() / ".codex" / "sessions"), stamp, _home),
         "opencode-go": _opencode_records,
         "spark": _spark_records,
         "claude": lambda _home, slots, _settings, stamp: _cli_meter_records("claude", _home, slots, stamp),

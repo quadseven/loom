@@ -44,6 +44,7 @@ from . import brain_memory
 from . import brain_hold
 from . import claimed
 from . import human_claims
+from . import lane_feed
 from . import claim_referee
 from . import close_audit
 from . import closing
@@ -53,6 +54,7 @@ from . import journal
 from . import lane_markers
 from . import log_capture
 from . import operator_budget
+from . import pace
 from . import fabric, fabric_reviews
 from . import fixrounds
 from . import logrotate
@@ -128,6 +130,9 @@ HEARTBEAT_MAX_AGE = lane_state.HEARTBEAT_MAX_AGE
 BRIEFED = "loom:briefed"
 RUNNING = "loom:running"
 RUNAWAY = "loom:runaway"
+# Work attempts since a ticket's last brief after which it is held as a runaway
+# (LOOM_FAILED_RUN_CAP sets it; 0 turns it off).
+FAILED_RUN_CAP = 8
 # How often the station moves tickets under no epic or a closed epic into an
 # open intake epic, matching the closed-epic invariant's check interval.
 OUTSIDE_EPIC_EVERY = invariants.CHECK_EVERY
@@ -1800,6 +1805,35 @@ def _int_or_default(raw: str, default: int) -> int:
         return int(raw.strip())
     except ValueError:
         return default
+
+
+def _is_work_attempt(reason: str) -> bool:
+    """Whether an attempt ending counts as a work attempt rather than a
+    non-work exit ([transient], [limit], [auth], or [factory])."""
+    return not reason or failure_class(reason) not in NOT_WORK
+
+
+def _runaway_trigger(now: float, comments: list, work: list, reason: str) -> str:
+    """Return the runaway trigger description when a ticket should be held,
+    or empty string otherwise."""
+    failures = [a[3] for a in work[:-1] if a[3]]
+    same_reason = bool(failures) and (
+        failures[-1] == reason
+        or (factory.is_timeout(failures[-1]) and factory.is_timeout(reason))
+    )
+    if same_reason:
+        return "repeated failure reason"
+    recent = [a for a in work if a[0] >= now - 6 * 3600]
+    if len(recent) >= 3:
+        return "three attempts within six hours"
+    # Failures that differ and spread over days trip neither test above: a
+    # ticket reached its fiftieth run that way. Work attempts since the
+    # last brief past the cap hold it; a new brief starts the count again.
+    cap = _int_or_default(os.environ.get("LOOM_FAILED_RUN_CAP", ""), FAILED_RUN_CAP)
+    since_brief = [a for a in history.attempts_since_brief(comments) if _is_work_attempt(a[3])]
+    if 0 < cap <= len(since_brief):
+        return "%d failed runs since the last brief" % len(since_brief)
+    return ""
 
 
 DECISION_DEFAULT_CHECK_EVERY = 3600
@@ -3567,7 +3601,8 @@ class Station:
                 if len(cols := line.split()) == 3}
         if jobs.get("com.loom.station") != str(os.getpid()):
             return
-        nonlocal_lanes = set(runners.runner_slots()) | set(REMOTE_LANES)
+        nonlocal_lanes = (set(runners.runner_slots()) | set(REMOTE_LANES)
+                          | {lane for lane in LANES if lane_feed.is_fed(lane)})
         self._missing_lane_jobs = {lane for lane in LANES if lane not in nonlocal_lanes
                                    and "com.loom." + lane not in jobs}
         for lane in sorted(self._missing_lane_jobs):
@@ -4042,8 +4077,10 @@ class Station:
         """True while the host is too loaded for a local lane to take a
         ticket. Only a station whose settings came from the environment
         asks (Settings.host_load_gate); runner slots and remote lanes do
-        their work elsewhere and are never held."""
-        if not self.s.host_load_gate or lane in runners.runner_slots() or lane in REMOTE_LANES:
+        their work elsewhere and are never held, nor are slots fed to lane
+        pods on other nodes (bus/lane_feed.py)."""
+        if (not self.s.host_load_gate or lane in runners.runner_slots() or lane in REMOTE_LANES
+                or lane_feed.is_fed(lane)):
             return False
         script = os.path.join(os.path.dirname(__file__), "..", "lanes", "host_load.sh")
         note = subprocess.check_output(["/bin/bash", script], text=True).strip()
@@ -10172,8 +10209,9 @@ class Station:
         return factory.timeouts_in_a_row(earlier) + 1 >= factory.TIMEOUT_STRIKES
 
     def _flag_repeated_failure(self, repo: str, number: int, lane: str, reason: str) -> bool:
-        """Hold a ticket after the same consecutive failure or three attempts in
-        six hours, and record its attempt table."""
+        """Hold a ticket after the same consecutive failure, three attempts in
+        six hours, or the failed-run cap since its last brief, and record its
+        attempt table."""
         if ending_class(reason) in NOT_WORK:
             # An incident is the factory's problem repeating, a transient or
             # limit exit is the lane's, and an expired key is the operator's:
@@ -10192,23 +10230,15 @@ class Station:
         comments = [c for c in self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
                     if isinstance(c, dict) and tickets._login(c.get("user")).lower() in authors]
         attempts = factory.attempts(comments, reason)
-        def is_work(reason: str) -> bool:
-            return not reason or failure_class(reason) not in NOT_WORK
-        work = [a for a in attempts if is_work(a[3])]
-        failures = [a[3] for a in work[:-1] if a[3]]
-        # Timeouts name their kept branch, which differs each run: one reason.
-        def same(a: str, b: str) -> bool:
-            return a == b or (factory.is_timeout(a) and factory.is_timeout(b))
-        reason_repeat = bool(failures) and same(failures[-1], reason)
-        recent = [a for a in work if a[0] >= self.now - 6 * 3600]
-        if not reason_repeat and len(recent) < 3:
+        work = [a for a in attempts if _is_work_attempt(a[3])]
+        trigger = _runaway_trigger(self.now, comments, work, reason)
+        if not trigger:
             return False
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                      {"labels": sorted(set(_label_names(issue)) | {RUNAWAY})})
-        trigger = "repeated failure reason" if reason_repeat else "three attempts within six hours"
         body = factory.runaway_comment(
             trigger, attempts, factory.issue_model(issue), factory.attempt_models(issue, comments),
-            counted=is_work)
+            counted=_is_work_attempt)
         skipped = len(attempts) - len(work)
         if skipped:
             body += ("\n\nNot counted as work attempts: %d that ended [transient], [limit], "
@@ -11402,6 +11432,7 @@ class Station:
                for row in rows]
             + ["", "Remote claims: muse %d/%d" % (
                 self._remote_claim_count("muse"), REMOTE_LANES["muse"]["slots"])]
+            + pace.lines(pace.read(self.s.home))
             + (pr_lines or [])
             + self._scorecard_lines()
             + (["", summary.line()] if summary is not None else []))
@@ -11504,6 +11535,8 @@ class Station:
         # Claims paused or resumed for disk republishes (loom#1808).
         values["disk"] = "paused" if self._disk_status_line() else "ok"
         values["disk watchdog"] = self._watchdog_notice() or ""
+        # A new pace verdict or slot request republishes (loom#3630).
+        values["pace"] = pace.summary(pace.read(self.s.home))
         if refresh_pr_counts:
             read_lines, read_at = self._repo_pr_lines(), self.now
             pr_lines = read_lines
@@ -19191,6 +19224,10 @@ class Station:
             except (GitHubError, OSError, runners.ReportError) as err:
                 _say("tend_runners failed: %s" % err)
             try:
+                self._timed(self.tend_lane_feed)
+            except (OSError, runners.ReportError) as err:
+                _say("tend_lane_feed failed: %s" % err)
+            try:
                 self._timed(self.tend_remote_checks)
             except RateLimited:
                 raise
@@ -19347,6 +19384,9 @@ class Station:
             records = usage.collect(self.s.home, now=self.now)
             usage.write(self.s.home, records)
             self.upload_usage_limits(records)
+            waits = _read_json(os.path.join(self.state, "ticket-waits.json"), {}, strict=False)
+            pace.write(self.s.home, pace.plan(self.s.home, records, pace.queued(waits),
+                                              os.environ, self.now))
         except OSError as err:
             _say("could not write usage limits: %s" % err)
         try:
@@ -19389,6 +19429,37 @@ class Station:
             actor = None
         runners.Runners(self.gh, self.s.home, repo, slots, dict(os.environ), self._public, _say,
                         actor=actor, now=self.now).tend()
+
+    def tend_lane_feed(self) -> None:
+        """The slots in LOOM_POD_FEED_SLOTS: offer their briefs to lane pods
+        on other nodes through the lane_feed table and mirror back each
+        pod's heartbeat and outcome (bus/lane_feed.py). On the shared
+        backend the pods' grants are reconciled every pass: an empty setting
+        revokes them all, and so does a bad one (fail closed). An unreadable
+        row is logged and feeds nothing this pass; a lost lease still stops
+        the pass."""
+        env = dict(os.environ)
+        store = state_store.active()
+        rows = None
+        try:
+            try:
+                slots = lane_feed.feed_slots(env)
+            except ValueError as err:
+                _say("lane feed: %s; no lane pod keeps a grant" % err)
+                env.pop(lane_feed.SLOTS_SETTING, None)
+                slots = {}
+            if not slots and state_store.backend_name(env) != "postgres":
+                return
+            rows = lane_feed.station_rows(env, self.s.home)
+            lane_feed.Feed(self.s.home, env, rows, _say, now=self.now,
+                           lease=getattr(store, "lease", None)).tend()
+        except station_lease.LeaseLost:
+            raise
+        except (ValueError, state_store.StateError) as err:
+            _say("lane feed: %s" % err)
+        finally:
+            if rows is not None:
+                rows.close()
 
     def tend_remote_checks(self) -> None:
         """Dispatch the check requests lanes filed under LOOM_REMOTE_CHECKS and
