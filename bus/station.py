@@ -22,6 +22,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -107,6 +108,7 @@ from . import criteria_gate
 from . import live_adapter, live_proof
 from . import deploy_watch
 from . import scorecard
+from . import signin
 from . import watch
 from . import workersai
 from . import weakened
@@ -7276,6 +7278,8 @@ class Station:
         """
         if self._deferred():
             return
+        # Every pass: a failed sign-in probe alerts at once (loom#3572).
+        self._tend_signin_due(paused)
         if "score_lanes" not in paused and scorecard.Scorecard(self.state, self.now).due():
             try:
                 self.score_lanes()
@@ -11210,6 +11214,64 @@ class Station:
         event is `_routine`, an edit of the status comment."""
         notify.post(self.gh, repo, number, body, kind)
 
+    # -- sign-in probes (bus/signin.py, loom#3572) --------------------------
+    def _tend_signin_due(self, paused: Set[str]) -> None:
+        if "tend_signin" in paused:
+            _say("step tend_signin paused (LOOM_PAUSED_STEPS)")
+            return
+        try:
+            self.tend_signin()
+        except TargetReached as err:
+            _say("step tend_signin carried over to the next pass: %s" % err)
+        except RateLimited:
+            raise
+        except (GitHubError, OSError, ValueError) as err:
+            _say("tend_signin failed: %s" % err)
+
+    def tend_signin(self) -> None:
+        """Alert, ask and close from the lanes' sign-in probe records."""
+        if not tickets.REPO_RE.fullmatch(FACTORY_REPO):
+            return
+        try:
+            own = self.gh.app_login() or ""
+        except RateLimited:
+            raise
+        except (GitHubError, AttributeError):
+            own = ""  # no own login: no repeat comment is edited, a new one is written
+        signin.Watch(self.gh, FACTORY_REPO, self.s.home, self.state, self.now,
+                     self._signin_alert, _say, self._slot_last_beat,
+                     remote=lambda slot: slot in REMOTE_LANES,
+                     own=own, trusted=self.s.authors).tend()
+
+    def _slot_last_beat(self, slot: str) -> Optional[float]:
+        """The slot's latest heartbeat or keepalive stamp, None with neither."""
+        beat = self._local_beat(slot)
+        at = lane_state.epoch(beat.get("at")) if isinstance(beat, dict) else None
+        age = self._keepalive_age(slot)
+        alive = self.now - age if age is not None else None
+        return max((t for t in (at, alive) if t is not None), default=None)
+
+    def _signin_alert(self, line: str) -> bool:
+        """Send one sign-in alert line; whether it went. LOOM_SIGNIN_ALERT_CMD
+        (a command, the line on its stdin) when set, else the ask webhook with
+        the operator mention, else only the station log."""
+        cmd = os.environ.get("LOOM_SIGNIN_ALERT_CMD", "").strip()
+        if cmd:
+            try:
+                done = subprocess.run(shlex.split(cmd), input=line, text=True,
+                                      capture_output=True, timeout=60)
+            except (OSError, ValueError, subprocess.SubprocessError) as err:
+                _say("sign-in alert command failed (%s); next pass" % type(err).__name__)
+                return False
+            if done.returncode != 0:
+                _say("sign-in alert command exited %d; next pass" % done.returncode)
+            return done.returncode == 0
+        _say(line)
+        if not self.s.webhook_ssm:
+            return True
+        url = self._webhook()
+        return url is not None and self._send(url, line, mention=True)
+
     # -- lane status ------------------------------------------------------
     @staticmethod
     def _utc(at: float) -> str:
@@ -11300,12 +11362,15 @@ class Station:
                     pr_lines: Optional[List[str]] = None) -> str:
         summary = self._spend_shown()
         disk = [line for line in (self._disk_status_line(), self._watchdog_notice()) if line]
+        probes = signin.by_slot(signin.read(self.s.home))
         body = "\n".join(
             [LANES_MARKER, "Updated " + self._utc(self.now),
              station_beat.stamp_line(station_beat.station_settings(os.environ)[0]), ""]
             + (disk + [""] if disk else [])
-            + ["| lane | state | heartbeat (UTC) | reason |", "|---|---|---|---|"]
-            + ["| %s | %s | %s | %s |" % row for row in rows]
+            + ["| lane | state | heartbeat (UTC) | reason | sign-in (UTC) |",
+               "|---|---|---|---|---|"]
+            + ["| %s | %s | %s | %s | %s |" % (tuple(row) + (signin.cell(probes.get(row[0])),))
+               for row in rows]
             + ["", "Remote claims: muse %d/%d" % (
                 self._remote_claim_count("muse"), REMOTE_LANES["muse"]["slots"])]
             + (pr_lines or [])
@@ -11395,6 +11460,9 @@ class Station:
             return
         rows = self._lane_rows()
         values = {lane: state + ": " + reason for lane, state, _, reason in rows}
+        # A new probe result republishes the sign-in column.
+        values["sign-in"] = " ".join(sorted(
+            "%s=%s" % (k, signin.cell(p)) for k, p in signin.read(self.s.home).items()))
         summary = self._spend_shown()
         if summary is not None:
             # A new run (or a budget change) republishes; the clock alone waits
