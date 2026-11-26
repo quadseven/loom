@@ -7715,6 +7715,22 @@ class SilentLaneTest(Base):
         self.assertEqual(st._no_lane_since(), {})
         self.assertEqual(st._invariant_waits(), [])
 
+    def test_the_no_lane_clock_survives_a_station_restart(self):
+        # loom#3592: the station pod restarts often; the pin fallback clock
+        # lives in ticket-waits.json, so a new Station and its Factory keep it.
+        first = self.station()
+        start = first.now - 40 * 60
+        first.now = start
+        key = "%s#12" % REPO
+        first._record_waits({key: "no free lane takes model claude-sonnet-5-5"})
+        del first
+        later = self.station()
+        later._record_waits({key: "no free lane takes model claude-sonnet-5-5"})
+        self.assertEqual(later._no_lane_since(), {key: start})
+        worker = later._factory()
+        self.assertEqual(worker.no_lane_since, {key: start})
+        self.assertGreaterEqual(worker.now - worker.no_lane_since[key], factory.PIN_FALLBACK_WAIT)
+
     def test_a_wait_reason_that_could_carry_ticket_text_never_reaches_the_invariant(self):
         st = self.station()
         st._record_waits({"%s#12" % REPO: "no free lane takes model `x` <img src=y>",
