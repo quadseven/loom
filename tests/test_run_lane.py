@@ -226,6 +226,13 @@ fi
 if [ "$1 $2" = "issue comment" ]; then
   exit 0
 fi
+# `issue list` prints $FAKE_GH_LIST (default empty), the numbers its --jq
+# keeps; $FAKE_GH_LIST_FAIL fails it.
+if [ "$1 $2" = "issue list" ]; then
+  [ -z "${FAKE_GH_LIST_FAIL:-}" ] || { echo "HTTP 502" >&2; exit 1; }
+  printf '%b' "${FAKE_GH_LIST:-}"
+  exit 0
+fi
 """
 
 # Fake agent: records the call, then commits a file ($FAKE_AGENT=commit),
@@ -6801,6 +6808,45 @@ echo fixed > fix.txt
         self.assertIn("Could not use the key again: 3 times since ", note)
         self.assertIn("Lanes seen: opencode-go-2, opencode-go-3\n", note)
         self.assertEqual(len([c for c in self.calls() if c.startswith("gh issue create")]), 1)
+
+    def key_ask_race(self, **env):
+        """Lane opencode-go-2 files the ask for an expired key while the search
+        still finds no open ask, as when another lane filed one a second ago."""
+        script = ('FACTORY_REPO=quadseven/loom KEY_ASK_MARKER="<!-- loom:key-ask v1 -->"\n'
+                  'KEY_REPEAT_MARKER="<!-- loom:key-repeat v1 -->"\n'
+                  'SLOT=opencode-go-2 LOG=/dev/null NET_TIMEOUT=30 LOOM_ROOT="%s"\n' % RUNNER.parent.parent
+                  + self.source_functions("open_issue", "upsert_sticky_comment", "signed", "sign_tail",
+                                         "settle_ask", "file_ask", "ask_renew_key") +
+                  'ask_renew_key "API key expired: renew /k/go"\n')
+        result = subprocess.run(["bash", "-c", script, "bash"],
+                                env={**self.lane_env(), "FAKE_GH_ISSUE_NUMBER": "12", **env},
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return [c for c in self.calls() if c.startswith("gh issue close")]
+
+    def test_two_lanes_that_file_one_key_ask_at_once_leave_one_open(self):
+        # loom#3536: two lanes search, find nothing, and both file. The later
+        # ask (the higher number) sees the earlier one when it lists the open
+        # issues again, closes itself, and counts its lane on the earlier ask.
+        closed = self.key_ask_race(FAKE_GH_LIST="11\\n12\\n")
+        self.assertEqual(len(closed), 1, self.calls())
+        self.assertTrue(closed[0].startswith("gh issue close --repo quadseven/loom 12 "), closed)
+        self.assertIn("#11", closed[0])
+        [note] = self.sticky_bodies()
+        self.assertIn("Could not use the key again: 1 time", note)
+        self.assertIn("Lanes seen: opencode-go-2\n", note)
+        listed = [c for c in self.calls() if c.startswith("gh issue list")]
+        self.assertEqual(len(listed), 1, self.calls())
+        self.assertIn("--state open", listed[0])
+
+    def test_the_earlier_of_two_racing_key_asks_stays_open(self):
+        self.assertEqual(self.key_ask_race(FAKE_GH_LIST="12\\n13\\n"), [])
+        self.assertEqual(self.sticky_bodies(), [])
+
+    def test_a_key_ask_that_cannot_list_the_open_asks_stays_open(self):
+        # A failed listing proves nothing: keeping a possible duplicate beats
+        # closing the only ask.
+        self.assertEqual(self.key_ask_race(FAKE_GH_LIST_FAIL="1"), [])
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_provider_that_answers_lets_the_run_go_ahead(self):

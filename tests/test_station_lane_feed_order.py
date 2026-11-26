@@ -91,7 +91,7 @@ class LaneFeedOrder(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         settings = station.Settings(os.path.join(tmp.name, "loom"), [REPO], [], [],
                                     disk_free_min_gb=0)
-        st = station.Station(mock.Mock(cache_dir=None, target=500), settings)
+        st = station.Station(mock.Mock(cache_dir=None, target=500, counted=0, requests=0), settings)
         seen = []
         with mock.patch.object(st, "_paused_steps", side_effect=lambda steps: seen.extend(
                 s.__name__ for s in steps) or set()), \

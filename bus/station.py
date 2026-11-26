@@ -742,6 +742,13 @@ INVARIANT_WRITE_RESERVE = 100
 # filled their repos' open pull request caps (loom#3534). The factory is due
 # every factory.FACTORY_CHECK seconds, and the budget floor still skips it.
 FACTORY_REQUEST_RESERVE = 250
+# The share of the pass request target the step loop keeps however much the
+# steps before it spent: it runs until max(target, counted at its start +
+# this share of the target). On 2026-11-26 the claim pass kept to its share,
+# but reconcile, assign and the factory spent the rest of the target, the
+# loop broke at its first step, and check_invariants ran four hours overdue
+# (loom#3119). The budget floor still stops the loop.
+STEP_LOOP_SHARE = 1 / 2
 # A repo with no briefed, running or pr ticket is scanned this often at most.
 IDLE_SCAN = 600
 # Conditional-request answers unused this long are removed.
@@ -7190,10 +7197,23 @@ class Station:
         """The pass's main step loop, given PASS_STEP_BUDGET seconds of its
         own: counted from the pass's start, the steps before it (reconcile,
         hand back, claim, assign, about six minutes on 2026-10-24) left one
-        loop step a pass and a full turn of the loop took hours."""
-        loop_started = time.monotonic()
+        loop step a pass and a full turn of the loop took hours. It also
+        keeps STEP_LOOP_SHARE of the request target past what those steps
+        spent (loom#3119)."""
+        target = getattr(self.gh, "target", None)
+        has_target = isinstance(target, int) and not isinstance(target, bool)
+        if has_target:
+            self.gh.target = max(target, self._pass_counted() + int(target * STEP_LOOP_SHARE))
+        try:
+            self._run_rotation()
+        finally:
+            if has_target:
+                self.gh.target = target
+
+    def _loop_steps(self) -> Tuple[Any, ...]:
+        """The step rotation, in order."""
         # Below the budget floor these wait for the reset; trees are local.
-        steps = (self.roll_source_pins, self.ship_deployed, self.ship_pins, self.ship_rolls,
+        return (self.roll_source_pins, self.ship_deployed, self.ship_pins, self.ship_rolls,
                      self.ship_merged,
                      self.ship_workflows, self.ship_path_workflows, self.unwind_reverts,
                      self.adopt_untracked_pulls, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
@@ -7215,18 +7235,26 @@ class Station:
                      # tickets sit under an epic.
                      self.move_outside_tickets, self.check_invariants,
                      self.release_factory_held, self.apply_decision_defaults)
+
+    def _run_rotation(self) -> None:
+        """Run the step rotation from where the last pass stopped, until the
+        pass's time budget or request target, and record where it stopped."""
+        loop_started = time.monotonic()
+        steps = self._loop_steps()
         self._note_every_pass()
         paused = self._paused_steps((*steps, self.post_metrics))
         self._run_due_steps(paused)
         rotation_path = os.path.join(self.state, STEP_ROTATION_FILE)
         rotation = _read_json(rotation_path, {}, strict=False)
-        start = rotation.get("next") if isinstance(rotation, dict) else 0
-        carried = rotation.get("carried") if isinstance(rotation, dict) else None
+        rotation = rotation if isinstance(rotation, dict) else {}
+        start = rotation.get("next")
+        carried = rotation.get("carried")
         start = start if isinstance(start, int) and 0 <= start < len(steps) else 0
         # Where the next pass starts, kept current so the write below records
         # it however the loop ends.
         next_step = start
         next_carried = None
+        full = False
         try:
             for offset in range(len(steps)):
                 next_step = (start + offset) % len(steps)
@@ -7266,11 +7294,26 @@ class Station:
                     _say("%s failed: %s" % (step.__name__, err))
             else:
                 next_step = 0
+                full = True
         finally:
+            turn_started = self._rotation_turn(rotation.get("turn_started"), len(steps),
+                                               full or next_step < start)
             try:
-                _write_json(rotation_path, {"next": next_step, "carried": next_carried})
+                _write_json(rotation_path, {"next": next_step, "carried": next_carried,
+                                            "turn_started": turn_started})
             except OSError as err:
                 _say("could not record the step rotation: %s" % err)
+
+    def _rotation_turn(self, started: Any, count: int, wrapped: bool) -> float:
+        """When the rotation's current turn began. A pass that carried the
+        rotation past its last step logs how long that turn took, so the log
+        shows whether every step comes round within its bound (loom#3119)."""
+        if not self._num(started):
+            return self.now
+        if not wrapped:
+            return started
+        _say("step rotation: a full turn of %d steps took %ds" % (count, self.now - started))
+        return self.now
 
     def _paused_steps(self, steps: Sequence[Any]) -> Set[str]:
         """The step names LOOM_PAUSED_STEPS and PAUSED_STEPS_FILE hold this
