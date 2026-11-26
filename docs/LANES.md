@@ -168,10 +168,14 @@ unset variables.
 - On a host, a base check verdict is reused by repo, base revision, check
   command and interpreter identity. Green verdicts last 24 hours; red
   verdicts last five minutes and still follow the base-check incident path.
-  Before running a Codex agent, the lane reruns green checks that populated
-  uv's scratch cache so the agent has packages for offline tests.
+  Before running a Codex agent, the lane reruns green checks written while
+  the repo's uv cache held packages, so the agent has packages for offline
+  tests even after a new pod or a bound emptied it.
   Setup still runs for each brief, and the final check on the agent's commit
-  is never cached. Verdicts live under the host's `state/base-verdicts/`;
+  is never cached. A new run whose agent commits nothing runs no final
+  check: its tree is the base the base check covered, so it goes straight
+  to its no-commit outcome and holds no check slot. Verdicts live under
+  the host's `state/base-verdicts/`;
   each write sweeps the ones older than a day.
 - A passing base check closes the repo's open base-check and contract
   incidents from any lane host. The host keeps one file per incident under
@@ -180,7 +184,18 @@ unset variables.
   cluster runner or a second machine releases tickets an absent host filed.
   Environment incidents describe the machine that filed them and still close
   only from that machine's own file. A private repo's incident title carries
-  a per-host alias, so it still closes only from the host that filed it.
+  an alias derived from the repo's GitHub id (`bus/incident_probe.py`
+  `repo_alias`), the same on every host and in the station, so it closes
+  from any host too. A host that cannot read the id files under its own
+  per-host alias and says so in the lane log; a pass that finds no open
+  incident to close logs that as well (loom#3573).
+- The station releases holds from GitHub's labels as well as from its own
+  `factory_held.json`: a `loom:queued` + `wait:incident` ticket with no
+  ledger entry (a station that moved hosts left its ledger behind) goes back
+  to its lane once its repo has no open base-check or contract incident, the
+  incident its status names (if any) is closed, and the default branch's CI
+  is green. An operator claim keeps it held. The status file's Held tickets
+  section counts such tickets (loom#3573).
 - An open base-check incident holds every ticket of its repo, so no ticket
   run would ever check that repo again (loom#3084). While an incident holds
   tickets, the station gives one free local lane (never a cluster runner
@@ -242,13 +257,48 @@ unset variables.
   127 as `validation environment unavailable: ...`), opens no pull request
   and pushes nothing to the ticket's branch or an open pull request. The
   edits go to a side branch `<branch>-unvalidated-<time>` so they can be
-  recovered.
+  recovered. When that branch is ahead of the default branch and no later
+  attempt opened a pull request or kept a newer branch, the next new brief's
+  "Earlier attempt" section names it with the failing tests from the reason
+  (at most 10, plain test names only), and the runner merges it before the
+  agent starts, as it does a `-timedout-` branch. A fix brief resumes only a
+  `-timedout-` branch.
 - Every step runs like an API-lane agent: an emptied environment, a scratch
   HOME (`run/<lane>-check`), under `sandbox-exec`, with no access to the
   runner's HOME, but with the network and the writes outside HOME a step's
   setup may need (an API-lane agent has neither). A machine without `sandbox-exec` fails setup
   for repos with a contract. Each step has `LOOM_CHECK_TIMEOUT` seconds
   (default 1800).
+- uv is shared per repo, not per check (loom#3591). Per-home caches made
+  each check fetch a managed Python and every wheel again, and three codex
+  slots filled a lane pod's 20Gi `run/` volume until the pod was evicted.
+  Under `run/uv-shared` (lanes/uv_cache.py):
+  - `repos/<owner>_<name>/cache` is one repo's uv cache (`UV_CACHE_DIR`),
+    shared by every slot's checks of that repo and writable by them only. A
+    check runs its tree's code, so no repo's check writes a cache another
+    repo's check reads.
+  - `python/` holds the managed Pythons (`UV_PYTHON_INSTALL_DIR`, with
+    `UV_MANAGED_PYTHON=1` and `UV_PYTHON_DOWNLOADS=never`). The runner
+    installs them before the check, outside the sandbox: `uv python install
+    --no-config --no-bin` with the versions in `.python-version`, else
+    `requires-python` in `pyproject.toml`, read as plain version strings,
+    so no uv setting in the tree reaches the install. A tree that asks for
+    none gets uv's default Python when its contract runs `uv` or `uvx` and
+    none is installed yet. Every check and agent reads them; none may write
+    them.
+  - `locks/<owner>_<name>.lock`: a check holds its repo's lock shared while
+    it runs.
+  The check home keeps the per-slot HOME and TMPDIR and holds no uv cache or
+  Python. The check profile (seatbelt and bwrap) adds the repo's cache to
+  what a check may write and the Pythons to what it may read; an agent's
+  profile gets neither.
+- Each repo's cache is bounded. After each check, `lanes/uv_cache.py bound`
+  takes the repo's lock exclusively without waiting (a check of that repo
+  still running skips it; the next check bounds it) and refuses a cache
+  any part of whose path is a symlink. A cache over
+  `LOOM_CHECK_UV_CACHE_MB` (default 8192) gets `uv cache prune`, then
+  `uv cache clean` if it is still over; with no uv on the runner it is
+  removed without following links. The managed Pythons are not counted.
 - Before claiming a ticket for a local lane, the station checks the same
   host load limits as lane checks. A high reading leaves the ticket for
   the next station pass. The local runner checks before preparing a brief
@@ -728,7 +778,12 @@ token. The station mints before its deploy step and reuses its
 `state/station/app-token.json` (`bus app token --cache-file`). Its Python pass
 refuses to start without the App settings, and a pass whose mint fails reads
 nothing from GitHub. A brain tick mints before it takes the lock and again
-once it holds it. Two reads still use the operator's own token on purpose:
+once it holds it. A lane run mints when it takes a brief and again after its
+agent. An installation token lasts an hour, so each late GitHub write (filing
+or closing a factory incident, a park note, an answer, a push) first mints
+again once the token is older than `LOOM_APP_TOKEN_MAX_AGE` seconds (default
+2700); an incident whose filing fails after a failed mint names the mint, not
+the 401 (loom#3571). Two reads still use the operator's own token on purpose:
 the pin pass (`bus/pin.py`, loom#612) and the operator budget sample
 (`bus/operator_budget.py`). Each reads `LOOM_GITHUB_TOKEN` from its own
 environment, since the wrapper refuses `gh auth token`.
@@ -832,7 +887,9 @@ open `loom:lanes` issue in `LOOM_STATUS_REPO` (default: this checkout's
 when a lane state or its public reason changes, when an Anthropic run is recorded, and when
 the table is older than 15 minutes (`LANES_REPUBLISH`), which it does at the
 start of the pass so a pass that stops at its request target still publishes.
-The table uses fixed reason text so raw runner details stay local. The
+The table uses fixed reason text so raw runner details stay local. Its
+sign-in column is each slot's last sign-in probe, result and time ("Lane
+pods" below). The
 launchd station removes stale heartbeat files for slots with no loaded job.
 Remote and cluster slots keep their own heartbeat sources. `bus.brain status`
 prints the table's age beside `Updated` and calls it stale past the same age. With Anthropic
@@ -1222,10 +1279,26 @@ carrying it in each `LOOM_REPOS` repo, oldest first, and gives `loom:triage`
 to each that carries no `loom:` label, has no assignee and no `claim:` label,
 and is not an epic, goal home or other issue triage skips
 (`intake_ready_for_agent`, loom#3092). The brain then triages it like any
-other issue: the label never skips triage. At most 20 issues a run
-(`READY_PER_RUN`), and the run stops when the pass's request budget is spent.
-It writes no comment and logs one line a run with the count. A run in which
-a repo read failed does not count toward the hour, so the next pass retries.
+other issue: the label never skips triage. The same run then reads every
+other open issue of each repo and gives `loom:triage` to each the same rules
+let through (loom#3598): before it, an issue with no label at all was never
+read. `LOOM_INTAKE_ALL=0` (or `off`) limits the run to `ready-for-agent`
+issues. At most `LOOM_INTAKE_PER_RUN` issues a run (default 60, at most 80),
+`ready-for-agent` ones first, oldest first, and the run stops when the pass's
+request budget is spent. Each label is a content-creating write, which
+GitHub's secondary limit holds to 80 a minute and 500 an hour, so a run's
+burst stays under the minute limit and the hour keeps most of its writes for
+everything else; the reads are one request per 100 open issues of a repo.
+At 60 an hour, 375 unseen issues are labelled in about 7 hours. It writes
+no comment and logs one line a run with the count. A run in which a repo
+read failed does not count toward the hour, so the next pass retries.
+
+Labelling is not triage. The issues it labels wait for the agent rewrites
+(at most 6 an hour across the station, `REWRITE_STATION_PER_HOUR`; Agent
+rewrites in docs/BRAIN.md) and the brain's triage step (up to 5 a tick, a
+tick about every 30 minutes), so a large intake drains at about 15 issues an
+hour, not at the intake's rate; those two caps bound it. A repo with a backlog goal home also has `triage_backlogs` (25 a run,
+before this intake in the pass), which queues a ready issue with no model.
 
 Each Loom sets these for itself when it installs; a second operator running
 from a clone of another operator's checkout must not inherit them:
@@ -2311,7 +2384,9 @@ anthropic slot reports itself unavailable with that reason, and the station
 sends the anthropic slots nothing more. Ephemeral runners return their spend
 rows in the sealed report. The station appends them once per report to the
 same ledger and checks the shared balance before dispatching more Anthropic
-briefs.
+briefs. The floor holds the anthropic slots only: the spend line says every
+other lane takes briefs as usual, and `bus.brain brief --lane` refuses only
+an anthropic slot under the floor (loom#3593).
 
 ## Skills on every lane
 
@@ -2395,9 +2470,13 @@ lookup leaves the brief for the next pass. The rule covers:
 
 - Tool: `codex exec --sandbox workspace-write` on a logged-in box: no network and
  no .git writes, so the agent edits and the runner commits and pushes.
- When the base check left a uv cache, the agent gets a copy of it and runs uv
- offline (`UV_OFFLINE`, `PIP_NO_INDEX`), so tests that need packages run
- without network (loom#1665).
+ When the repo's uv cache holds packages (`run/uv-shared/repos/<owner>_<name>/cache`),
+ the agent gets that cache as its one extra writable directory and runs uv
+ offline (`UV_OFFLINE`, `PIP_NO_INDEX`, `UV_PYTHON_DOWNLOADS=never`), so
+ tests that need packages run without network (loom#1665). The managed
+ Pythons stay read-only to it. It was a per-run copy of the check's cache,
+ a second full copy on a pod's disk (loom#3591); that repo's checks already
+ run the agent's code with its cache writable.
 - A lane run points `CODEX_HOME` at a lane-only home under the run's scratch
  home: the operator's `config.toml` (model and provider config) and sign-in
  are copied in, and the user-level `AGENTS.md` is not, so a personal startup
@@ -2542,6 +2621,29 @@ reply at 1,024 tokens. The runner checks the daily neuron meter before sending
 the request. Larger verify briefs stay eligible for other lanes. Cluster
 dispatch requires both provider parameter settings, and a successful cluster
 run refreshes the meter for its report.
+
+## tinker: the Tinker free tier
+
+- Tinker's OpenAI-compatible endpoint (`LOOM_TINKER_URL`, default Tinker's
+  `/oai/api/v1` base) through an opencode provider named `tinker`, with the key
+  named by `LOOM_TINKER_KEY_SSM`, handed to the agent as `TINKER_API_KEY`.
+- One model, `LOOM_TINKER_MODEL`, written `tinker/<id>`, for example
+  `tinker/thinkingmachines/Inkling-2-Mini:peft:65536:free`. Tinker serves an id
+  ending in `:free` at no charge, within a rate limit and only while a prepaid
+  account's balance is positive; every other id is billed against that balance.
+- Fail closed (`tinker_free_model` in lanes/agent_sandbox.sh): the lane does not
+  start, and its heartbeat says `REFUSED`, when `LOOM_TINKER_MODEL` is unset or
+  does not end in `:free`, when `LOOM_TINKER_MODELS` is set, or when the URL is
+  not https. A brief's `Model:` line is ignored: the lane runs its own model.
+  `opencode_config` checks the id again before every opencode run, so no other
+  id reaches the network.
+- An HTTP 429 or "too many requests" rests the lane for `LIMIT_WAIT` (an hour);
+  an HTTP 402 or "insufficient balance" rests it a day. Either is the usual
+  limit hold: the heartbeat is unavailable with a retry time, the brief is
+  parked as a limit and handed on, and the lane takes nothing until then.
+- A free lane (station `FREE_LANES`): public repos only, tried after openrouter
+  in `LANE_ORDER`. Its pull requests name lane `tinker`, so the scorecard counts
+  them on a row of their own.
 
 ## free provider slots on the spark-gateway
 
@@ -2754,7 +2856,9 @@ What changes in a pod:
   with empty tmpfs). The run's tree and scratch home are the only writable
   binds, `.git` stays read-only, the CLI's folder and the skill snapshot are
   read-only, and `/tmp` is private. A validation run gets the same root:
-  its writes go to the tree, its check home and `/tmp`. A fresh `/proc` in a
+  its writes go to the tree, its check home, its repo's uv cache under
+  `run/uv-shared` and `/tmp`, and the managed Pythons there are bound
+  read-only. A fresh `/proc` in a
   new PID namespace hides the runner's processes. bwrap needs user
   namespaces inside the container; a lane whose bwrap cannot start reports
   itself unavailable (`sandbox_ready`). The agy lane stays on the Mac.
@@ -2794,6 +2898,28 @@ What changes in a pod:
   kept in step with SSM by the cluster. `ssm_value` reads the file and makes
   no AWS call, so the pod holds no AWS key. The GitHub App key comes from
   `LOOM_GITHUB_APP_KEY_FILE`, also under HOME.
+- A sign-in probe (loom#3572): at start and every
+  `LOOM_SIGNIN_PROBE_INTERVAL` seconds (default 1800; 0 turns it off), for
+  each lane in `LOOM_SIGNIN_LANES` (default `codex claude`) with a slot in
+  the pod, `lanes/signin_probe.sh` runs the CLI's cheapest real call (a
+  one-word prompt) in place on the lane's own sign-in, while it holds the
+  run lock of every slot of that lane. A slot whose lock is taken makes it
+  let go and try again every `LOOM_SIGNIN_PROBE_POLL` seconds (default 15)
+  for up to `LOOM_SIGNIN_PROBE_WAIT` (default 1500); a runner that starts
+  while the probe holds its lock exits at once. The result (pass; unknown on
+  a usage limit, the network or `LOOM_SIGNIN_PROBE_TIMEOUT`, default 180;
+  fail otherwise) goes to `state/signin/<first slot>.json` with a masked
+  tail of what the CLI said, and the probe's own log to
+  `logs/signin-probe.log`. Every pass the station (`tend_signin`,
+  `bus/signin.py`) reads the records: the first fail after a pass sends one
+  alert line (`LOOM_SIGNIN_ALERT_CMD`, a command given the line on stdin,
+  when set; else the ask webhook with the operator mention) and files or
+  counts on the single key-ask for that sign-in, titled as
+  `ask_renew_key` titles it, so lanes and probes share one ask. The first
+  pass after a fail sends a recovery line and closes the ask; a pass with no
+  failure before it closes an ask left open too. At most hourly a key-ask
+  whose lanes have all had no heartbeat for 24 hours is closed as off. The
+  lane status table's sign-in column shows each slot's last probe.
 
 Everything the agent must not read (the copied parameters, the App key,
 `LOOM_HOME`) sits under HOME, outside the system folders bwrap binds; the

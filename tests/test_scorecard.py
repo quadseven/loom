@@ -159,6 +159,15 @@ class AuditCounts(unittest.TestCase):
         self.assertEqual(slots, {"codex": "x", "codex-2": "x", "free-kilo": "y",
                                  "opencode-go-3": "z"})
 
+    def test_a_tinker_pull_request_counts_on_its_own_row(self):
+        # loom#3579: the tinker lane's merges are scored apart from openrouter's.
+        body = ("## Why\nx\n\n---\nLoom ticket quadseven/loom#1, lane tinker, model "
+                "tinker/thinkingmachines/Inkling-2-Mini:peft:65536:free.\n")
+        self.assertEqual(scorecard.footer(body),
+                         ("tinker", "tinker/thinkingmachines/Inkling-2-Mini:peft:65536:free"))
+        self.assertEqual(scorecard.labels.base_lane("tinker"), "tinker")
+        self.assertEqual(factory.lane_kind("tinker"), "free")
+
 
 def runs(lane, total, bad, at, model="gpt-6-luna"):
     """`total` lane pull requests in the window, `bad` of them bad-work."""

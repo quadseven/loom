@@ -24,7 +24,7 @@ from .status import (add as add_status_event, is_status as is_status_comment,
                      parse as parse_status_events, resort as resort_events,
                      strip_body as strip_status_body)
 from .labels import (HANDOFF, HUMAN_LABELS, LANES, NEEDS_HUMAN, REMOTE_LANES,
-                     needs_human)
+                     base_lane, needs_human)
 from .tickets import (FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket,
                       verify_handoff_source)
 from . import lane_markers, lane_state, tick_clock
@@ -669,15 +669,42 @@ def held_on(found: List[Dict[str, Any]], issues: List[Dict[str, Any]],
 
 
 def held_lines(held: Dict[int, List[tickets.After]],
-               found: List[Dict[str, Any]]) -> List[str]:
-    """The Held tickets section: what each waiting ticket waits for."""
+               found: List[Dict[str, Any]], unrecorded: int = 0) -> List[str]:
+    """The Held tickets section: what each waiting ticket waits for, and how
+    many queued wait:incident tickets the station's hold ledger does not
+    know (unrecorded_incident_holds)."""
     lines = [HELD_HEADING]
     titles = {int(i["number"]): i.get("title", "") for i in found}
     for number, waiting in sorted(held.items()):
         lines.append("- #%d %s - waits for %s" % (
             number, titles.get(number, ""),
             ", ".join("%s (%s)" % (a.short, a.why) for a in waiting)))
-    return lines if held else lines + ["- none"]
+    if unrecorded:
+        lines.append("- %d queued wait:incident ticket(s) with no entry in the station's "
+                     "hold ledger" % unrecorded)
+    return lines if held or unrecorded else lines + ["- none"]
+
+
+def unrecorded_incident_holds(repo: str, found: List[Dict[str, Any]],
+                              env: Optional[Dict[str, str]] = None) -> int:
+    """How many of the repo's open queued wait:incident tickets have no entry
+    in the station's factory_held.json (loom#3573). The station releases them
+    from GitHub's labels; a count that stays up names a stalled queue before
+    it stalls for days. No ledger file counts every such ticket."""
+    env = os.environ if env is None else env
+    home = env.get("LOOM_HOME") or os.path.join(os.path.expanduser("~"), "loom")
+    try:
+        with open(os.path.join(home, "state", "station", "factory_held.json"),
+                  encoding="utf-8") as fh:
+            ledger = json.load(fh)
+    except (OSError, ValueError):
+        ledger = {}
+    if not isinstance(ledger, dict):
+        ledger = {}
+    return sum(1 for i in found
+               if i.get("state", "open") == "open"
+               and {"loom:queued", "wait:incident"} <= set(_labels(i))
+               and "%s#%s" % (repo, i.get("number")) not in ledger)
 
 
 def merge_ready(node: Optional[Dict[str, Any]], bot: str) -> str:
@@ -1635,7 +1662,7 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     lines += runaway_lines(tickets) + [""]
     lines += _ticket_lines(tickets, now, _stuck_marks(histories, skipped,
                                                       person_claims(tickets))) + [""]
-    lines += held_lines(held, tickets)
+    lines += held_lines(held, tickets, unrecorded_incident_holds(repo, tickets))
     lines += [""] + _pull_request_lines(gh, repo, prs, data, bot, authors or (), check, caps,
                                         now, hold)
     lines += [""] + _sensitive_pr_lines(prs, gh, repo)
@@ -4334,11 +4361,21 @@ def _repairs_header_for(gh: GitHub, repo: str, body: str, given: Optional[int],
     numbers = sorted({int(m.group(2)) for m in _REPO_NUMBER.finditer(body)
                       if m.group(1).lower() == factory.lower()})
     subjects = _incident_subjects(repo, env)
+    derived = False
     named = []
     for number in numbers:
         issue = gh.rest("GET", "/repos/%s/issues/%d" % (factory, number), ok=(404,)).data
-        if incident_probe.open_base_check(issue) and any(
-                "Repo: %s" % x in str(issue.get("body") or "").splitlines() for x in subjects):
+        if not incident_probe.open_base_check(issue):
+            continue
+        lines = str(issue.get("body") or "").splitlines()
+        if not derived and not any("Repo: %s" % x in lines for x in subjects) \
+                and any(line.startswith("Repo: private repo ") for line in lines):
+            # The alias every lane host derives from the repo id (loom#3573),
+            # read only when a private repo's incident needs it.
+            raw = (gh.rest("GET", "/repos/%s" % repo).data or {}).get("id")
+            subjects += incident_probe.subjects(repo, raw if isinstance(raw, int) else None)[1:]
+            derived = True
+        if any("Repo: %s" % x in lines for x in subjects):
             named.append(number)
     if not named or given in named:
         return given
@@ -4909,11 +4946,28 @@ def _oldest_open_issues(gh: GitHub, repo: str):
         url = _next_link(resp.headers.get("link", ""))
 
 
+def _triage_again(issue: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The issue without its loom:triage label when that is its one Loom
+    state (loom:factory aside), it holds no ask, no needs-brain hold, no
+    claim: label and no assignee, else None: triage reads such an issue
+    again (loom#3594)."""
+    names = _labels(issue)
+    loom = {n for n in names if n.startswith("loom:") and n != "loom:factory"}
+    if (loom != {"loom:triage"} or needs_human(names) or "needs-brain" in names
+            or any(n.startswith("claim:") for n in names)
+            or issue.get("assignees") or issue.get("assignee")):
+        return None
+    return dict(issue, labels=[x for x in issue.get("labels") or []
+                               if x.get("name") != "loom:triage"])
+
+
 def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[str]:
     """Label at most limit open issues that Loom has not seen, oldest first.
 
     Skips pull requests, epics (an epic label or sub-issues), asks and
-    anything with a loom: label. A trusted author's ready issue (every brief section,
+    anything with a loom: label but a plain loom:triage one (_triage_again),
+    which is queued when ready and otherwise left with no write and not
+    counted. A trusted author's ready issue (every brief section,
     checkboxes under Acceptance criteria) becomes a loom:queued ticket under
     the goal, while the goal has room; the rest get loom:triage, and the
     returned line names the reason. No comment: each one emailed the
@@ -4939,11 +4993,18 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
         if done >= limit:
             break
         number = int(issue["number"])
-        skip = _triage_skip(issue, authors, briefers, journals)
+        # A loom:triage issue is read again (loom#3594): one whose body
+        # became ready, or that an intake labelled without reading it, is
+        # queued here with no model; one still not ready is left as it is.
+        again = _triage_again(issue)
+        skip = _triage_skip(again or issue, authors, briefers, journals)
         if skip or _human_holder(gh, repo, issue):
             continue
         missing = missing_sections(issue.get("body"))
-        if not missing and tickets.brief_author_trusted(issue, authors, briefers, as_ticket=True):
+        trusted = tickets.brief_author_trusted(issue, authors, briefers, as_ticket=True)
+        if again and (missing or not trusted):
+            continue
+        if not missing and trusted:
             if in_flight >= cap:
                 lines.append("#%d held: ready, but the goal has %d tickets in flight (cap %d)"
                              % (number, in_flight, cap))
@@ -4966,6 +5027,8 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
             gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
                     {"labels": ["loom:ticket", "loom:queued"] +
                      (["area:" + area] if area and "area:" + area not in _labels(issue) else [])})
+            if again:
+                _remove_label(gh, repo, number, "loom:triage")
             in_flight += 1
             intake = (intake[0], intake[1] + 1)
             lines.append("#%d queued under #%d" % (number, intake[0]))
@@ -5853,6 +5916,37 @@ def _pr_contributors(gh: GitHub, repo: str, number: int, pr: Dict[str, Any]) -> 
     return [x for x in logins if x]
 
 
+def _head_pushers(gh: GitHub, repo: str, ref: str, head: str) -> List[str]:
+    """The login of everyone who pushed to the head branch, from the
+    repository's push activity (commit author and committer are client-set,
+    the pusher is not). Raises ValueError when the activity cannot be read,
+    when a push has no actor login, and when no push to the branch ends at
+    `head`, since then the pusher of the head is unknown (loom#3548)."""
+    if not ref:
+        raise ValueError("blocked: pull request has no head branch, so its pushers cannot "
+                         "be kept from approving it")
+    try:
+        pushes = gh.paginate("/repos/%s/activity?ref=%s&activity_type=push&per_page=100"
+                             % (repo, quote("refs/heads/" + ref, safe="")))
+    except GitHubError as err:
+        raise ValueError("blocked: push activity unreadable, so the pushers of the pull "
+                         "request cannot be kept from approving it (%s)" % err) from err
+    logins: List[str] = []
+    seen_head = False
+    for push in pushes:
+        push = push if isinstance(push, dict) else {}
+        login = str((push.get("actor") or {}).get("login") or "")
+        if not login:
+            raise ValueError("blocked: a push to the head branch has no GitHub login, so "
+                             "its pusher is unknown")
+        logins.append(login)
+        seen_head = seen_head or str(push.get("after") or "") == head
+    if not seen_head:
+        raise ValueError("blocked: no push to the head branch ends at head %s, so the "
+                         "pusher of the head is unknown" % head[:10])
+    return logins
+
+
 def _refuse_unapproved_head(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
                             details: Dict[str, Any], env: Optional[Dict[str, str]]) -> None:
     """Refuse the merge unless head_approval approves the current head. A
@@ -5872,6 +5966,11 @@ def _refuse_unapproved_head(gh: GitHub, repo: str, number: int, pr: Dict[str, An
     contributors = _pr_contributors(gh, repo, number, pr)
     automation = hold_logins(env) + [settings.get("LOOM_GITHUB_LOGIN", "").strip()]
     why = head_approval(reviews, comments, head, bot, contributors, automation)
+    if not why and head_approval(reviews, [], head, bot, contributors, automation):
+        # approved by a person's marker, not by the review bot: bar the pushers
+        ref = str(details.get("headRefName") or (pr.get("head") or {}).get("ref") or "")
+        pushers = _head_pushers(gh, repo, ref, head)
+        why = head_approval(reviews, comments, head, bot, contributors + pushers, automation)
     if why:
         raise ValueError("blocked: " + why)
 
@@ -7074,7 +7173,7 @@ def writer_login(gh: Any, env: Optional[Dict[str, str]] = None) -> str:
 
 # Brain commands outside the lock check: reads, and `step`, whose tick
 # record only the lock's holder may write (tick_step checks it).
-READ_COMMANDS = ("status", "resume", "step-budget", "audit-close", "step", "proof")
+READ_COMMANDS = ("status", "resume", "step-budget", "step-pending", "audit-close", "step", "proof")
 
 
 def check_acting_brain(gh: Any, lock_repo: str, env: Optional[Dict[str, str]] = None,
@@ -8067,6 +8166,11 @@ def _step_record(message: str) -> Dict[str, Any]:
             # before them has none.
             times = saved.get("times")
             record["times"] = times if isinstance(times, list) else []
+            # Steps whose last note was refused for deferring on budget:
+            # recorded, but not run (pending_steps).
+            refused = saved.get("refused")
+            if isinstance(refused, list):
+                record["refused"] = [s for s in refused if s in TICK_STEPS]
         except (ValueError, TypeError, KeyError, AttributeError):
             pass
     return record
@@ -8124,6 +8228,66 @@ def _sweep_step_note(record: Dict[str, Any], note: Optional[str], now: datetime)
     return note
 
 
+# The steps a tick runs between taking the lock and journaling: each is
+# recorded (a note saying there was nothing to do counts) before the journal.
+RUN_STEPS = TICK_STEPS[TICK_STEPS.index("status"):TICK_STEPS.index("journal")]
+
+
+def _held_to_order(record: Dict[str, Any]) -> bool:
+    """Whether the record's tick began with a timed lock step: only such a
+    tick is held to running every step (records written before step times
+    keep the free order)."""
+    times = record.get("times") or []
+    return (bool(record.get("started_at")) and bool(times) and isinstance(times[0], dict)
+            and times[0].get("step") == "lock")
+
+
+def pending_steps(record: Dict[str, Any]) -> List[str]:
+    """The run steps (status to sweep) the tick has not run: never recorded,
+    or recorded last with a note refused for deferring on budget. Empty for
+    a record not held to the order (_held_to_order)."""
+    if not _held_to_order(record):
+        return []
+    ran = {t.get("step") for t in record["times"] if isinstance(t, dict)}
+    refused = set(record.get("refused") or [])
+    return [s for s in RUN_STEPS if s not in ran or s in refused]
+
+
+def _clock_open(record: Dict[str, Any], now: datetime) -> bool:
+    """Whether the tick has used less than its budget minutes."""
+    used = tick_clock.minutes_used(record, now)
+    return used is not None and used < tick_clock.budget_minutes(record)
+
+
+def _check_steps_run(record: Dict[str, Any], step: str, now: datetime) -> None:
+    """Refuse the journal step while a run step is pending and the clock is
+    under the budget (loom#3593): on 2026-11-25 every tick journaled after
+    merge with 10 of its 12 minutes left, so brief and triage never ran.
+    Nothing is recorded; the message names the next step to run."""
+    if step != "journal" or not _clock_open(record, now):
+        return
+    left = pending_steps(record)
+    if left:
+        raise ValueError(
+            "step journal refused: %s; steps not run yet: %s. Run python3 -m bus.brain "
+            "step %s next (a step with nothing to do is recorded with a note saying so)"
+            % (tick_clock.elapsed_line(record, now), ", ".join(left), left[0]))
+
+
+def step_pending(record: Dict[str, Any], now: datetime) -> Tuple[str, bool]:
+    """(the verdict line, whether the tick must go on): it goes on while a
+    run step is pending and the clock is under the budget. The lane machine
+    wrapper reads this after its agent exits (lanes/mac/brain.sh)."""
+    left = pending_steps(record)
+    clock = tick_clock.elapsed_line(record, now)
+    if not left:
+        return "%s; every step ran" % clock, False
+    if not _clock_open(record, now):
+        return "%s; past the budget, not run: %s" % (clock, ", ".join(left)), False
+    return ("%s; not run yet: %s; run python3 -m bus.brain step %s next"
+            % (clock, ", ".join(left), left[0])), True
+
+
 def _tick_step_commit(gh: GitHub, lock_repo: str, step: Optional[str], note: Optional[str],
                       holder: Optional[str], now: datetime, tick_minutes: Optional[int],
                       sleep: Callable[[float], None]
@@ -8157,17 +8321,21 @@ def _tick_step_commit(gh: GitHub, lock_repo: str, step: Optional[str], note: Opt
                                  % tick_clock.MIN_TICK_MINUTES)
             if tick_clock.valid_tick_minutes(tick_minutes):
                 record["tick_minutes"] = tick_minutes
+    else:
+        _check_steps_run(record, step, now)
     record["step"] = step
     record["step_index"] = TICK_STEPS.index(step) + 1
     _time_step(record, step, at)
     note, refused = _budget_note(record, note, now)
     if note:
         record["notes"].append({"ts": at, "step": step, "text": note})
+    left = [s for s in record.get("refused", []) if s != step]
+    record["refused"] = left + [step] if refused else left
     record["holder"] = holder
     clean = "\n".join(line for line in message.splitlines() if not line.startswith(STEP_MARKER))
     new_message = clean + "\n" + STEP_MARKER + json.dumps(
         {k: record[k] for k in ("started_at", "step", "step_index", "notes", "times",
-                                "tick_minutes") if k in record},
+                                "tick_minutes", "refused") if k in record},
         separators=(",", ":"))
     created = gh.rest("POST", "/repos/%s/git/commits" % lock_repo, {
         "message": new_message, "tree": commit.data["tree"]["sha"], "parents": [sha]})
@@ -8267,6 +8435,14 @@ def _print_sweep_candidates(gh: GitHub, now: datetime) -> None:
         lines = ["candidate list unavailable: %s" % exc]
     for each in lines:
         print(each)
+
+
+def _cmd_step_pending(gh: GitHub, args: argparse.Namespace) -> int:
+    """Print step_pending's verdict; exit 0 when the tick must go on, 1
+    when it may end."""
+    line, go_on = step_pending(tick_step(gh, _repo(args.lock_repo)), datetime.now(timezone.utc))
+    print(line)
+    return 0 if go_on else 1
 
 
 def _cmd_step_budget(gh: GitHub, args: argparse.Namespace) -> None:
@@ -9625,7 +9801,7 @@ def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python3 -m bus.brain")
     sub = p.add_subparsers(dest="command", required=True)
     s = sub.add_parser("status"); s.add_argument("repos", nargs="+"); s.add_argument("--lanes-repo", default=lanes_repo_default()); s.add_argument("--repo-budget", type=float, metavar="SECONDS", help="per-repo read budget (default LOOM_REPO_BUDGET, else %g)" % per_repo.DEFAULT_BUDGET); s.add_argument("--deadline", type=float, metavar="MINUTES", help="stop reading after MINUTES (default %g), name the repos not reached and exit %d" % (STATUS_DEADLINE_MINUTES, STATUS_PARTIAL_EXIT))
-    b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--epic", type=int); b.add_argument("--goal", type=int, help=argparse.SUPPRESS); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=DIFFICULTIES); b.add_argument("--model"); b.add_argument("--base"); b.add_argument("--not-before"); b.add_argument("--after", metavar="'#5' or 'owner/name#7, #8'"); b.add_argument("--refs", type=int); b.add_argument("--regresses", type=int); b.add_argument("--priority", choices=tickets.PRIORITIES); b.add_argument("--holder"); b.add_argument("--resolves", help="brief defer key this brief finishes")  # leak-guard-allow: the --after help above shows the cross-repo ref shape
+    b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--epic", type=int); b.add_argument("--goal", type=int, help=argparse.SUPPRESS); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=DIFFICULTIES); b.add_argument("--model"); b.add_argument("--base"); b.add_argument("--not-before"); b.add_argument("--after", metavar="'#5' or 'owner/name#7, #8'"); b.add_argument("--refs", type=int); b.add_argument("--regresses", type=int); b.add_argument("--priority", choices=tickets.PRIORITIES); b.add_argument("--holder"); b.add_argument("--resolves", help="brief defer key this brief finishes"); b.add_argument("--lanes-repo", default=lanes_repo_default())  # leak-guard-allow: the --after help above shows the cross-repo ref shape
     b.add_argument("--repairs-incident", type=int, help="open factory incident repaired, for example 7")
     b.add_argument("--foundational", action="store_true",
                    help="an epic child its siblings build on: writes Foundational: yes")
@@ -9648,6 +9824,7 @@ def parser() -> argparse.ArgumentParser:
     fx = sub.add_parser("fix"); fx.add_argument("pull_request"); fx.add_argument("--ticket", required=True); fx.add_argument("--file", required=True); fx.add_argument("--lane"); fx.add_argument("--model")
     df = sub.add_parser("defer"); df.add_argument("item"); df.add_argument("--stage", choices=handoff.STAGES, required=True); df.add_argument("--holder", required=True); df.add_argument("--note"); df.add_argument("--lock-repo", default=lock_repo_default())
     dn = sub.add_parser("done"); dn.add_argument("item"); dn.add_argument("--stage", choices=handoff.STAGES, required=True); dn.add_argument("--holder", required=True); dn.add_argument("--resolves", help="brief defer key this done finishes")
+    sp = sub.add_parser("step-pending", help="exit 0, naming them, while tick steps are not run and the clock is open"); sp.add_argument("--lock-repo", default=lock_repo_default())
     sb = sub.add_parser("step-budget", help="the tick's elapsed minutes and whether a step may be deferred on budget"); sb.add_argument("--lock-repo", default=lock_repo_default())
     rs = sub.add_parser("resume"); rs.add_argument("repos", nargs="+"); rs.add_argument("--holder", required=True); rs.add_argument("--lock-repo", default=lock_repo_default()); rs.add_argument("--repo-budget", type=float, metavar="SECONDS", help="per-repo read budget (default LOOM_REPO_BUDGET, else %g)" % per_repo.DEFAULT_BUDGET); rs.add_argument("--deadline", type=float, metavar="MINUTES", help="stop reading after MINUTES (default %g), name the repos not reached and exit %d" % (RESUME_DEADLINE_MINUTES, RESUME_PARTIAL_EXIT))
     st = sub.add_parser("step"); st.add_argument("name", nargs="?", choices=TICK_STEPS); st.add_argument("--note"); st.add_argument("--holder"); st.add_argument("--lock-repo", default=lock_repo_default()); st.add_argument("--show", action="store_true"); st.add_argument("--tick-minutes", type=int, help="with lock: the tick's own length when shorter than %d minutes (a bounded lane machine tick)" % tick_clock.TICK_MINUTES)
@@ -9692,6 +9869,30 @@ def _cmd_status(gh: GitHub, args: argparse.Namespace) -> int:
     return STATUS_PARTIAL_EXIT
 
 
+def anthropic_floor_refusal(gh: GitHub, lane: Optional[str], lanes_repo: str) -> Optional[str]:
+    """Why a brief to `lane` is refused under the Anthropic spend floor, or
+    None (loom#3593). The floor (bus/spend.py) parks the anthropic slots
+    only, so only a brief whose --lane is an anthropic slot that the
+    published lane status shows parked for Anthropic credit is refused; a
+    brief to any other lane, or with no lane, is never read against it. On
+    2026-11-25 the brain read the floor line as a stop on every brief and the
+    cheap lanes sat idle."""
+    if not lane or base_lane(lane) != "anthropic" or not lanes_repo:
+        return None
+    body = _lane_status(gh, lanes_repo)
+    for row in lane_state.published_rows(body):
+        if (row["lane"] == lane and row.get("state") == "parked"
+                and "anthropic" in str(row.get("reason", "")).lower()):
+            return ("lane %s is parked (%s): the Anthropic spend floor holds briefs to the "
+                    "anthropic slots only; brief another lane" % (lane, row["reason"]))
+    # A slot with no row of its own is held by the station's spend line.
+    if any(line.startswith("Anthropic spend:") and ". Under the $" in line
+           for line in body.splitlines()):
+        return ("lane %s: Anthropic credit below floor (the lane status spend line); the "
+                "floor holds briefs to the anthropic slots only; brief another lane" % lane)
+    return None
+
+
 def _cmd_brief(gh: GitHub, args: argparse.Namespace) -> None:
     if args.epic is None:
         raise ValueError("brief files a ticket under an open epic: pass --epic N (a goal's "
@@ -9702,6 +9903,9 @@ def _cmd_brief(gh: GitHub, args: argparse.Namespace) -> None:
     # the station's own absence tracking, not by a log string.
     _check_live_criterion(body)
     _check_test_named(body)
+    refused = anthropic_floor_refusal(gh, args.lane, getattr(args, "lanes_repo", ""))
+    if refused:
+        raise ValueError(refused)
     print(brief(gh, _repo(args.repo), args.epic, args.title, body,
                 args.lane, args.difficulty, args.model, args.base, args.not_before, args.refs,
                 args.regresses, args.after, args.priority, args.holder,
@@ -9866,7 +10070,8 @@ COMMANDS = {"status": _cmd_status, "brief": _cmd_brief, "move": _cmd_move,
             "fix": _cmd_fix, "triage": _cmd_triage, "human": _cmd_human,
             "defer": _cmd_defer, "done": _cmd_done, "resume": _cmd_resume,
             "onboard": _cmd_onboard, "escalate": _cmd_escalate, "epic": _cmd_epic,
-            "close-epic": _cmd_close_epic, "step-budget": _cmd_step_budget}
+            "close-epic": _cmd_close_epic, "step-budget": _cmd_step_budget,
+            "step-pending": _cmd_step_pending}
 COMMANDS["step"] = _cmd_step
 COMMANDS["sweep"] = _cmd_sweep
 

@@ -144,9 +144,12 @@ Neither needs a model:
 - A queued ticket pinned to a model no free lane takes, waiting for it
   past LOOM_PIN_FALLBACK_MINUTES (default 30), takes the first free lane
   with that lane's own model and loses its Model: line (_pin_fallback,
-  loom#3151), unless the pin is hard (hard_pin: a person opened the ticket,
-  or it carries class:sensitive or tier:security). It never takes a lane it
-  ran on, and falls back at most PIN_FALLBACK_MAX times.
+  loom#3151), unless the pin is hard (hard_pin: it carries class:sensitive
+  or tier:security) or a ladder marker says its model is the ladder's rung
+  (loom#3191). Who opened the ticket does not matter (loom#3592). The wait
+  is the station's no_lane_since, kept in ticket-waits.json through the
+  state store, so a station restart does not reset it. It never takes a
+  lane it ran on, and falls back at most PIN_FALLBACK_MAX times.
 - A ticket waiting with no lane that takes it (NO_LANE_RE) for
   LOOM_NO_LANE_REROUTE hours (default 6) is rerouted to the first rung the
   climb rules allow with a free lane its repo may run on; with none, by
@@ -296,18 +299,13 @@ def pin_fallback_after(env: Optional[Dict[str, str]] = None) -> Optional[float]:
 
 
 def hard_pin(issue: Dict[str, Any]) -> str:
-    """Why a ticket's Model: line binds however long it waits, or "": a
-    person opened the ticket (the operator wrote the pin), or it carries a
-    HARD_PIN_LABELS label. A pin a brain's App or the ladder wrote is a
-    default the factory may route around."""
+    """Why a ticket's Model: line binds however long it waits, or "": it
+    carries a HARD_PIN_LABELS label. Any other pin is a default the factory
+    may route around, whoever opened the ticket: agent sessions post as the
+    person account, so its authorship says nothing about who chose the model,
+    and every lane may try every ticket (loom#3550, loom#3592)."""
     found = [x for x in HARD_PIN_LABELS if x in _labels(issue)]
-    if found:
-        return "it carries %s" % found[0]
-    user = issue.get("user") or {}
-    login = str(user.get("login") or "")
-    if login and user.get("type") != "Bot" and not login.endswith("[bot]"):
-        return "a person opened it"
-    return ""
+    return "it carries %s" % found[0] if found else ""
 
 
 def no_lane(reason: str) -> bool:
@@ -432,7 +430,7 @@ OPENCODE_GO = ("opencode-go", "opencode-go-1", "opencode-go-2", "opencode-go-3",
 # anthropic credit last.
 LANE_ORDER: Tuple[str, ...] = (
     SPARKS
-    + FREE_POOL + ("openrouter", "workersai", "zen", "zai", "copilot")
+    + FREE_POOL + ("openrouter", "tinker", "workersai", "zen", "zai", "copilot")
     + OPENCODE_GO + CODEX + ("claude", "agy", "muse")
     + ANTHROPIC)
 # What a lane costs, for the dashboard's Tiers and allowances page (loom#968):
@@ -445,7 +443,7 @@ LANE_ORDER: Tuple[str, ...] = (
 KINDS = ("own-hardware", "free", "subscription", "never-paid")
 LANE_KINDS: Dict[str, str] = {
     "spark": "own-hardware",
-    **{lane: "free" for lane in FREE_POOL + ("openrouter", "workersai", "zen", "zai", "copilot")},
+    **{lane: "free" for lane in FREE_POOL + ("openrouter", "tinker", "workersai", "zen", "zai", "copilot")},
     **{lane: "subscription" for lane in ("claude", "codex", "opencode-go", "agy", "muse")},
     "anthropic": "never-paid",
 }

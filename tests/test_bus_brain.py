@@ -3106,6 +3106,7 @@ class HeadApprovalMergeTests(unittest.TestCase):
         self.merges = []
         self.commits = [{"sha": HEAD, "author": {"login": "example-lane"},
                          "committer": {"login": "web-flow"}}]
+        self.pushes = [{"actor": {"login": "example-lane"}, "after": HEAD}]
 
     @staticmethod
     def grug(state, commit):
@@ -3155,6 +3156,10 @@ class HeadApprovalMergeTests(unittest.TestCase):
             return reply(200, self.reviews)
         if method == "GET" and path.startswith("/repos/%s/pulls/8/commits" % REPO):
             return reply(200, self.commits)
+        if method == "GET" and path.startswith("/repos/%s/activity" % REPO):
+            if self.pushes is None:
+                return reply(500, {"message": "boom"})
+            return reply(200, self.pushes)
         if method == "GET" and path.startswith("/repos/%s/issues/8/comments" % REPO):
             return reply(200, self.pr_comments)
         if method == "GET" and path.startswith("/repos/%s/issues/9/comments" % REPO):
@@ -3231,6 +3236,38 @@ class HeadApprovalMergeTests(unittest.TestCase):
         self.reviews = []
         self.pr_comments = [self.marker("example-lane")]
         self.refused("no approval on head")
+
+    def test_a_marker_from_the_pusher_of_a_head_commit_does_not_merge(self):
+        self.reviews = []
+        self.pushes = [{"actor": {"login": "example-owner"}, "after": HEAD}]
+        self.pr_comments = [self.marker("example-owner")]
+        self.refused("no approval on head")
+
+    def test_a_marker_from_an_earlier_pusher_does_not_merge(self):
+        self.reviews = []
+        self.pushes = [{"actor": {"login": "example-owner"}, "after": OLD_HEAD},
+                       {"actor": {"login": "example-lane"}, "after": HEAD}]
+        self.pr_comments = [self.marker("example-owner")]
+        self.refused("no approval on head")
+
+    def test_a_marker_with_an_unreadable_pusher_refuses_the_merge(self):
+        self.reviews = []
+        self.pr_comments = [self.marker("example-owner")]
+        for pushes, pattern in ((None, "push activity unreadable"),
+                                ([{"actor": None, "after": HEAD}], "no GitHub login"),
+                                ([{"actor": {"login": "example-lane"}, "after": OLD_HEAD}],
+                                 "pusher of the head is unknown")):
+            self.pushes = pushes
+            self.refused(pattern)
+
+    def test_a_marker_from_a_non_pusher_merges(self):
+        self.reviews = []
+        self.pr_comments = [self.marker("example-owner")]
+        self.assertTrue(self.merge()["merged"])
+
+    def test_the_review_bot_path_does_not_read_pushes(self):
+        self.pushes = None
+        self.assertTrue(self.merge()["merged"])
 
     def test_a_marker_for_an_older_head_does_not_merge(self):
         self.reviews = []
@@ -5140,6 +5177,8 @@ class Routes:
             return reply(422, {"message": "already has a parent"})
         if method == "POST":
             return reply(201, {})
+        if method == "DELETE" and "/labels/" in path:
+            return reply(200, [])
         return None
 
     def writes(self):
@@ -5236,12 +5275,41 @@ class TriageTests(unittest.TestCase):
         self.run_triage(routes)
         self.assertEqual(routes.labelled(), {9: ["loom:triage"]})
 
+    def test_a_ready_loom_triage_issue_is_queued_with_no_model(self):
+        # loom#3594: brain ticks wrote "no rewrites this tick" while ready
+        # loom:triage issues waited; triage now queues them itself.
+        routes = Routes([item(5, labels=["loom:triage"]), item(6, labels=["loom:triage"],
+                                                                  body="broken")])
+        lines = self.run_triage(routes)
+        self.assertEqual(lines, ["#5 queued under #%d" % INTAKE])
+        self.assertEqual(routes.labelled(), {5: ["loom:ticket", "loom:queued"]})
+        self.assertIn(("DELETE", "/repos/%s/issues/5/labels/loom%%3Atriage" % REPO, None),
+                      routes.calls)
+        # Not ready: left as it is, no write, not counted against the limit.
+        self.assertFalse([c for c in routes.writes() if "/issues/6/" in c[1]])
+
+    def test_a_loom_triage_issue_held_for_the_brain_or_a_person_is_left_alone(self):
+        routes = Routes([item(5, labels=["loom:triage", "needs-brain"]),
+                         item(6, labels=["loom:triage", "loom:queued"]),
+                         item(7, labels=["loom:triage", "claim:someone"])])
+        self.assertEqual(self.run_triage(routes), [])
+        self.assertEqual(routes.writes(), [])
+
+    def test_an_untrusted_ready_loom_triage_issue_stays(self):
+        routes = Routes([item(5, labels=["loom:triage"])])
+        with unittest.mock.patch.object(brain, "intake_epic", return_value=INTAKE), \
+                unittest.mock.patch.object(brain.tickets, "brief_author_trusted", return_value=False), \
+                unittest.mock.patch.object(brain, "_epic_tickets", return_value=[]):
+            lines = brain.triage(GitHub("t", transport=routes), REPO, 1)
+        self.assertEqual(lines, [])
+        self.assertEqual(routes.writes(), [])
+
     def test_pull_requests_epics_and_labelled_issues_are_skipped(self):
         routes = Routes([
             item(2, pull_request={"url": "x"}),
             item(3, labels=["Epic"]),
             item(4, sub_issues_summary={"total": 3, "completed": 0}),
-            item(5, labels=["loom:triage"]),
+            item(5, labels=["loom:triage"], body="broken"),
             item(6, labels=["loom:human"]),
             item(7, labels=["needs-operator"]),
             item(8, labels=["bug"], body="broken"),

@@ -357,9 +357,15 @@ below; where the steps leave room, this is how to spend it.
     its own. Read that line instead of judging the time. A step may be
     deferred on budget only when the printed elapsed is 20 minutes or more;
     under 20, a `step` or `defer` note that defers on budget is refused
-    (recorded as refused, exit 1), so do the step instead (loom#2104). Until
-    the clock is in (a `step` that prints no elapsed line) and the tick is
-    short, run triage before verify.
+    (recorded as refused, exit 1), so do the step instead (loom#2104). A
+    refused step still counts as not run. Every step from status to sweep is
+    recorded before the journal, a step with nothing to do with a note
+    saying so: under the budget, `step journal` is refused while one is not
+    run, and names the next (loom#3593). `python3 -m bus.brain step-pending`
+    lists the steps not run; the lane machine wrapper reads it when the
+    agent exits and hands the tick back while steps are left and the clock
+    is open. Until the clock is in (a `step` that prints no elapsed line)
+    and the tick is short, run triage before verify.
 12. The journal ends with what moved, counted: merged N, briefed N (with
     numbers), closed or verified N, escalated N, factory tickets filed N,
     deferred N with their stages. A tick that moved nothing says so as its
@@ -814,10 +820,13 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    home onboard opens for a repo carries the `loom:backlog` label; one opened
    before that label existed has a title starting `Backlog:`), with the
    default limit of 25 issues a run, oldest first. It skips pull requests,
-   epics, asks and anything with a `loom:` label; a ready issue (every brief
-   section, checkboxes under Acceptance criteria) becomes a `loom:queued`
-   ticket under the goal's intake epic, the rest get `loom:triage` (no comment;
-   the printed line names what is missing). Where the station has `LOOM_REWRITE_CMD` set it rewrites
+   epics, asks and anything with a `loom:` label other than `loom:triage`; a
+   ready issue (every brief section, checkboxes under Acceptance criteria)
+   becomes a `loom:queued` ticket under the goal's intake epic, a
+   `loom:triage` one included, the rest get `loom:triage` (no comment;
+   the printed line names what is missing). A `loom:triage` issue left after
+   that is not ready: it needs a rewrite, so the station's run never covers
+   it. Where the station has `LOOM_REWRITE_CMD` set it rewrites
    `loom:triage` issues itself (docs/BRAIN.md, Agent rewrites); the brain
    takes what is left (the `needs-brain` ones first: the station's rewrite
    model judged them person-only, and you decide), and only rewrites
@@ -994,8 +1003,8 @@ tuple `LANE_ORDER` in bus/factory.py):
   (the operator wants every free tier used up, 2026-10-19): one slot per
   free provider (`free-ollama`, `free-gemma`, `free-nvidia`, `free-kilo`,
   `free-groq`, `free-openrouter`) at its pinned route on the spark-gateway,
-  each waiting out its own provider's reset, then openrouter, workersai,
-  zen, zai and copilot; then the subscriptions: opencode-go and its slots,
+  each waiting out its own provider's reset, then openrouter, tinker,
+  workersai, zen, zai and copilot; then the subscriptions: opencode-go and its slots,
   codex, claude, agy, muse (muse runs remotely); then the never-paid
   anthropic slots last. free-ollama is Ollama Cloud and free-gemma is Gemma,
   both on any repo. These lanes take work on public repos only: zen, zai,
@@ -1034,6 +1043,11 @@ An anthropic slot whose heartbeat says "out of credit" is unavailable. Do not
 brief, re-brief, move a limit-held ticket, or climb the ladder onto it until
 its hold expires. When the API credit is gone, route hard work to codex and
 the claude lane.
+
+The Anthropic spend floor (`LOOM_ANTHROPIC_FLOOR_USD`, the lane status line
+"Under the $5.00 floor") parks the anthropic slots only. It is never a
+reason to brief nothing: brief every other lane as usual. `brief --lane`
+refuses only an anthropic slot under the floor (loom#3593).
 
 Spark takes one ticket at a time and steps aside while its box is hot: the
 factory moves its waiting tickets to the first free other lane as above,

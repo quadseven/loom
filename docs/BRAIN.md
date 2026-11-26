@@ -506,6 +506,19 @@ only, and posts no comment: it never closes or retitles an issue, and edits noth
 line below, because an automated pass over old issues over-calls work as
 done.
 
+A `loom:triage` issue is read again on every run (loom#3594): one whose
+only Loom label is `loom:triage`, with no `needs:human` ask, no
+`needs-brain` hold, no `claim:` label and no assignee, is queued as above
+when its body is ready and its author trusted, and `loom:triage` comes off.
+One still not ready is left as it is, with no write, and does not count
+against `--limit`. So an issue an intake labelled without reading it
+(`ready-for-agent`, or any unseen issue, docs/LANES.md), or one whose body
+was completed later, becomes a ticket at the station's hourly triage with
+no model call, and the station gives the queued ticket the first free lane
+of its tier, cheapest first. On 2026-11-25 brain ticks recorded "no
+rewrites this tick, the hourly station triage covers intake" while ready
+`loom:triage` issues waited: this makes that true for the plain case.
+
 GitHub holds at most 100 sub-issues under one issue and refuses the next one
 (422). The sub-issue link is best effort everywhere: any refusal is logged,
 not raised, and the ticket is still queued. A ticket a goal refuses, from
@@ -1502,8 +1515,9 @@ that fails posts nothing, so a bad API answer cannot start a second comment.
   `<!-- loom:key-repeat v1 -->` comment on the open issue: a running count, the
   first and last time, the tickets (or lanes) seen, and the latest detail.
 - A factory incident is filed on the public factory repo, so it names only a
-  repo known to be public. Any other repo is `private repo <alias>` (a random
-  id the lane machine keeps per repo), and its ticket and failing line are
+  repo known to be public. Any other repo is `private repo <alias>` (8 hex
+  digits every host derives from the repo's GitHub id; a host that cannot
+  read the id falls back to a random one it keeps), and its ticket and failing line are
   withheld; they stay in the lane log and on the ticket. A public repo's
   detail that fails the public repo leak scan is withheld the same way.
 
@@ -1737,6 +1751,26 @@ have their own slot (see Regression slot). Write the journal, report when
 due, and release the lock. A failed step goes in the journal and waits for
 the next tick.
 
+A tick runs every step (loom#3593). The tick record keeps the steps whose
+last note was refused for deferring on budget (`refused`); such a step
+counts as not run. For a tick whose record starts with a timed `lock` step,
+`bus.brain step journal` is refused and nothing is recorded while a step
+from `status` to `sweep` is not run and the tick has used less than its
+budget minutes; the refusal names the next step. Past the budget the
+journal goes through and the tick may end. `python3 -m bus.brain
+step-pending` prints the elapsed line and the steps not run, and exits 0
+only while steps are left and the clock is open. `lanes/mac/brain.sh` reads
+it after an agent that ended well and runs the agent again with the steps
+named, at most `LOOM_BRAIN_CONTINUES` times (default 2) and only with 5 or
+more minutes left. On 2026-11-25 every lane machine tick ended after merge
+with 10 of its 12 minutes left, so brief and triage never ran.
+
+The Anthropic spend floor (docs/LANES.md, Anthropic spend) parks the
+anthropic slots only. `bus.brain brief --lane L` is refused under the floor
+when L is an anthropic slot (its lane status row is parked for Anthropic
+credit, or the status spend line says it is under the floor); a brief to any
+other lane, or with no lane, is never held by it.
+
 ## Tickets no lane takes
 
 A ticket the factory leaves waiting because no lane takes it (no free lane
@@ -1759,9 +1793,11 @@ no-lane reasons and dropped when a lane takes it), and the factory acts on it:
   (`PIN_FALLBACK_MAX`): a fallback run that fails climbs the ladder as any
   failure does. The status comment says `Not a failure` with a
   `loom:pin-fallback <model>` marker, and the station log says `pin fallback
-  from model <model> after N minutes`. Hard pins wait instead: a ticket a
-  person opened (the operator wrote its `Model:` line), and one carrying
-  `class:sensitive` or `tier:security` (docs/BRIEF_FORMAT.md). No demotion is
+  from model <model> after N minutes`. Hard pins wait instead: a ticket
+  carrying `class:sensitive` or `tier:security` (docs/BRIEF_FORMAT.md). A
+  ticket a person account opened is no hard pin: agent sessions post as that
+  account (loom#3592). The clock is kept in the station's state store, so a
+  station restart does not reset it. No demotion is
   lifted and no credit spent: the fallback routes around both. On
   2026-11-17 one pass assigned 0 of 86 queued tickets, each pinned to a codex
   or anthropic model with no lane up, while about 30 other lanes sat idle.
@@ -1989,8 +2025,11 @@ for the head. Nobody who opened the pull request or authored or committed
 any of its commits approves it, the review bot included. Commit author and
 committer are client-set, so a commit whose author or committer has no
 GitHub login (an unknown writer) refuses, and so does a pull request of 250
-or more commits, past what GitHub lists. No automation login
-approves by marker: `LOOM_GITHUB_LOGIN`, `LOOM_BRIEF_AUTHORS`,
+or more commits, past what GitHub lists. A marker approval also bars
+whoever pushed to the head branch, read from the repository's push activity
+(the pusher is set by GitHub, not the client); activity that cannot be read,
+a push with no login, or no push ending at the head refuses (loom#3548). No
+automation login approves by marker: `LOOM_GITHUB_LOGIN`, `LOOM_BRIEF_AUTHORS`,
 `LOOM_TRUSTED_BRIEFERS`, any `agent-` login, any App and the check bots
 (github-actions, copilot, dependabot, renovate). A review check that
 concluded success, neutral or skipped is no approval, an approval on an

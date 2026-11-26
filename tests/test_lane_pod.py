@@ -146,6 +146,38 @@ echo "agent-exit $slot $status" >> "$FAKE_LOG"
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse(self.log.exists())
 
+    # The sign-in probe (lanes/signin_probe.sh, loom#3572): one per sign-in
+    # lane with a slot here, covering every slot of that lane.
+    FAKE_PROBE = """#!/usr/bin/env bash
+echo "probe $*" >> "$FAKE_LOG"
+"""
+
+    def with_fake_probe(self):
+        probe = self.root / "lanes" / "signin_probe.sh"
+        probe.write_text(self.FAKE_PROBE)
+        probe.chmod(0o755)
+
+    def test_one_round_probes_each_sign_in_lane_over_all_its_slots(self):
+        self.with_fake_probe()
+        result = self.pod(LOOM_POD_SLOTS="codex codex-2 codex-12 zen")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = self.log.read_text().splitlines()
+        self.assertEqual([line for line in lines if line.startswith("probe")],
+                         ["probe codex codex-2 codex-12"])
+
+    def test_no_probe_for_api_lanes_or_when_turned_off(self):
+        self.with_fake_probe()
+        for env in ({"LOOM_POD_SLOTS": "zen opencode-go-5"},
+                    {"LOOM_POD_SLOTS": "claude", "LOOM_SIGNIN_PROBE_INTERVAL": "0"},
+                    {"LOOM_POD_SLOTS": "claude", "LOOM_SIGNIN_LANES": ""}):
+            with self.subTest(env=env):
+                if self.log.exists():
+                    self.log.unlink()
+                result = self.pod(**env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(any(line.startswith("probe")
+                                     for line in self.log.read_text().splitlines()))
+
 
 if __name__ == "__main__":
     unittest.main()

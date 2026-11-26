@@ -112,6 +112,8 @@ class FakeGitHub:
         self.check_runs = {}
         self.pull_files = {}
         self.carried = set()
+        # Side branches that hold commits the default branch lacks.
+        self.side_edits = set()
         self.check_runs_status = 200
         self.head_files = {}
         # Commit sha -> the files it changed, for a "Fixed in <sha>" answer.
@@ -335,7 +337,9 @@ class FakeGitHub:
                 return reply(200, page_items, headers)
             return reply(200, self.pulls)
         if method == "GET" and rest.startswith("compare/"):
-            base = rest[len("compare/"):].split("...", 1)[0]
+            base, head = (rest[len("compare/"):].split("...", 1) + [""])[:2]
+            if head in self.side_edits:
+                return reply(200, {"status": "ahead", "ahead_by": 1})
             return reply(200, {"status": "ahead" if base in self.carried else "behind"})
         runs = re.match(r"commits/([0-9a-f]{40})/check-runs$", rest)
         if method == "GET" and runs:
@@ -489,6 +493,15 @@ class FakeGitHub:
             return reply(200, self.lanes_issues)
         if "loom:digest" in query:
             return reply(200, self.digest_issues)
+        if "sort=created&direction=asc" in query and "page=" in query:
+            # A field a test set on open_issues (assignees) holds; labels
+            # and state come from issues, which the fake's writes change.
+            listed = {i["number"]: i for i in self.open_issues}
+            found = sorted((dict(listed.get(i["number"], {}), **i) for i in self.issues.values()
+                            if i["state"] == "open"),
+                           key=lambda i: i.get("created_at") or "")
+            page = int((re.search(r"[?&]page=(\d+)", query) or [0, "1"])[1])
+            return reply(200, found[(page - 1) * 100:page * 100])
         if "sort=created&direction=asc" in query:
             return reply(200, self.open_issues)
         return self._list_briefed(headers)
@@ -5164,7 +5177,9 @@ class CorruptStateTest(Base):
         # The invariant pass also reads the completed scheduled workflow runs.
         # The invariant pass reads open tickets for verify handoff coverage
         # and stale live checks (loom#3509).
-        self.assertEqual(self.run_pass().requests, 24)
+        # The factory release reads the queued wait:incident tickets the hold
+        # ledger does not know, once every 15 minutes (loom#3573).
+        self.assertEqual(self.run_pass().requests, 25)
 
 
 class TicketsTest(unittest.TestCase):
@@ -6290,6 +6305,59 @@ class FixTest(Base):
         self.run_pass()
 
         self.assertIn("kept its edits on branch %s" % side, self.claimed_brief())
+
+    UNVALIDATED = "loom/12-fix-the-thing-unvalidated-1760000000"
+    RED = ("Lane spark failed: [work] validation failed: the remote check was red at b32bd921fc17 "
+           "(failing: test_a.ATest.test_one, test_b.BTest.test_two); the edits are on branch "
+           "%s; no pull request opened" % UNVALIDATED)
+
+    def red_attempt(self, *later):
+        self.fake.add(12)
+        self.comment(12, "Claimed for lane spark (body sha256 0123456789ab)", author="station-example")
+        self.comment(12, self.RED)
+        for body in later:
+            self.comment(12, body)
+
+    def test_a_retry_after_a_red_final_check_resumes_its_branch_and_names_the_tests(self):
+        self.fake.side_edits.add(self.UNVALIDATED)
+        self.red_attempt()
+        self.run_pass()
+        section = self.claimed_brief().split("\n## Earlier attempt\n", 1)[1]
+        self.assertIn("final check failed", section)
+        self.assertIn("kept its edits on branch %s." % self.UNVALIDATED, section)
+        self.assertIn("- `test_a.ATest.test_one`\n- `test_b.BTest.test_two`\n", section)
+
+    def test_a_forged_clause_naming_another_branch_is_not_offered(self):
+        other = "loom/77-another-ticket-unvalidated-1760000000"
+        self.fake.side_edits.add(other)
+        self.fake.side_edits.add(self.UNVALIDATED)
+        self.fake.add(12)
+        self.comment(12, "Claimed for lane spark (body sha256 0123456789ab)", author="station-example")
+        self.comment(12, "Lane spark failed: [work] validation failed: the check exited 1 at abc; "
+                         "the edits are on branch %s; no pull request opened" % other)
+        self.comment(12, "Lane spark failed: [work] note: the edits are on branch %s; then "
+                         "agent exited 1" % self.UNVALIDATED.replace("1760000000", "1"))
+        self.run_pass()
+        self.assertNotIn("Earlier attempt", self.claimed_brief())
+
+    def test_a_red_check_branch_with_no_edits_is_not_offered(self):
+        # A run with no commit still names a side branch, which only holds the base.
+        self.red_attempt()
+        self.run_pass()
+        self.assertNotIn("Earlier attempt", self.claimed_brief())
+
+    def test_a_red_check_branch_older_than_a_pull_request_is_not_offered(self):
+        self.fake.side_edits.add(self.UNVALIDATED)
+        self.red_attempt("Lane codex opened a pull request: https://example.com/pull/99")
+        self.run_pass()
+        self.assertNotIn("Earlier attempt", self.claimed_brief())
+
+    def test_a_fix_brief_resumes_only_a_timed_out_branch(self):
+        self.fake.side_edits.add(self.UNVALIDATED)
+        self.red_attempt("Lane codex opened a pull request: https://example.com/pull/99", FIX_BODY)
+        self.comment(12, self.RED)
+        self.run_pass()
+        self.assertNotIn("Earlier attempt", self.claimed_brief())
 
     def test_a_fix_for_a_pull_request_that_merged_is_never_briefed(self):
         # Three fix rounds in two hours were briefed for pull requests that
@@ -7655,6 +7723,22 @@ class SilentLaneTest(Base):
         say.assert_called_once_with("%s model wait ended" % key)
         self.assertEqual(st._no_lane_since(), {})
         self.assertEqual(st._invariant_waits(), [])
+
+    def test_the_no_lane_clock_survives_a_station_restart(self):
+        # loom#3592: the station pod restarts often; the pin fallback clock
+        # lives in ticket-waits.json, so a new Station and its Factory keep it.
+        first = self.station()
+        start = first.now - 40 * 60
+        first.now = start
+        key = "%s#12" % REPO
+        first._record_waits({key: "no free lane takes model claude-sonnet-5-5"})
+        del first
+        later = self.station()
+        later._record_waits({key: "no free lane takes model claude-sonnet-5-5"})
+        self.assertEqual(later._no_lane_since(), {key: start})
+        worker = later._factory()
+        self.assertEqual(worker.no_lane_since, {key: start})
+        self.assertGreaterEqual(worker.now - worker.no_lane_since[key], factory.PIN_FALLBACK_WAIT)
 
     def test_a_wait_reason_that_could_carry_ticket_text_never_reaches_the_invariant(self):
         st = self.station()
@@ -10605,7 +10689,8 @@ class SpendTest(Base):
                       body=BODY_WITH_CRITERIA.replace("Model: model-x", "Model: claude-sonnet-5-5"))
         st.run_pass()
         self.assertEqual(self.listing("anthropic-4"), [])
-        self.assertIn("Under the $5.00 floor: the anthropic slots take no work.",
+        self.assertIn("Under the $5.00 floor: only the anthropic slots (anthropic to "
+                      "anthropic-8) take no work; every other lane takes briefs as usual.",
                       self.fake.posts[0])
         self.assertIn("| anthropic-4 | parked |", self.fake.posts[0])
         # Above the floor, the same heartbeat takes work again.
@@ -16417,8 +16502,8 @@ class ReadyForAgentIntakeTest(Base):
                 if len(posts) == 2:
                     raise station.GitHubError("server error", 500)
             return real(method, path, *args, **kw)
+        self.settings.intake_per_run = 2
         with mock.patch.object(runner.gh, "rest", side_effect=rest), \
-                mock.patch.object(station, "READY_PER_RUN", 2), \
                 mock.patch.object(runner, "_verify_repos", return_value=[REPO, REPO]), \
                 mock.patch("bus.station._say") as say:
             runner.intake_ready_for_agent()
@@ -16448,6 +16533,76 @@ class ReadyForAgentIntakeTest(Base):
         said = self.intake()
         self.assertIn("loom:triage", self.fake.names(21))
         self.assertEqual(said, ["ready-for-agent intake: 1 issue to loom:triage"])
+
+
+class UnseenIssueIntakeTest(Base):
+    """On 2026-11-25, 375 open issues carried no triage or Loom label and Loom
+    never read them. With intake_all the hourly intake gives every such issue
+    loom:triage, ready-for-agent ones first, under one configurable cap."""
+
+    def setUp(self):
+        super().setUp()
+        self.settings.intake_all = True
+
+    def issue(self, number, labels=(), created="2030-01-01T00:00:00Z", **fields):
+        self.fake.add_open_issue(number, created=created)
+        self.fake.issues[number]["labels"] = [{"name": name} for name in labels]
+        self.fake.issues[number].update(fields)
+
+    def intake(self):
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        with mock.patch("bus.station._say") as say:
+            runner.intake_ready_for_agent()
+        return [c.args[0] for c in say.call_args_list]
+
+    def test_an_unlabelled_issue_goes_to_triage(self):
+        self.issue(21)
+        said = self.intake()
+        self.assertEqual(self.fake.names(21), ["loom:triage"])
+        self.assertEqual(self.fake.comments[21], [])
+        self.assertEqual(said, ["ready-for-agent intake: 1 issue to loom:triage"])
+
+    def test_held_or_non_work_issues_are_left_alone(self):
+        self.issue(21, labels=("claim:someone",))
+        self.issue(22, assignees=[{"login": "someone"}])
+        self.issue(23, labels=("epic",))
+        self.issue(24, labels=("needs:human",))
+        self.issue(25, labels=("loom:queued", "loom:ticket"))
+        self.issue(26, pull_request={"url": "x"})
+        self.intake()
+        for number in range(21, 27):
+            self.assertNotIn("loom:triage", self.fake.names(number), number)
+
+    def test_ready_for_agent_issues_go_first_under_the_one_cap(self):
+        self.settings.intake_per_run = 2
+        self.issue(21, created="2030-01-01T00:00:00Z")
+        self.issue(22, labels=("ready-for-agent",), created="2030-01-03T00:00:00Z")
+        self.issue(23, created="2030-01-02T00:00:00Z")
+        self.intake()
+        labeled = [n for n in (21, 22, 23) if "loom:triage" in self.fake.names(n)]
+        self.assertEqual(labeled, [21, 22])
+
+    def test_a_backlog_of_issues_drains_by_the_cap_each_hour(self):
+        self.settings.intake_per_run = 60
+        for n in range(150):
+            self.issue(300 + n, created="2030-01-01T%02d:%02d:00Z" % (n // 60, n % 60))
+        self.intake()
+        labeled = [n for n in range(300, 450) if "loom:triage" in self.fake.names(n)]
+        self.assertEqual(labeled, list(range(300, 360)))
+
+    def test_without_intake_all_only_ready_for_agent_issues_are_taken(self):
+        self.settings.intake_all = False
+        self.issue(21)
+        self.intake()
+        self.assertNotIn("loom:triage", self.fake.names(21))
+
+    def test_the_cap_and_switch_come_from_the_environment(self):
+        self.assertEqual(station._intake_per_run(""), station.INTAKE_PER_RUN)
+        self.assertEqual(station._intake_per_run("25"), 25)
+        self.assertEqual(station._intake_per_run("5000"), station.INTAKE_MAX)
+        self.assertEqual(station._intake_per_run("0"), station.INTAKE_PER_RUN)
+        self.assertEqual(station._intake_per_run("lots"), station.INTAKE_PER_RUN)
+        self.assertLess(station.INTAKE_MAX, 81)
 
 
 class HumanClaimTest(Base):
