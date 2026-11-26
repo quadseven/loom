@@ -181,6 +181,8 @@ class FakeGitHub:
             if number not in self.issues:
                 return Response(404, {"message": "Not Found"})
             return Response(200, self.issues[number])
+        if re.search(r"/pulls\?state=closed&sort=updated&direction=desc&per_page=100$", path):
+            return Response(200, [p for p in self.pulls.values() if p.get("state") == "closed"])
         m = re.search(r"/pulls/(\d+)$", path)
         if m:
             return Response(200, self.pulls[int(m.group(1))])
@@ -3739,7 +3741,7 @@ class EveryLaneTriesEveryTicket(Base):
     def test_one_lane_list_ordered_by_cost(self):
         kinds = [factory.KINDS.index(factory.lane_kind(x)) for x in factory.LANE_ORDER]
         self.assertEqual(kinds, sorted(kinds))
-        self.assertEqual(factory.LANE_ORDER[:4], factory.SPARKS)
+        self.assertEqual(factory.LANE_ORDER[:len(factory.SPARKS)], factory.SPARKS)
         self.assertEqual(factory.LANE_ORDER[-len(factory.ANTHROPIC):], factory.ANTHROPIC)
         self.assertEqual(len(set(factory.LANE_ORDER)), len(factory.LANE_ORDER))
         paid = [x for x in factory.LANE_ORDER if factory.lane_kind(x) == "subscription"]
@@ -4433,7 +4435,7 @@ class Tickets(Base):
 
     def test_a_public_easy_ticket_may_go_to_the_muse_spark_slot_and_a_private_one_never(self):
         self.gh.private = False
-        self.limited_easy(busy=factory.FREE_POOL + ("openrouter", "workersai", "zen", "zai", "copilot",
+        self.limited_easy(busy=factory.FREE_POOL + ("openrouter", "tinker", "workersai", "zen", "zai", "copilot",
                                                     "opencode-go", "opencode-go-1", "opencode-go-2",
                                                     "opencode-go-3"))
         self.assertEqual(self.lane(7), "opencode-go-4")
@@ -4441,7 +4443,7 @@ class Tickets(Base):
         self.assertNotIn("opencode-go-4", factory.lanes_for(True))
 
     def test_a_private_easy_ticket_goes_to_spark_2_when_spark_is_busy(self):
-        self.assertEqual(factory.lanes_for(True)[:4], factory.SPARKS)
+        self.assertEqual(factory.lanes_for(True)[:len(factory.SPARKS)], factory.SPARKS)
         self.gh.private = True
         self.limited_easy(limited=("spark",))
         self.assertEqual(self.lane(7), "spark-2")
@@ -4451,9 +4453,10 @@ class Tickets(Base):
         # free provider slots: on a private repo only the two allowed private
         # code, then opencode-go: the free lanes openrouter and workersai take
         # public repos only (loom#2358).
-        self.assertEqual(factory.LANE_ORDER[:4], factory.SPARKS)
-        self.assertEqual(factory.LANE_ORDER[4:10], factory.FREE_POOL)
-        self.assertEqual(factory.lanes_for(True)[4:7],
+        self.assertEqual(factory.LANE_ORDER[:len(factory.SPARKS)], factory.SPARKS)
+        n = len(factory.SPARKS)
+        self.assertEqual(factory.LANE_ORDER[n:n + 6], factory.FREE_POOL)
+        self.assertEqual(factory.lanes_for(True)[n:n + 3],
                          ("free-ollama", "free-gemma", "opencode-go"))
 
     def test_a_slot_on_cluster_runners_never_takes_a_private_repos_ticket(self):
@@ -4470,8 +4473,23 @@ class Tickets(Base):
     def test_the_free_lanes_come_before_the_paid_codex_lanes(self):
         # Operator 2026-10-19: "I always want my free tier used up".
         order = factory.LANE_ORDER
-        for lane in ("openrouter", "workersai", "zen", "zai"):
+        for lane in ("openrouter", "tinker", "workersai", "zen", "zai"):
             self.assertLess(order.index(lane), order.index("codex"))
+
+    def test_the_tinker_lane_takes_the_openrouter_lanes_tickets_on_free_models_only(self):
+        # loom#3579: a free lane, tried right after openrouter, public repos
+        # only, and routed only tickets whose pin is a tinker :free model.
+        from bus import station
+        order = factory.LANE_ORDER
+        self.assertEqual(order.index("tinker"), order.index("openrouter") + 1)
+        self.assertEqual(factory.lane_kind("tinker"), "free")
+        self.assertIn("tinker", factory.lanes_for(False))
+        self.assertNotIn("tinker", factory.lanes_for(True))
+        self.assertTrue(station.needs_public_repo("tinker", ""))
+        self.assertTrue(station.lane_takes_model("tinker",
+                                                 "tinker/thinkingmachines/Inkling-2-Mini:peft:65536:free"))
+        self.assertFalse(station.lane_takes_model("tinker", "tinker/thinkingmachines/Inkling-2-Mini:peft:65536"))
+        self.assertFalse(station.lane_takes_model("tinker", "openrouter/vendor/model:free"))
 
     def test_free_provider_slots_that_may_train_take_public_repos_only(self):
         for lane in ("free-nvidia", "free-kilo", "free-groq", "free-openrouter"):
@@ -4502,7 +4520,7 @@ class Tickets(Base):
 
     def test_a_public_easy_ticket_may_go_to_zen(self):
         self.gh.private = False
-        self.limited_easy(busy=("openrouter", "workersai") + factory.FREE_POOL)
+        self.limited_easy(busy=("openrouter", "tinker", "workersai") + factory.FREE_POOL)
         self.assertEqual(self.lane(7), "zen")
 
     def test_a_limit_hand_off_of_a_briefed_ticket_never_picks_a_remote_lane(self):
@@ -4982,6 +5000,31 @@ class Helpers(unittest.TestCase):
         with mock.patch("bus.factory._say") as say:
             self.assertIsNone(f._association(REPO, other))
         say.assert_not_called()
+
+    def test_ticket_references_to_multiple_repos_have_no_association_or_log(self):
+        f = factory.Factory(FakeGitHub(), [REPO], NOW)
+        for repos in ((REPO, "example-org/other-repo"),
+                      ("example-org/other-repo", "example-org/third-repo")):
+            for branch in ("pin-image", "loom/7-update"):
+                with self.subTest(repos=repos, branch=branch):
+                    pr = {"number": 50, "body": "Refs %s#5\nRefs %s#6\n" % repos,
+                          "head": {"ref": branch}}
+                    with mock.patch("bus.factory._say") as say:
+                        self.assertIsNone(f._association(REPO, pr))
+                    say.assert_not_called()
+
+    def test_a_merged_pull_request_has_no_association_or_log(self):
+        f = factory.Factory(FakeGitHub(), [REPO], NOW)
+        bodies = ("Refs #5", "Refs #5\nRefs #6", "Refs %s#5" % REPO,
+                  "Refs %s#5\nRefs %s#6" % (REPO, REPO))
+        for merged in ({"merged_at": iso(0)}, {"merged": True}):
+            for body in bodies:
+                with self.subTest(merged=merged, body=body):
+                    pr = dict(merged, number=50, state="closed", body=body,
+                              head={"ref": "pin-image"})
+                    with mock.patch("bus.factory._say") as say:
+                        self.assertIsNone(f._association(REPO, pr))
+                    say.assert_not_called()
 
     def test_conflicting_ticket_references_still_log_their_line(self):
         f = factory.Factory(FakeGitHub(), [REPO], NOW)
@@ -5498,10 +5541,13 @@ class NoLane(Base):
         self.gh.issues[number]["created_at"] = iso(0)
 
     def assign(self, waited, available, **kwargs):
+        # These tests time the reroute and the hand-off alone: the pin
+        # fallback (PinFallback) would move any pinned ticket after 30 minutes.
         key = "%s#7" % REPO
-        worker = factory.Factory(self.gh, [REPO], NOW, trusted=["alice-example"],
-                                 available=available, no_lane_since={key: NOW - waited},
-                                 **kwargs)
+        with mock.patch.dict(os.environ, {"LOOM_PIN_FALLBACK_MINUTES": "0"}):
+            worker = factory.Factory(self.gh, [REPO], NOW, trusted=["alice-example"],
+                                     available=available, no_lane_since={key: NOW - waited},
+                                     **kwargs)
         worker.assign_queued()
         return worker
 
@@ -5689,20 +5735,25 @@ class PinFallback(Base):
         self.assign(11 * 60, ["spark"], env={"LOOM_PIN_FALLBACK_MINUTES": "10"})
         self.assertEqual((self.lane(7), self.model(7)), ("spark", None))
 
-    def test_a_ticket_a_person_opened_keeps_its_pin(self):
-        # The operator wrote its Model: line: a hard pin.
+    def test_a_ticket_a_person_opened_falls_back_like_any_default_pin(self):
+        # loom#3592: agent sessions post as the person account, so its
+        # Model: line is a default; every lane may try every ticket (loom#3550).
         self.queued(7, user=ME)
-        worker = self.assign(3 * 3600, ["spark"])
-        self.assertEqual((factory._state(self.gh.issues[7]), self.model(7)),
-                         ("queued", "claude-sonnet-5-5"))
-        self.assertIn("%s#7" % REPO, worker.waits)
+        self.assertEqual(factory.hard_pin(self.gh.issues[7]), "")
+        worker = self.assign(31 * 60, ["spark"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7), self.model(7)),
+                         ("briefed", "spark", None))
+        self.assertIn(factory.PIN_FALLBACK_MARKER % "claude-sonnet-5-5", self.notes(7))
+        self.assertIn("%s#7" % REPO, worker.settled)
 
     def test_a_sensitive_or_security_ticket_keeps_its_pin(self):
-        for label in ("class:sensitive", "tier:security"):
-            self.queued(7, labels=(label,))
-            self.assign(3 * 3600, ["spark"])
-            self.assertEqual((factory._state(self.gh.issues[7]), self.model(7)),
-                             ("queued", "claude-sonnet-5-5"), label)
+        for user in (None, ME):
+            for label in ("class:sensitive", "tier:security"):
+                self.queued(7, user=user, labels=(label,))
+                self.assertEqual(factory.hard_pin(self.gh.issues[7]), "it carries %s" % label)
+                self.assign(3 * 3600, ["spark"])
+                self.assertEqual((factory._state(self.gh.issues[7]), self.model(7)),
+                                 ("queued", "claude-sonnet-5-5"), (user, label))
 
     def test_a_fallback_skips_a_lane_the_ticket_already_ran_on(self):
         self.queued(7)

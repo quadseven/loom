@@ -57,6 +57,9 @@ def _codex_limits(item: Any, now: float) -> Dict[str, Dict[str, Any]]:
             break
     if not isinstance(limits, dict):
         return {}
+    observed = _observed(item)
+    observed_at = _parse(observed)
+    anchor = now if observed_at is None else observed_at
     found = {}
     for key, label in (("primary", "5-hour"), ("secondary", "weekly")):
         window = limits.get(key)
@@ -68,11 +71,9 @@ def _codex_limits(item: Any, now: float) -> Dict[str, Dict[str, Any]]:
             relative = reset is None
             if reset is None:
                 reset = window.get("resets_in_seconds")
-            if reset is None and isinstance(window.get("window_minutes"), (int, float)):
-                reset = window["window_minutes"] * 60
-            found[label] = {"used": float(used), "reset": _utc_epoch(reset, now, relative),
+            found[label] = {"used": float(used), "reset": _utc_epoch(reset, anchor, relative),
                             "minutes": _minutes(window.get("window_minutes")),
-                            "observed": _observed(item)}
+                            "observed": observed}
     return found
 
 
@@ -126,8 +127,8 @@ def _tail_lines(path: Path) -> List[str]:
 
 
 def _read_codex_sessions(sessions: Path, now: float) -> Dict[str, Dict[str, Any]]:
-    """The rate-limit windows of the newest line that carries any, looking at
-    the newest SESSION_FILES files, newest first, and only their tails."""
+    """The newest reading of each window from the bounded session tails."""
+    readings = {}
     for path in _newest_sessions(sessions):
         try:
             lines = _tail_lines(path)
@@ -138,15 +139,22 @@ def _read_codex_sessions(sessions: Path, now: float) -> Dict[str, Dict[str, Any]
                 found = _codex_limits(json.loads(line), now)
             except ValueError:
                 continue
-            if found:
-                return found
-    return {}
+            for window, reading in found.items():
+                readings.setdefault(window, reading)
+            if len(readings) == 2:
+                return readings
+    return readings
 
 
-def codex_records(lanes: List[str], sessions: Path, now: float) -> List[Dict[str, Any]]:
+def codex_records(lanes: List[str], sessions: Path, now: float,
+                  home: Optional[str] = None) -> List[Dict[str, Any]]:
     if not sessions.is_dir():
-        # The collector reads the session logs of the machine it runs on; a
-        # machine where codex never ran has none, and says so.
+        # The collector reads the session logs of the machine it runs on. In
+        # the cluster they live in the codex lane's own Codex home, which the
+        # station does not mount, so the lane writes them to the shared Loom
+        # home as state/usage/<slot>.meter.json (bus/meter.py codex_record).
+        if home is not None and _newest_meter(home, lanes) is not None:
+            return _meter_records("codex", home, lanes, now)
         return [_record("codex", lanes, "all", None, None, None, None, "codex session logs", now,
                         "no codex session logs on this machine")]
     found = _read_codex_sessions(sessions, now)
@@ -201,9 +209,8 @@ def anthropic_records(home: str, lanes: List[str], env: Dict[str, str], now: flo
 # The runner writes each lane's heartbeat (state/usage/<lane>.json): a lane
 # held at a limit says "limit: <why>; ... until <time>" with retry_at, the
 # reset its CLI printed (lanes/agent_cli.sh classify_failure). That is the
-# only usage state the claude and agy CLIs leave: neither writes a usage
-# figure on disk. The last hold seen is kept beside the heartbeat, so the
-# Usage view still says when a lane was last limited after the hold lifts.
+# fallback when no CLI usage meter is available. The last hold seen is kept
+# beside the heartbeat so the Usage view can show it after the hold lifts.
 HOLD_UNTIL = re.compile(r";\s*(?:lane waits|unavailable) until \S+")
 
 
@@ -384,7 +391,7 @@ def _meter_records(provider: str, home: str, slots: List[str], now: float) -> Li
                          _utc_epoch(window.get("resets_at"), now, relative=False),
                          source, now, _meter_note(window))
         record["window_minutes"] = window.get("window_minutes")
-        record["observed_at"] = observed
+        record["observed_at"] = _utc_epoch(window.get("at"), now, relative=False) or observed
         records.append(record)
     if records:
         return records
@@ -449,7 +456,7 @@ def collect(home: str, env: Optional[Dict[str, str]] = None, now: Optional[float
         "anthropic": lambda _home, slots, settings, stamp: anthropic_records(_home, slots, settings, stamp),
         "codex": lambda _home, slots, settings, stamp: codex_records(
             slots, sessions or Path(settings.get("LOOM_CODEX_SESSIONS")
-                                    or Path.home() / ".codex" / "sessions"), stamp),
+                                    or Path.home() / ".codex" / "sessions"), stamp, _home),
         "opencode-go": _opencode_records,
         "spark": _spark_records,
         "claude": lambda _home, slots, _settings, stamp: _cli_meter_records("claude", _home, slots, stamp),
@@ -541,13 +548,14 @@ def _opencode_records(home: str, slots: List[str], _env: Dict[str, str], now: fl
             samples.append(row)
         except (OSError, ValueError):
             pass
-    if not samples:
-        return [_record("opencode-go", slots, "all", None, None, None, None,
-                        "lane probe", now, "not exposed")]
-    row = max(samples, key=lambda x: x.get("at", 0))
-    return [_record("opencode-go", slots, "last 429", None, None, None,
-                    _utc_epoch(row.get("retry_after"), now), "lane probe", now,
-                    "limitName: %s" % row.get("limit_name", "unknown"))]
+    records = _meter_records("opencode-go", home, slots, now) if _newest_meter(home, slots) else []
+    if samples:
+        row = max(samples, key=lambda x: x.get("at", 0))
+        records.append(_record("opencode-go", slots, "last 429", None, None, None,
+                               _utc_epoch(row.get("retry_after"), now), "lane probe", now,
+                               "limitName: %s" % row.get("limit_name", "unknown")))
+    return records or [_record("opencode-go", slots, "all", None, None, None, None,
+                               "lane probe", now, "not exposed")]
 
 
 def _spark_records(home: str, slots: List[str], _env: Dict[str, str], now: float) -> List[Dict[str, Any]]:
@@ -578,6 +586,14 @@ def write(home: str, records: List[Dict[str, Any]]) -> str:
         stream.write("\n")
     os.replace(tmp, path)
     return path
+
+
+def read_snapshot(home: str) -> List[Dict[str, Any]]:
+    try:
+        rows = json.loads((Path(home) / "state" / "usage" / "limits.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
 
 
 # -- the command line -----------------------------------------------------
@@ -613,6 +629,26 @@ def stale_reason(row: Dict[str, Any], now: float) -> Optional[str]:
     return None
 
 
+def preferred_weekly_lanes(rows: List[Dict[str, Any]], now: float) -> set[str]:
+    """Lanes with a fresh, under-half weekly window about to reset."""
+    preferred, limited = set(), set()
+    for row in rows:
+        used = row.get("used_pct")
+        observed = _parse(row.get("observed_at", row.get("as_of")))
+        reset = _parse(row.get("resets_at"))
+        lanes = row.get("lanes")
+        if (not isinstance(used, (int, float)) or isinstance(used, bool)
+                or not isinstance(lanes, list) or observed is None or observed > now
+                or stale_reason(row, now)):
+            continue
+        slots = {lane for lane in lanes if isinstance(lane, str)}
+        if used >= 100:
+            limited.update(slots)
+        if row.get("window") == "weekly" and 0 <= used < 50 and reset is not None and 0 < reset - now < 86400:
+            preferred.update(slots)
+    return preferred - limited
+
+
 def newest_heartbeat(home: str) -> Optional[float]:
     """The newest lane heartbeat time under home, or None."""
     newest = None
@@ -641,6 +677,25 @@ def table(records: List[Dict[str, Any]], now: float) -> List[str]:
             row.get("resets_at") or "unknown", row.get("observed_at") or row.get("as_of") or "unknown",
             row.get("host") or "unknown", row.get("note") or ""))
     return lines
+
+
+def fuel_line(rows: List[Dict[str, Any]], now: float) -> str:
+    """A journal line from numeric weekly readings and their reset times."""
+    figures = []
+    for row in rows:
+        used, lanes = row.get("used_pct"), row.get("lanes")
+        if (row.get("window") != "weekly" or not isinstance(lanes, list)
+                or not isinstance(used, (int, float)) or isinstance(used, bool) or not 0 <= used <= 100):
+            continue
+        names = ", ".join(lane for lane in lanes if lane in labels.LANES)
+        if not names:
+            continue
+        reset = _iso(_parse(row.get("resets_at")))
+        stale = stale_reason(row, now)
+        figures.append("%s weekly %g%% used, resets %s%s" % (
+            names, used, reset.replace("+00:00", "Z") if reset else "at an unknown time",
+            " (stale: %s)" % stale if stale else ""))
+    return "- Fuel: " + " / ".join(figures) if figures else ""
 
 
 def live_url(env: Dict[str, str]) -> str:
@@ -705,6 +760,9 @@ def _live(env: Dict[str, str], now: float) -> int:
         "; over %dh old, so the station has stopped uploading" % (STALE_AFTER // 3600)
         if age > STALE_AFTER else ""))
     print("\n".join(table(rows, now)))
+    fuel = fuel_line(rows, now)
+    if fuel:
+        print(fuel)
     return 0
 
 

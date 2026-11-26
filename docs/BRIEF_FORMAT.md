@@ -15,13 +15,14 @@ pull request footer names the lane and the model. A model from the other
 lane's family is refused.
 
 A ticket's `Model:` line is either a hard pin or a default. A hard pin binds
-however long the ticket waits: the ticket was opened by a person (the
-operator wrote the line), or it carries `class:sensitive` or `tier:security`.
-Any other pin (one a brain's App wrote when it briefed, or the model ladder
-wrote when it climbed) is a default: a queued ticket whose pinned model has
-had no free lane for `LOOM_PIN_FALLBACK_MINUTES` (default 30, `0` turns it
-off) takes the first free lane by cost with that lane's own model,
-and loses the line (docs/BRAIN.md, Tickets no lane takes).
+however long the ticket waits: the ticket carries `class:sensitive` or
+`tier:security`. Any other pin is a default, whoever opened the ticket (agent
+sessions post as the person account, and every lane may try every ticket,
+loom#3550, loom#3592): a queued ticket whose pinned model has had no free
+lane for `LOOM_PIN_FALLBACK_MINUTES` (default 30, `0` turns it off) takes
+the first free lane by cost with that lane's own model, and loses the line
+(docs/BRAIN.md, Tickets no lane takes). A pin the model ladder wrote when it
+climbed waits for its rung instead (loom#3191).
 
 When a ticket body says `Builds on #N`, briefing reads open pull request N and
 uses its head branch as `Base` only for a trusted, non-draft lane pull request

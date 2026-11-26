@@ -3,6 +3,7 @@
 #
 #   run_lane.sh <lane>   lane = codex | claude | openrouter | opencode-go | anthropic
 #                               | zen | zai | workersai | agy | spark | copilot
+#                               | tinker
 #                               | <lane>-<n> (an extra slot of that lane)
 #
 # A slot such as anthropic-2 is a second copy of the anthropic lane: its own
@@ -72,7 +73,7 @@
 # a bwrap agent run, default 60),
 # LOOM_DROP_TREES (1: each run's scratch goes when it ends), LOOM_SSM_DIR (a
 # folder of copied SSM values read in place of SSM; docs/LANES.md, "Lane
-# pods"), LOOM_CLONE_BASE (default git@github.com:), for the anthropic lanes
+# pods"), LOOM_CLONE_BASE (default https://github.com/), for the anthropic lanes
 # LOOM_ANTHROPIC_BUDGET_USD, _BUDGET_SINCE, _BUDGET_EXPIRES and _FLOOR_USD
 # (docs/LANES.md, "Anthropic spend"), and for the spark lane LOOM_SPARK_URL
 # (the OpenAI-compatible base URL of the local vLLM coder, e.g.
@@ -93,6 +94,10 @@ LOOM_HOME="${LOOM_HOME:-$HOME/loom}"
 export LOOM_HOME
 # This checkout, for its python helpers (bus/spend.py).
 LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The fail-closed GitHub identity (loom#3083): github_auth_init,
+# github_auth_mint, github_auth_cleanup.
+# shellcheck source=lanes/github_auth.sh
+. "$LOOM_ROOT/lanes/github_auth.sh" || exit 1
 # The leak scanner a public-repo push reads lives in infra-public, kept at
 # $LOOM_HOME/infra-public and fast-forwarded at most hourly
 # (keep_scanner_current). The default reads it from there.
@@ -157,7 +162,7 @@ keep_scanner_current() {
     echo "set LOOM_INFRA_PUBLIC_REPO or LOOM_LEAK_SCANNER to provide the leak scanner" >&2
     return 1
   fi
-  local now stamp=0 remote="${LOOM_CLONE_BASE:-git@github.com:}$INFRA_PUBLIC_REPO"
+  local now stamp=0 remote="${LOOM_CLONE_BASE:-https://github.com/}$INFRA_PUBLIC_REPO"
   now="$(date +%s)"
   [ -f "$INFRA_PUBLIC_STAMP" ] && stamp="$(tr -cd '0-9' < "$INFRA_PUBLIC_STAMP")"
   if [ -d "$INFRA_PUBLIC/.git" ]; then
@@ -199,6 +204,11 @@ is_lane_runner_pid() {
   command="$(ps -o command= -p "$pid" 2>/dev/null)" || return 2
   [ -n "$command" ] || return 2
   case "$command" in *"run_lane.sh $SLOT") return 0 ;; esac
+  # The sign-in probe holds the lock of every slot it names while it proves
+  # the sign-in in place (lanes/signin_probe.sh, loom#3572).
+  case "$command" in
+    *"/signin_probe.sh "*) case " ${command#*/signin_probe.sh} " in *" $SLOT "*) return 0 ;; esac ;;
+  esac
   return 1
 }
 
@@ -327,7 +337,7 @@ release_heavy_repo() {
   [ -z "$HEAVY_LOCK" ] || heavy_lock release "$HEAVY_LOCK"
   HEAVY_LOCK=""
 }
-trap 'release_heavy_repo; release_check_slot; drop_build_output; drop_run_scratch; drop_check_home; stop_keepalive; rm -rf "$LOCK"' EXIT
+trap 'release_heavy_repo; release_check_slot; drop_build_output; drop_run_scratch; drop_check_home; stop_keepalive; github_auth_cleanup; rm -rf "$LOCK"' EXIT
 
 AGENT_TIMEOUT="${LOOM_AGENT_TIMEOUT:-3600}"
 NET_TIMEOUT="${LOOM_NET_TIMEOUT:-120}"
@@ -363,23 +373,17 @@ if [ -n "${LOOM_LANE_APPS:-}" ]; then
     unset LOOM_GITHUB_APP_KEY_FILE
   fi
 fi
-# A lane with GitHub App settings (LOOM_GITHUB_APP_*, the Loom Lanes App)
-# writes as that App, never as the operator (loom#1142): lanes opened 58 pull
+# A lane writes only as its GitHub App (LOOM_GITHUB_APP_*, the Loom Lanes
+# App), never as the operator (loom#1142, loom#3083): lanes opened 58 pull
 # requests as the operator in a day. It clones over https, and each run mints
-# an installation token for gh and git (lane_app_token). The agent never gets
-# the token in its environment, nor the App's settings or git's helper: its gh
-# reads the token from a per-run gh config directory (agent_gh_config, loom#665).
+# an installation token (lanes/fleet-token) for the gh wrapper and git's one
+# credential helper (lanes/github_auth.sh); with no App or no token the run
+# parks and calls GitHub not at all. The agent never gets the token in its
+# environment, nor the App's settings or git's helper: its gh reads the token
+# from a per-run gh config directory (agent_gh_config, loom#665).
 # LOOM_APP_TOKEN_CMD, when set, prints the token in place of
 # `python3 -m bus app token`.
-if [ -n "${LOOM_GITHUB_APP_ID:-}" ]; then
-  CLONE_BASE="${LOOM_CLONE_BASE:-https://github.com/}"
-  # git asks gh for github.com credentials, and gh answers with GH_TOKEN.
-  export GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=credential.https://github.com.helper \
-    GIT_CONFIG_VALUE_0="" GIT_CONFIG_KEY_1=credential.https://github.com.helper \
-    GIT_CONFIG_VALUE_1="!gh auth git-credential"
-else
-  CLONE_BASE="${LOOM_CLONE_BASE:-git@github.com:}"
-fi
+CLONE_BASE="${LOOM_CLONE_BASE:-https://github.com/}"
 WORKDIR="$LOOM_HOME/worktrees"
 LOGDIR="$LOOM_HOME/logs/$SLOT"
 # The agy lane's agent runs as a dedicated macOS user (default "loom") that
@@ -396,6 +400,14 @@ if [ -n "${LOOM_AGY_RUNAS:-}" ]; then AGY_RUNAS=("$LOOM_AGY_RUNAS"); else AGY_RU
 mkdir -p "$WORKDIR" "$LOGDIR"
 # launchd starts with a bare PATH; the agent CLIs live in these.
 PATH="$PATH:$HOME/.local/bin:$HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin"
+# No ambient GH_TOKEN, no stored login: the gh wrapper first on PATH and a
+# fresh empty GH_CONFIG_DIR from here on (lanes/github_auth.sh).
+# The full EXIT trap names helpers defined further down, so a stop here
+# runs only the ones that exist yet.
+if ! github_auth_init "$LOOM_ROOT/lanes"; then
+  trap 'release_heavy_repo; stop_keepalive; rm -rf "$LOCK"' EXIT
+  exit 1
+fi
 
 # A check that hashes a file needs a sha256sum this machine can execute. The
 # lane plist puts the Intel Homebrew bin directory ahead of everything but the
@@ -1307,21 +1319,11 @@ signin_rest_until() {
   [[ "$until" =~ ^[0-9]+$ ]] && [ "$until" -gt "$(date +%s)" ] && printf '%s' "$until"
 }
 
-# Mint this run's App token into GH_TOKEN. A personal token in the
-# environment is dropped first, so a failed mint leaves gh with nothing to
-# post as. Installation tokens last an hour: a run mints again after its agent.
+# Mint this run's App token into GH_TOKEN (lanes/fleet-token). The old token
+# is dropped first, so a failed mint leaves gh with nothing to post as.
+# Installation tokens last an hour: a run mints again after its agent.
 lane_app_token() {
-  [ -n "${LOOM_GITHUB_APP_ID:-}" ] || return 0
-  local token
-  unset GH_TOKEN GITHUB_TOKEN
-  if [ -n "${LOOM_APP_TOKEN_CMD:-}" ]; then
-    token="$("$LOOM_APP_TOKEN_CMD" 2>> "$LOG")" || return 1
-  else
-    token="$(cd "$LOOM_ROOT" && timeout "$NET_TIMEOUT" python3 -B -m bus app token 2>> "$LOG")" || return 1
-  fi
-  # Installation tokens are ghs_ and a JWT-like body: letters, digits, _ . -
-  [[ "$token" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
-  export GH_TOKEN="$token"
+  github_auth_mint 2>> "$LOG" || return 1
   APP_TOKEN_AT="$(date +%s)"
 }
 
@@ -1330,27 +1332,26 @@ lane_app_token() {
 # LOOM_APP_TOKEN_MAX_AGE seconds (default 45 minutes). A failed mint says so in
 # the log and keeps the old token, which may still work (loom#3231).
 fresh_app_token() {
-  [ -n "${LOOM_GITHUB_APP_ID:-}" ] || return 0
   local now old="${GH_TOKEN:-}" max="${LOOM_APP_TOKEN_MAX_AGE:-2700}"
   now="$(date +%s)"
   [[ "$max" =~ ^[0-9]+$ ]] || max=2700
   [[ "${APP_TOKEN_AT:-}" =~ ^[0-9]+$ ]] && [ $((now - APP_TOKEN_AT)) -lt "$max" ] && return 0
   lane_app_token && return 0
   [ -z "$old" ] || export GH_TOKEN="$old"
-  echo "[$(date -u +%FT%TZ)] ${TICKET:-run}: could not mint a fresh GitHub App token before a GitHub write" >> "$LOG"
+  echo "[$(date -u +%FT%TZ)] ${TICKET:-run}: $APP_TOKEN_STALE_WHY" >> "$LOG"
   return 1
 }
+APP_TOKEN_STALE_WHY="could not mint a fresh GitHub App token before a GitHub write"
 
 # The agent's own gh config directory (loom#665): a fresh one per run, holding
 # this run's App token in the hosts.yml gh reads, so the agent's gh calls bill
 # the App and not the operator. The token never enters the agent's
 # environment and never passes through a gh command whose error text could
 # echo it into the log; printf is a builtin, so it is in no process's argv.
-# Sets AGENT_GH_CONFIG, empty on a lane without App settings.
+# Sets AGENT_GH_CONFIG.
 agent_gh_config() {
   AGENT_GH_CONFIG=""
-  [ -n "${LOOM_GITHUB_APP_ID:-}" ] || return 0
-  [[ "${GH_TOKEN:-}" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
+  [[ "${GH_TOKEN:-}" =~ ^ghs_[A-Za-z0-9_.-]+$ ]] || return 1
   # One runner per lane holds its lock, so this lane's stores are its own:
   # drop one a killed run left behind before making the next.
   rm -rf "$LOOM_HOME/run/$SLOT-gh."* || return 1
@@ -1394,12 +1395,12 @@ APP_TOKEN_WHY="could not mint the lane's GitHub App token (LOOM_GITHUB_APP_*); n
 # Only a brief whose repo passed the owner check and whose privacy is known
 # (LOG_TAIL_OK, set in the brief loop) gets one: a brief is input, and a
 # refused one must not make the lane write to a repo it names. A lane with
-# App settings and no minted token posts nothing, as nothing else does.
+# no minted token posts nothing, as nothing else does.
 LOG_TAIL_MARKER="<!-- loom:lane-log-tail v1 -->"
 LOG_TAIL_OK=0
 post_park_note() {  # failure class, reason
   [ "${LOOM_LOG_TAIL:-on}" != off ] && [ "$LOG_TAIL_OK" = 1 ] || return 0
-  [ -z "${LOOM_GITHUB_APP_ID:-}" ] || [ -n "${GH_TOKEN:-}" ] || return 0
+  [ -n "${GH_TOKEN:-}" ] || return 0
   local class="${1:-work}" reason file scan=() rc=0 text
   case "$class" in limit|size|auth) return 0 ;; esac
   [ -n "${ISSUE_NUMBER:-}" ] && [ -n "${REPO:-}" ] || return 0
@@ -1586,6 +1587,10 @@ LIMIT_MAX_HOLD=86400
 LIMIT_FILE="$LOOM_HOME/state/usage/$SLOT.limit"
 # A spark slot (spark-2) may name its own box: LOOM_SPARK_2_URL, else LOOM_SPARK_URL.
 SPARK_URL="$(lane_setting URL)"
+# The tinker lane's endpoint: LOOM_TINKER_URL, else Tinker's OpenAI-compatible
+# base URL. opencode_config (lanes/agent_sandbox.sh) declares the provider there.
+TINKER_URL=""
+[ "$LANE" = tinker ] && TINKER_URL="${SPARK_URL:-https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1}"
 SPARK_PROBE_TIMEOUT=15
 LIMITED=""
 LIMIT_RETRY_AFTER=""
@@ -1877,8 +1882,16 @@ lift_provider_limit() {
 # Usage view through bus/meter.py, at most every five minutes. The key and the
 # account id go on stdin, so they reach no argv and no log. LOOM_<SLOT>_METER_URL
 # overrides the provider's endpoint. A failed read is recorded, never fatal.
+# A codex lane reads no provider: it copies the newest rate-limit reading in
+# its Codex home's session logs into the same file, because the station does
+# not mount that home in the cluster (loom#3630).
 lane_meter() {
   local url
+  if [ "$LANE" = codex ]; then
+    PYTHONPATH="$LOOM_ROOT" timeout "$PROBE_TIMEOUT" python3 -B -m bus.meter --codex-sessions \
+      "${CODEX_HOME:-$HOME/.codex}/sessions" "$LOOM_HOME/state/usage/$SLOT.meter.json" "$@" > /dev/null 2>&1 || true
+    return 0
+  fi
   case "$LANE" in openrouter|workersai) ;; *) return 0 ;; esac
   [ -n "$API_KEY" ] || return 0
   url="$(lane_setting METER_URL)"
@@ -2154,7 +2167,36 @@ file_ask() {
              --label needs:human --body "$(signed "$body")" 2>>"$LOG" ||
            gh issue create --repo "$FACTORY_REPO" --title "$title" --body "$(signed "$body")" 2>>"$LOG")"
   number="${number##*/}"
-  case "$number" in ''|*[!0-9]*) echo "needs:human ask filing failed" >> "$LOG" ;; esac
+  case "$number" in
+    ''|*[!0-9]*) echo "needs:human ask filing failed" >> "$LOG" ;;
+    *) settle_ask "$title" "$number" "$headline" ;;
+  esac
+  return 0
+}
+
+# Two lanes that hit one expired key in the same second both search, find no
+# open ask (the search index lags a new issue), and both file (loom#3536).
+# Just after filing ask $2 titled $1, list the open issues again with the
+# issue list, which sees a new issue at once. The lowest number with the same
+# title is the one ask: a higher one closes itself and counts its lane on the
+# lowest. The earlier filer never closes, since every later ask has a higher
+# number and every later listing sees it. A failed listing keeps the ask.
+settle_ask() {
+  local title="$1" number="$2" headline="$3" first
+  first="$(TITLE="$title" gh issue list --repo "$FACTORY_REPO" --state open --limit 500 \
+             --json number,title --jq '.[] | select(.title == env.TITLE) | .number' \
+             2>>"$LOG" | tr -cd '0-9\n' | sort -n | head -1)" || return 0
+  [ -n "$first" ] && [ "$first" -lt "$number" ] || return 0
+  # Shadow mode (bus/shadow.py) holds this close, as it is no factory
+  # incident: the duplicate then stays open, as before this check.
+  if PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.shadow gh-guard --lane "$PWD" \
+       issue close --repo "$FACTORY_REPO" "$number" >>"$LOG" 2>&1; then
+    gh issue close --repo "$FACTORY_REPO" "$number" --reason "not planned" --comment "Filed in the same moment as #$first, which holds this ask.$(sign_tail)" >/dev/null 2>>"$LOG" ||
+      echo "could not close the duplicate ask $FACTORY_REPO#$number" >> "$LOG"
+  fi
+  printf '' | upsert_sticky_comment "$FACTORY_REPO" "$first" "$KEY_REPEAT_MARKER" repeat \
+    --headline "$headline" --items-label "Lanes seen" --item "$SLOT" ||
+    echo "could not update the open ask $FACTORY_REPO#$first" >> "$LOG"
   return 0
 }
 
@@ -2470,7 +2512,12 @@ commit_msg() {
 #                               check, and a failure blocks the push the same
 #                               way. It runs the per-directory suites a repo's
 #                               path-scoped CI jobs run (loom#1773).
-# setup, check and affected run as shell commands, like the run: steps of a CI
+#   autoformat: <shell command> optional; runs once before the final check
+#                               with the lane's changed files appended, and
+#                               what it changes in them is committed as one
+#                               format: commit; a failure only skips it
+#                               (loom#3577, contract_autoformat).
+# setup, check, affected and autoformat run as shell commands, like the run: steps of a CI
 # workflow, so they are only ever read from the branch the pull request
 # merges into: the base revision of a new run, and the base branch (fetched
 # for it) of a fix run, whose own branch holds unmerged agent edits. Nothing
@@ -2478,11 +2525,11 @@ commit_msg() {
 # validated by the runner (its CI still is).
 CONTRACT_FILE=.loom/validation.conf
 # Read the key: value lines bus.contract printed into C_INTERP, C_SUBMODULES,
-# C_SETUP, C_CHECK and C_AFFECTED. Returns 1 with SETUP_REASON when a line, the check,
+# C_SETUP, C_CHECK, C_AFFECTED and C_AUTOFORMAT. Returns 1 with SETUP_REASON when a line, the check,
 # submodules, the interpreter or a command is unusable.
 parse_contract() {
   local canon="$1" line key val
-  C_INTERP="" C_SUBMODULES=no C_SETUP="" C_CHECK="" C_AFFECTED=""
+  C_INTERP="" C_SUBMODULES=no C_SETUP="" C_CHECK="" C_AFFECTED="" C_AUTOFORMAT=""
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in ''|'#'*) continue ;; esac
     key="${line%%:*}" val="${line#*:}"
@@ -2493,6 +2540,7 @@ parse_contract() {
       setup) C_SETUP="$val" ;;
       check) C_CHECK="$val" ;;
       affected) C_AFFECTED="$val" ;;
+      autoformat) C_AUTOFORMAT="$val" ;;
       *) SETUP_REASON="$CONTRACT_FILE has an unknown line '${line:0:40}'"; return 1 ;;
     esac
   done <<< "$canon"
@@ -2506,6 +2554,8 @@ parse_contract() {
   done
   contract_command_ok "$C_AFFECTED" ||
     { SETUP_REASON="$CONTRACT_FILE affected: must be printable ASCII, at most 1000 characters"; return 1; }
+  contract_command_ok "$C_AUTOFORMAT" ||
+    { SETUP_REASON="$CONTRACT_FILE autoformat: must be printable ASCII, at most 1000 characters"; return 1; }
 }
 
 # Read .loom/validation.conf from the already-fetched base branch when possible.
@@ -2527,7 +2577,7 @@ load_contract() {
   # A brief need not name a base, and the lane's clone has no origin/HEAD, so
   # a fix round falls back to the default branch update_fix_branch fetched.
   local rev="$BASE" mode canon base_ref="${BASE_BRANCH:-${FIX_DEFAULT:-HEAD}}"
-  HAS_CONTRACT="" C_INTERP="" C_SUBMODULES=no C_SETUP="" C_CHECK="" C_AFFECTED=""
+  HAS_CONTRACT="" C_INTERP="" C_SUBMODULES=no C_SETUP="" C_CHECK="" C_AFFECTED="" C_AUTOFORMAT=""
   if [ -n "$FIX_PR" ]; then
     if ! rev="$(safe_git rev-parse --verify -q "origin/$base_ref^{commit}")"; then
       if ! { fetch_base_for_contract &&
@@ -2622,7 +2672,7 @@ check_failure_names() {  # log offset: one failing name a line, at most 20
     -e 's/^(FAILED|ERROR) ([^ ]+::[^ ]+).*/\2/p' \
     -e 's/^--- FAIL: ([^ ]+).*/\1/p' \
     -e 's/^.*: ([^ :]+): (command )?not found$/missing \1/p' |
-    awk '!seen[$0]++' | head -n 20
+    awk '(index($0, " ") == 0 || /^missing [^ ]+$/) && !seen[$0]++' | head -n 20
 }
 check_failures() {  # log offset
   local out names
@@ -2667,15 +2717,28 @@ check_failure_set() {  # log offset
     -e 's/^(FAILED|ERROR) ([^ ]+::[^ ]+).*/\2/p' \
     -e 's/^--- FAIL: ([^ ]+).*/\1/p' | LC_ALL=C sort -u
 }
-# Whether GitHub's own checks passed on a commit: at least one check run,
-# and every one completed as success, neutral or skipped.
-github_checks_green() {  # sha
-  local runs
+# GitHub's completed verdict: 0 green, 1 red, 2 no settled answer.
+github_checks_verdict() {  # sha, optional fix-base mode
+  local runs query='.check_runs[] | "\(.status) \(.conclusion)"'
+  if [ "${2:-}" = fix-base ]; then
+    query='.check_runs[] | "\(.status) \(.conclusion)\t\(.name)"'
+  fi
   runs="$(timeout "$CHECK_TIMEOUT" gh api --paginate "repos/$REPO/commits/$1/check-runs?per_page=100" \
-    --jq '.check_runs[] | "\(.status) \(.conclusion)"' 2>>"$LOG")" || return 1
-  [ -n "$runs" ] || return 1
+    --jq "$query" 2>>"$LOG")" || return 2
+  if [ "${2:-}" = fix-base ]; then
+    # Review verdicts trigger fix rounds; they do not describe the test base.
+    runs="$(printf '%s\n' "$runs" | awk -F '\t' -v review="${LOOM_REVIEW_CHECK:-Grug - Elder}" \
+      -v plan="${LOOM_PLAN_CHECK:-Grug - Chief}" '$2 != review && $2 != plan { print $1 }')"
+  fi
+  [ -n "$runs" ] || return 2
+  if printf '%s\n' "$runs" | LC_ALL=C grep -qvxE \
+       'completed (success|neutral|skipped|failure|cancelled|timed_out|action_required|stale|startup_failure)'; then
+    return 2
+  fi
   ! printf '%s\n' "$runs" | LC_ALL=C grep -qvxE 'completed (success|neutral|skipped)'
 }
+# Preserve the boolean interface for callers that only accept green.
+github_checks_green() { github_checks_verdict "$1"; [ "$?" -eq 0 ]; }
 # At most this many host-red tests may be set aside; a base red in more
 # places is not a sandbox quirk, and stays a factory incident.
 HOST_RED_MAX=20
@@ -2766,8 +2829,10 @@ base_verdict_read() {  # key, now
   [ -f "$file" ] || return 1
   IFS=' ' read -r at exit uv_cache < "$file" || return 1
   case "$at:$exit" in *[!0-9:]*|:*) return 1 ;; esac
-  # The verdict outlives the check home, but the packages do not. Rerun a
-  # passing check for a codex agent if it warmed uv or predates this marker.
+  # The verdict can outlive the packages: the shared uv cache goes with a
+  # new pod or a bound (bound_check_uv_cache). Rerun a passing check for a
+  # codex agent if the repo's uv cache held anything when it was written, or
+  # the verdict predates this marker.
   if [ "$exit" -eq 0 ] && [ "$LANE" = codex ] && [ "$DELIVERABLE" != base-check ] &&
      [ "$uv_cache" != plain ]; then
     return 1
@@ -2779,7 +2844,9 @@ base_verdict_read() {  # key, now
 }
 base_verdict_write() {  # key, exit
   local uv_cache=plain
-  [ -d "$CHECK_HOME/.cache/uv" ] && uv_cache=uv
+  local key
+  key="$(check_uv_key 2> /dev/null)" &&
+    [ -n "$(ls -A "$CHECK_UV_DIR/repos/$key/cache" 2> /dev/null)" ] && uv_cache=uv
   mkdir -p "$BASE_VERDICT_DIR" || return 1
   printf '%s %s %s\n' "$(date +%s)" "$2" "$uv_cache" > "$BASE_VERDICT_DIR/$1" || return 1
   # Every revision mints a new file; sweep the ones no read can use. A
@@ -2833,14 +2900,16 @@ incident_file() { printf '%s/%s-%s' "$INCIDENT_DIR" "$(printf '%s' "$REPO" | tr 
 # state dir. The state dir only knows what this machine filed, so a pass on
 # another host (a cluster runner, a second Mac) never closed an incident the
 # station host filed, and the tickets stayed held until that one host ran
-# again. Only a public repo has a title another host can rebuild: a private
-# repo's subject is a random alias kept per host unless the shared alias
-# key is readable (incident_subject).
+# again. A private repo's title carries the alias derived from its GitHub id
+# (incident_subject), which every host rebuilds alike.
 shared_incident_number() {  # kind
   local listed subject
-  # A private repo's title is rebuildable only when the shared alias key is
-  # readable (incident_subject then derives the alias from it).
-  subject="$(incident_subject shared-only)" || return 1
+  # No derived alias (the repo id could not be read): only a host-local
+  # alias is left, which no other host's title matches. Say so in the log.
+  if ! subject="$(incident_subject shared-only)"; then
+    echo "could not name this repo's $1 incident; another host's incident stays open until a pass that can" >> "${LOG:-/dev/null}"
+    return 1
+  fi
   if ! listed="$(TITLE="Factory incident: $subject validation $1" MARKER="$INCIDENT_MARKER"     gh issue list --repo "$FACTORY_REPO" --state open --limit 200     --json number,title,body     --jq '.[] | select(.title == env.TITLE and (.body | contains(env.MARKER))) | .number'     2>>"$LOG")"; then
     echo "could not read the open $1 incidents on $FACTORY_REPO; a stale one stays open until the next pass" >> "$LOG"
     return 1
@@ -2858,6 +2927,8 @@ shared_incident_number() {  # kind
 resolve_factory_incidents() {
   local kind file number kinds="${1:-environment contract base-check}"
   local text="${2:-the check passed on the unmodified base in $(incident_ticket).}"
+  # It follows the base check, which can outlast the run's first token.
+  fresh_app_token || true
   for kind in $kinds; do
     file="$(incident_file "$kind")"
     if [ -f "$file" ]; then
@@ -2865,7 +2936,11 @@ resolve_factory_incidents() {
     else
       number=""
       case "$kind" in
-        base-check|contract) number="$(shared_incident_number "$kind")" ;;
+        base-check|contract)
+          number="$(shared_incident_number "$kind")"
+          [ -n "$number" ] ||
+            echo "found no open $kind incident for this repo on ${FACTORY_REPO:-the factory repo} to close" >> "${LOG:-/dev/null}"
+          ;;
       esac
       [ -n "$number" ] || continue
     fi
@@ -2889,24 +2964,31 @@ repo_is_public() { [ "${REPO_PRIVATE:-}" = false ]; }
 incident_ticket() {
   if repo_is_public; then printf '%s' "$TICKET"; else printf 'a private repo ticket'; fi
 }
+# The alias every lane host and the station derive from the repo's GitHub id
+# (bus/incident_probe.py repo_alias), so a pass on any host rebuilds a private
+# repo's incident title and closes an incident another host filed. It needs no
+# shared secret: the shared key it replaced was never created, so a cluster
+# lane could not find the incident and skipped the close silently (loom#3573).
+derived_repo_alias() {
+  local id
+  id="$(timeout "${NET_TIMEOUT:-30}" gh api "repos/$REPO" --jq .id 2>>"${LOG:-/dev/null}")" || return 1
+  case "$id" in ''|*[!0-9]*) return 1 ;; esac
+  PYTHONPATH="${LOOM_ROOT:-.}" python3 -B -m bus.incident_probe alias "$id" 2>>"${LOG:-/dev/null}"
+}
 incident_subject() {  # [shared-only]
   local file alias
   if repo_is_public; then printf '%s' "$REPO"; return 0; fi
-  # Pipe the shared key straight to the signer. Strip trailing newlines
-  # as shell command substitution did so existing shared titles still match.
-  if alias="$(ssm_value "${LOOM_INCIDENT_ALIAS_SSM:-/loom/incident-alias-key}" |
-    REPO_NAME="$REPO" python3 -B -c '
-import hmac, os, sys
-
-key = sys.stdin.buffer.read().rstrip(b"\n")
-if not key:
-    sys.exit(1)
-print(hmac.digest(key, os.environ["REPO_NAME"].encode(), "sha256").hex()[:8])
-')"; then
+  if alias="$(derived_repo_alias)" && [[ "$alias" =~ ^[0-9a-f]{8}$ ]]; then
     printf 'private repo %s' "$alias"
     return 0
   fi
-  [ "${1:-}" != shared-only ] || return 1
+  if [ "${1:-}" = shared-only ]; then
+    echo "could not derive this private repo's incident alias (its GitHub id could not be read); another host's incident cannot be found by title" >> "${LOG:-/dev/null}"
+    return 1
+  fi
+  # Only this host's own state file closes an incident filed under this
+  # fallback alias, so say so.
+  echo "could not derive this private repo's incident alias; using this host's own alias" >> "${LOG:-/dev/null}"
   file="$INCIDENT_DIR/$(printf '%s' "$REPO" | tr '/' '_').alias"
   if [ ! -s "$file" ]; then
     mkdir -p "$INCIDENT_DIR" && od -An -N4 -tx1 /dev/urandom | tr -cd '0-9a-f' > "$file" || return 1
@@ -2992,10 +3074,18 @@ file_factory_incident() {  # kind, detail
 # File or update the factory incident for the current failure, append its
 # reference to the named reason variable, and park the brief as [factory]
 # so the ticket keeps its rung. (Assigns via printf -v, never in a
-# subshell, so PARK_CLASS survives.)
+# subshell, so PARK_CLASS survives.) A setup or check can outlast the token
+# minted when the run began, so this mints again first, here and not in the
+# subshell that files, so the new token stays for the run (loom#3571: eight
+# incidents lost to a 401 after an hour-long setup). A filing that fails
+# after a failed mint names the mint, not the 401 that followed it.
 note_factory_incident() {  # kind, detail, reason_var_name
-  local ref
+  local ref minted=1
+  fresh_app_token || minted=0
   ref="$(file_factory_incident "$1" "$2")"
+  if [ "$minted" = 0 ] && [[ "$ref" == "factory incident filing failed"* ]]; then
+    ref="factory incident filing failed (token mint: $APP_TOKEN_STALE_WHY)"
+  fi
   PARK_CLASS=factory
   printf -v "$3" '%s; %s' "${!3}" "$ref"
 }
@@ -3137,8 +3227,9 @@ release_check_slot() {
 # takes a host check slot. The lanes' App cannot dispatch a workflow, so the
 # request goes to the station through files (bus/remote_checks.py). A private
 # repo, a fix round, a repo with no check contract, a lane on a cluster runner
-# (no station files) and any dispatch error or timeout keep the local slot
-# path. docs/LANES.md, "Remote checks".
+# (no station files) and any dispatch error or timeout keep the local final
+# check. Public fix rounds can read an existing GitHub base verdict on any
+# runner. docs/LANES.md, "Remote checks".
 REMOTE_CHECKS="${LOOM_REMOTE_CHECKS:-0}"
 REMOTE_CHECK_WAIT="${LOOM_REMOTE_CHECK_WAIT:-1800}"
 REMOTE_CHECK_START_WAIT="${LOOM_REMOTE_CHECK_START_WAIT:-180}"
@@ -3147,6 +3238,18 @@ REMOTE_CHECK_POLL="${LOOM_REMOTE_CHECK_POLL:-10}"
 [[ "$REMOTE_CHECK_START_WAIT" =~ ^[0-9]+$ ]] || REMOTE_CHECK_START_WAIT=180
 [[ "$REMOTE_CHECK_POLL" =~ ^[0-9]+(\.[0-9]+)?$ ]] || REMOTE_CHECK_POLL=10
 remote_checks_on() { [ "$REMOTE_CHECKS" = 1 ] && [ "${LOOM_CLUSTER_RUNNER:-}" != 1 ] && repo_is_public; }
+# Reading existing fix-head checks needs no station dispatch, including on
+# a cluster runner. A settled red still goes through the default-branch gate.
+remote_base_verdict() {  # sha
+  if [ -n "$FIX_PR" ]; then
+    [ "$REMOTE_CHECKS" = 1 ] && repo_is_public || return 1
+    github_checks_verdict "$1" fix-base; BASELINE_EXIT=$?
+    [ "$BASELINE_EXIT" -lt 2 ]
+  else
+    remote_checks_on && github_checks_green "$1" || return 1
+    BASELINE_EXIT=0
+  fi
+}
 # Ask for the check of a pushed commit on GitHub and wait, bounded. Returns 0
 # green, 1 red (the failing test names are appended to the log as FAIL: lines,
 # the ones check_failures reads), 2 when the remote cannot answer: the caller
@@ -3273,8 +3376,109 @@ contract_run() {
   local rc
   acquire_check_slot || return 75
   contract_run_sandboxed "$@"; rc=$?
+  bound_check_uv_cache
   release_check_slot
   return "$rc"
+}
+
+# The runner's uv, as contract_run_sandboxed finds it: on PATH, else in the
+# runner's .local/bin. Prints nothing when there is none.
+runner_uv() {
+  local uv_bin
+  uv_bin="$(command -v uv 2>/dev/null)" || uv_bin=""
+  [ -x "$uv_bin" ] || uv_bin="$HOME/.local/bin/uv"
+  [ -x "$uv_bin" ] && printf '%s' "$uv_bin"
+  return 0
+}
+# The key of this repo's uv cache under CHECK_UV_DIR/repos: owner_name in
+# lower case (an owner name has no underscore, so the first one splits it).
+# Fails for a REPO that is not owner/name.
+check_uv_key() {
+  local key
+  key="$(printf '%s' "${REPO:-}" | tr '[:upper:]' '[:lower:]')"
+  [[ "$key" =~ ^[a-z0-9-]+/[a-z0-9._-]+$ ]] || return 1
+  printf '%s_%s' "${key%%/*}" "${key#*/}"
+}
+# Ready the shared uv directory (CHECK_UV_DIR, loom#3591) for a check of
+# this repo. A check runs code its tree holds, so nothing it may write is
+# read by another repo's check: the cache is one per repo
+# (repos/<key>/cache, CHECK_UV_CACHE), and the managed Pythons (python/)
+# are installed here, by the runner outside the sandbox, and are read-only
+# to every check and agent. uv is given the versions the tree asks for, read
+# as plain version strings (`.python-version`, else `requires-python` in
+# pyproject.toml), with --no-config so no setting in the tree (a download
+# mirror) reaches it. Every check also gets the baseline LOOM_CHECK_PYTHONS
+# (default "3.12 3.13 3.14", space separated; empty turns it off), because a
+# tree may declare no Python and still run `uv run --python 3.12` with
+# downloads off (loom#3602). Each entry is a plain version, validated like
+# `.python-version`; a bad one is logged and ignored, and one already
+# installed (python/cpython-<version>[.-]*, not a `+` variant) is not asked
+# for again, so a warm directory runs no install. A tree that asks for none
+# and needs no baseline gets uv's default Python when the contract runs uv
+# and no Python is installed yet. A failed install is logged; the check
+# then finds the Pythons already there or fails itself.
+check_uv_prepare() {
+  local key uv_bin line req have dir spec_re='^[0-9.,<>=!~ *]+$' ver_re='^[0-9]+(\.[0-9]+){0,2}$'
+  local reqs=() base=() baseline=()
+  key="$(check_uv_key)" || { echo "contract_run: no uv cache for repo '${REPO:-}'" >> "$LOG"; return 1; }
+  CHECK_UV_CACHE="$CHECK_UV_DIR/repos/$key/cache" CHECK_UV_LOCK="$CHECK_UV_DIR/locks/$key.lock"
+  mkdir -p "$CHECK_UV_CACHE" "$CHECK_UV_DIR/python" "$CHECK_UV_DIR/locks" || return 1
+  uv_bin="$(runner_uv)"
+  [ -n "$uv_bin" ] || return 0
+  if [ -f "$TREE/.python-version" ] && [ ! -L "$TREE/.python-version" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      line="$(printf '%s' "${line%%#*}" | tr -d ' \t\r')"
+      [[ "$line" =~ $ver_re ]] && reqs+=("$line")
+    done < <(head -n 5 "$TREE/.python-version")
+  fi
+  if [ "${#reqs[@]}" -eq 0 ] && [ -f "$TREE/pyproject.toml" ] && [ ! -L "$TREE/pyproject.toml" ]; then
+    req="$(sed -n 's/^requires-python[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$TREE/pyproject.toml" | head -n 1)"
+    [ -n "$req" ] && [[ "$req" =~ $spec_re ]] && reqs+=("$req")
+  fi
+  read -r -a baseline <<< "${LOOM_CHECK_PYTHONS-3.12 3.13 3.14}"
+  for req in ${baseline[@]+"${baseline[@]}"}; do
+    if ! [[ "$req" =~ $ver_re ]]; then
+      printf 'contract_run: ignoring LOOM_CHECK_PYTHONS entry [%s]: not a version\n' "$req" >> "$LOG"
+      continue
+    fi
+    case " ${reqs[*]:-} ${base[*]:-} " in *" $req "*) continue ;; esac
+    have=""
+    for dir in "$CHECK_UV_DIR/python/cpython-$req".* "$CHECK_UV_DIR/python/cpython-$req"-*; do
+      case "${dir##*/}" in *+*) continue ;; esac
+      [ -d "$dir" ] && { have=1; break; }
+    done
+    [ -n "$have" ] || base+=("$req")
+  done
+  if [ "${#reqs[@]}" -eq 0 ] && [ "${#base[@]}" -eq 0 ]; then
+    case " ${C_SETUP:-} ${C_CHECK:-} " in *" uv "*|*" uvx "*) ;; *) return 0 ;; esac
+    [ -z "$(ls -A "$CHECK_UV_DIR/python" 2>/dev/null)" ] || return 0
+  fi
+  reqs+=(${base[@]+"${base[@]}"})
+  # One install at a time across slots (locks/python.lock, exclusive): two
+  # slots preparing at once must not write the same interpreter together.
+  UV_PYTHON_INSTALL_DIR="$CHECK_UV_DIR/python" python3 -B "$LOOM_ROOT/lanes/uv_cache.py" exclusive \
+    "$CHECK_UV_DIR/locks/python.lock" -- timeout "$NET_TIMEOUT" "$uv_bin" python install \
+    --no-config --no-bin --no-cache ${reqs[@]+"${reqs[@]}"} >> "$LOG" 2>&1 ||
+    echo "contract_run: uv could not install the Python this check asks for (${reqs[*]:-default})" >> "$LOG"
+  return 0
+}
+# The bound on this repo's uv cache: after each check, a cache over
+# LOOM_CHECK_UV_CACHE_MB (default 8192) gets `uv cache prune`, then
+# `uv cache clean` if it is still over (no uv on the runner: removed).
+# lanes/uv_cache.py does it under the cache's lock, taken exclusively and
+# without waiting (a check of the same repo still running holds it shared,
+# and the next check bounds it), and refuses a cache any part of whose path
+# is a symlink. The lock and every parent of the cache sit where no sandbox
+# can write. The managed Pythons are not counted. Never fails the check.
+bound_check_uv_cache() {
+  local key uv_bin max_mb="${LOOM_CHECK_UV_CACHE_MB:-8192}"
+  key="$(check_uv_key)" || return 0
+  [[ "$max_mb" =~ ^[0-9]+$ ]] || max_mb=8192
+  uv_bin="$(runner_uv)"
+  python3 -B "$LOOM_ROOT/lanes/uv_cache.py" bound "$CHECK_UV_DIR" "$key" "$max_mb" \
+    ${uv_bin:+"$uv_bin"} >> "$LOG" 2>&1 ||
+    echo "contract_run: the uv cache bound failed" >> "$LOG"
+  return 0
 }
 contract_run_sandboxed() {
   local profile tool uv_bin uv_dir uv_path_dirs="" uv_bins="" changed_list="${2:-}"
@@ -3283,6 +3487,7 @@ contract_run_sandboxed() {
   # so the final check's environment matches the base check's even when
   # no earlier step prepared the check home.
   mkdir -p "$CHECK_HOME/tmp" || { echo "contract_run: could not create the check temp dir" >> "$LOG"; return 125; }
+  check_uv_prepare || { echo "contract_run: could not prepare the shared uv directory" >> "$LOG"; return 125; }
   contract_command_ok "$1" || { echo "contract_run: refusing a command that is not printable ASCII" >> "$LOG"; return 125; }
   # A contract that runs `uvx` failed every check with 127 on the unmodified
   # base: the lane machine keeps uv and uvx in the runner's .local/bin,
@@ -3300,22 +3505,28 @@ contract_run_sandboxed() {
       uv_path_dirs="${uv_path_dirs:+$uv_path_dirs:}$uv_dir" ;; esac
     uv_bins="${uv_bins:+$uv_bins }$uv_bin"
   done
-  profile="$(AGENT_HOME="$CHECK_HOME" CHECK_UV_BINS="$uv_bins" sandbox_profile "$TREE" "$CHECK_CLI" check)" || return 125
+  profile="$(AGENT_HOME="$CHECK_HOME" CHECK_UV_BINS="$uv_bins" CHECK_UV_CACHE="$CHECK_UV_CACHE" \
+    CHECK_UV_PYTHON="$CHECK_UV_DIR/python" sandbox_profile "$TREE" "$CHECK_CLI" check)" || return 125
   sandbox_command "$profile" || return 125
   # shellcheck disable=SC2030,SC2031 # deliberately local to the check's subshell
   (
     cd "$TREE" || exit 125
-    keep_path="$PATH" keep_lang="${LANG:-en_US.UTF-8}" home="$CHECK_HOME"
+    keep_path="$PATH" keep_lang="${LANG:-en_US.UTF-8}" home="$CHECK_HOME" uv_cache="$CHECK_UV_CACHE"
+    uv_python="$CHECK_UV_DIR/python" uv_lock="$CHECK_UV_LOCK" uv_tool="$LOOM_ROOT/lanes/uv_cache.py"
+    py="$(command -v python3)" || exit 125
     for v in $(compgen -e); do unset "$v"; done
     # UV_MANAGED_PYTHON: uv uses only the Pythons it installs, never one
     # found on PATH. A PATH interpreter it cannot run (an x86_64 Homebrew
     # python3 on an arm64 host without Rosetta) made uv exit 2 before any
     # test, so every muster lane run failed on the unmodified base
     # (2026-10-16).
-    # UV_CACHE_DIR and UV_PYTHON_INSTALL_DIR name uv's own defaults under
-    # the scratch home, where agent_uv_cache copies them for a codex agent.
+    # UV_CACHE_DIR is this repo's cache in the shared uv directory and
+    # UV_PYTHON_INSTALL_DIR its read-only managed Pythons (check_uv_prepare),
+    # not the scratch home, so a check no longer downloads them again into
+    # its own home (loom#3591). UV_PYTHON_DOWNLOADS=never: a check never
+    # installs a Python; the runner did.
     export PATH="${BUILD_JOBS_BIN:+$BUILD_JOBS_BIN:}${uv_path_dirs:+$uv_path_dirs:}$keep_path" HOME="$home" TMPDIR="$home/tmp" TERM=dumb LANG="$keep_lang" UV_MANAGED_PYTHON=1
-    export UV_CACHE_DIR="$home/.cache/uv" UV_PYTHON_INSTALL_DIR="$home/.local/share/uv/python"
+    export UV_CACHE_DIR="$uv_cache" UV_PYTHON_INSTALL_DIR="$uv_python" UV_PYTHON_DOWNLOADS=never
     # LOOM_CHECK_SANDBOX=1 tells a repo's tests they run in this sandbox,
     # which denies localhost, so a test that needs a loopback connection can
     # skip here and still run on CI (docs/LANES.md, "Validation").
@@ -3344,7 +3555,10 @@ contract_run_sandboxed() {
       LOOM_CHANGED_FILES="$(cat "$input")" || exit 125
       export LOOM_CHANGED_FILES
     fi
-    exec timeout "$CHECK_TIMEOUT" "${SANDBOX_CMD[@]}" /bin/bash -c "$1" < "$input"
+    # The check holds its cache's lock shared while it runs, so the bound
+    # (bound_check_uv_cache) never prunes a cache a check is using.
+    exec "$py" -B "$uv_tool" shared "$uv_lock" -- \
+      timeout "$CHECK_TIMEOUT" "${SANDBOX_CMD[@]}" /bin/bash -c "$1" < "$input"
   ) 2>&1 | timeout "$((CHECK_TIMEOUT + 60))" cat >> "$LOG"
 }
 
@@ -3484,13 +3698,15 @@ sys.exit(0 if valid else 1)
 }
 
 # Before the agent: interpreter, submodules, setup, then the check on the
-# current tree. A fix round checks the branch after merging the default
-# branch; a red result is compared with the default branch's own head.
+# current tree. A fix round can use its saved pull request head's GitHub
+# verdict when remote checks are enabled. Otherwise it checks the branch
+# after merging the default branch; a red result is compared with the
+# default branch's own head.
 # Only a red default branch check is a base-check factory incident. Returns
 # 1 with SETUP_REASON when the environment cannot be prepared.
 prepare_validation() {
   local rc interp="" subs="" changed what baseline_rev tool="" verdict_key interpreter_id now cached_verdict=0
-  local check_start="" failures=""
+  local check_start="" failures="" remote_rev
   SETUP_REASON="" HOST_RED_BASE="" CHECK_DESELECT=""
   BASELINE_SOURCE="base"
   load_contract || { record prepare "$CONTRACT_FILE" 1 "$BASE" false "$SETUP_REASON"; return 1; }
@@ -3554,6 +3770,8 @@ prepare_validation() {
     [ "$rc" -eq 0 ] || { SETUP_REASON="setup exited $rc"; return 1; }
   fi
   baseline_rev="$(safe_git rev-parse HEAD)"
+  remote_rev="$baseline_rev"
+  [ -z "$FIX_PR" ] || remote_rev="$BASE"
   # interp already holds "path version" (set above), so it is the identity as
   # it stands; running it again would hand its own output to the key.
   interpreter_id="${interp:-${C_INTERP:-none}}"
@@ -3564,19 +3782,21 @@ prepare_validation() {
     changed=""
     echo "base check reused cached verdict for $baseline_rev" >> "$LOG"
     record baseline "$C_CHECK" "$BASELINE_EXIT" "$baseline_rev" "$([ "$BASELINE_EXIT" -eq 0 ] && echo true || echo false)" "cached verdict"
-  elif [ -z "$FIX_PR" ] && remote_checks_on && github_checks_green "$baseline_rev"; then
-    # A public repo's base that GitHub's checks already passed needs no run
-    # (and no slot) here; any other state runs the check on the host below.
-    cached_verdict=1 BASELINE_EXIT=0 changed=""
-    echo "base check not run: GitHub's checks passed on $baseline_rev (LOOM_REMOTE_CHECKS)" >> "$LOG"
-    record baseline "$C_CHECK" 0 "$baseline_rev" true "GitHub checks green; no host check slot taken"
+  elif remote_base_verdict "$remote_rev"; then
+    baseline_rev="$remote_rev"
+    cached_verdict=1 changed=""
+    what=passed
+    [ "$BASELINE_EXIT" -eq 0 ] || what=failed
+    echo "base check not run: GitHub's checks $what on $baseline_rev (LOOM_REMOTE_CHECKS)" >> "$LOG"
+    record baseline "$C_CHECK" "$BASELINE_EXIT" "$baseline_rev" "$([ "$BASELINE_EXIT" -eq 0 ] && echo true || echo false)" \
+      "GitHub checks $what; no host check slot taken"
   else
     check_start="$(log_size)"
     contract_run "$C_CHECK"; BASELINE_EXIT=$?
     changed="$(tracked_changes)"
     [ "$BASELINE_EXIT" -eq 0 ] || failures="$(check_failures "$check_start")"
     record baseline "$C_CHECK" "$BASELINE_EXIT" "$baseline_rev" "$([ "$BASELINE_EXIT" -eq 0 ] && [ -z "$changed" ] && echo true || echo false)" \
-      "$(join_detail "${changed:+changed tracked files: $changed}" "$failures")"
+      "$(join_detail "host check" "${changed:+changed tracked files: $changed}" "$failures")"
   fi
   if [ "$BASELINE_EXIT" -eq 143 ]; then
     PARK_CLASS=transient
@@ -3764,6 +3984,79 @@ format_changed_files() {
   safe_git diff --cached --quiet && return 0
   safe_git commit -qm "$(commit_msg "format: apply ruff format to the lane's changed files")" >> "$LOG" 2>&1 || return 0
   echo "formatted $n files the change touched before the second run" >> "$LOG"
+  return 0
+}
+
+# The contract's autoformat command (loom#3577), once, after the scope and
+# contract checks and before the final check, host or remote: a remote check
+# keeps no log a lane could format from, so a format-only defect was thrown
+# away there. The command gets the files the lane's own commits changed that
+# still exist, shell-quoted, in batches that keep each command within
+# contract_command_ok's bound, through contract_run (the check's sandbox).
+# Edits to those files become one format: commit; anything else it touched is
+# restored. A formatter that fails, is missing or times out restores the tree
+# and the run goes on unformatted. C_AUTOFORMAT is the base's (load_contract),
+# and a run that changed the contract file is skipped, so a run never names
+# its own formatter. Always returns 0.
+contract_autoformat() {
+  local range path q cmd batch=0 rc=0 n before after pr="" changed=""
+  local -a paths=()
+  [ -n "${C_AUTOFORMAT:-}" ] || return 0
+  range="$BASE..HEAD"
+  [ -z "${FIX_UPSTREAM:-}" ] || range="$FIX_UPSTREAM...HEAD"
+  changed="$(safe_git diff --name-only "$range" -- "$CONTRACT_FILE" 2>> "$LOG")" ||
+    { echo "autoformat: skipped, could not read the lane's changes" >> "$LOG"; return 0; }
+  [ -z "$changed" ] || { echo "autoformat: skipped, the run changed $CONTRACT_FILE" >> "$LOG"; return 0; }
+  [ -z "$(tracked_changes)" ] || { echo "autoformat: skipped, the tree has uncommitted changes" >> "$LOG"; return 0; }
+  # This round's own commits, within what the pull request changes (a fix
+  # round's merge of the default branch brings files that are not its own).
+  pr="$(lane_changed_files 2>> "$LOG")" ||
+    { echo "autoformat: skipped, could not read the lane's changes" >> "$LOG"; return 0; }
+  while IFS= read -r -d '' path; do
+    case "$path" in *$'\n'*) continue ;; esac
+    grep -Fxq -- "$path" <<< "$pr" || continue
+    [ -f "$TREE/$path" ] && [ ! -L "$TREE/$path" ] || continue
+    paths+=("$path")
+  done < <(safe_git diff --name-only -z --diff-filter=d "$BASE" HEAD 2>> "$LOG")
+  [ "${#paths[@]}" -gt 0 ] || return 0
+  # An untracked file has no copy to restore from, so a formatter that
+  # touched one could not be undone: run only on a tree without any (what
+  # setup leaves is in .git/info/exclude, so it does not count).
+  before="$(safe_git ls-files --others --exclude-standard 2>> "$LOG")" ||
+    { echo "autoformat: skipped, could not list untracked files" >> "$LOG"; return 0; }
+  [ -z "$before" ] || { echo "autoformat: skipped, the tree has untracked files" >> "$LOG"; return 0; }
+  cmd="$C_AUTOFORMAT"
+  for path in "${paths[@]}"; do
+    printf -v q '%q' "$path"
+    if [ "$batch" -gt 0 ] && [ $((${#cmd} + 1 + ${#q})) -gt 1000 ]; then
+      contract_run "$cmd"; rc=$?
+      [ "$rc" -eq 0 ] || break
+      cmd="$C_AUTOFORMAT" batch=0
+    fi
+    cmd="$cmd $q" batch=$((batch + 1))
+  done
+  if [ "$rc" -eq 0 ] && [ "$batch" -gt 0 ]; then contract_run "$cmd"; rc=$?; fi
+  [ "$rc" -ne 0 ] || safe_git add -- "${paths[@]}" >> "$LOG" 2>&1 || rc=$?
+  # Restore what is not kept: every tracked edit not staged above, and every
+  # untracked file the formatter left (there was none before it ran).
+  [ "$rc" -eq 0 ] || safe_git reset -q >> "$LOG" 2>&1
+  safe_git checkout -q -- . >> "$LOG" 2>&1
+  after="$(safe_git ls-files --others --exclude-standard 2>> "$LOG")"
+  while IFS= read -r path; do
+    [ -z "$path" ] || rm -f -- "$TREE/$path"
+  done <<< "$after"
+  if [ "$rc" -ne 0 ]; then
+    echo "autoformat: the formatter exited $rc; files restored, run goes on unformatted" >> "$LOG"
+    return 0
+  fi
+  safe_git diff --cached --quiet && { echo "autoformat: nothing to format" >> "$LOG"; return 0; }
+  n="$(safe_git diff --cached --name-only | wc -l | tr -d ' ')"
+  if ! safe_git commit -qm "$(commit_msg "format: apply the contract's autoformat command to the lane's changed files")" >> "$LOG" 2>&1; then
+    { safe_git reset -q; safe_git checkout -q -- .; } >> "$LOG" 2>&1
+    echo "autoformat: could not commit the formatted files; files restored, run goes on unformatted" >> "$LOG"
+    return 0
+  fi
+  echo "autoformat: formatted $n of the lane's changed files" >> "$LOG"
   return 0
 }
 
@@ -4123,7 +4416,7 @@ run_committed_contract() {
 check_contract_change() {
   local range="$BASE..HEAD" touched mode canon rc=0
   local b_interp="$C_INTERP" b_subs="$C_SUBMODULES" b_setup="$C_SETUP" b_check="$C_CHECK" b_cli="${CHECK_CLI:-}"
-  local b_affected="${C_AFFECTED:-}"
+  local b_affected="${C_AFFECTED:-}" b_autoformat="${C_AUTOFORMAT:-}"
   CONTRACT_REFUSAL=""
   [ -z "$FIX_UPSTREAM" ] || range="$FIX_UPSTREAM...HEAD"
   touched="$(safe_git diff --name-only "$range" -- "$CONTRACT_FILE" 2>> "$LOG")" ||
@@ -4143,7 +4436,7 @@ check_contract_change() {
     run_committed_contract "$b_setup" || rc=$?
   fi
   C_INTERP="$b_interp" C_SUBMODULES="$b_subs" C_SETUP="$b_setup" C_CHECK="$b_check" CHECK_CLI="$b_cli"
-  C_AFFECTED="$b_affected"
+  C_AFFECTED="$b_affected" C_AUTOFORMAT="$b_autoformat"
   [ -n "$HAS_CONTRACT" ] || drop_check_home
   return "$rc"
 }
@@ -4204,6 +4497,30 @@ preserve_timedout() {
     return 1
   fi
   push_side HEAD "$BRANCH-timedout-$(date +%s)"
+}
+
+# A lane pod that is stopping (lanes/k8s/pod.sh) marks
+# run/<slot>.drain: the runner takes no new brief, and an agent the pod then
+# stops is not a failure. run/ goes with the pod, so the mark never outlives it.
+pod_draining() { [ -e "$LOOM_HOME/run/$SLOT.drain" ]; }
+
+# The run a drain stopped: its edits go to a -timedout- branch as a timeout's
+# do, the brief names that branch in an "Earlier attempt" section, and the
+# brief stays in the inbox. The loom home outlives the pod, so the next pod's
+# runner takes the same brief, merges the branch (resume_earlier_attempt) and
+# carries on; the station sees the brief and keeps the ticket running.
+keep_drained_run() {
+  local tree_status tree_head note="" side=""
+  if tree_status="$(safe_git status --porcelain 2>> "$LOG")" &&
+     tree_head="$(safe_git rev-parse HEAD 2>> "$LOG")" &&
+     { [ -n "$tree_status" ] || [ "$tree_head" != "$BASE" ]; }; then
+    note="$(preserve_timedout)"
+    side="$(printf '%s' "$note" | sed -nE 's#^the edits are on branch ([A-Za-z0-9._/-]+-timedout-[0-9]+)$#\1#p')"
+  fi
+  if [ -n "$side" ]; then
+    printf '\n## Earlier attempt\n\nA lane pod restart stopped the last run of this brief, which kept its edits on branch %s. The runner merges them into this tree before you start: check what is there and finish the ticket instead of starting over.\n' "$side" >> "$BRIEF"
+  fi
+  echo "[$(date -u +%FT%TZ)] $TICKET stopped by a lane pod restart; the brief stays in the inbox${note:+ ($note)}" >> "$LOG"
 }
 
 # The next attempt merges the kept branch, and its commit is refused for any
@@ -4404,7 +4721,7 @@ trains_on_prompts() {
 
 # Lanes whose agent runs sandboxed in a fresh scratch home (api_agent).
 is_api_lane() {
-  case "$LANE" in openrouter|opencode-go|anthropic|zen|zai|workersai|spark|free|copilot) return 0 ;; esac
+  case "$LANE" in openrouter|opencode-go|anthropic|zen|zai|workersai|spark|free|copilot|tinker) return 0 ;; esac
   return 1
 }
 
@@ -4470,8 +4787,12 @@ update_fix_branch() {
   return 0
 }
 
-# An earlier attempt that timed out or hit a limit after editing kept its
-# edits on a side branch, which the brief's Earlier attempt section names. The agent cannot
+# An earlier attempt that timed out or hit a limit after editing, or was
+# parked on a red final check (preserve_unvalidated), kept its edits on a
+# side branch, which the brief's Earlier attempt section names. A timed-out
+# branch leaves out files outside the brief's paths (drop_stray_from_kept);
+# an -unvalidated- one holds none, since a commit with any is refused before
+# the final check runs. The agent cannot
 # fetch it: the sandbox keeps .git read-only, and two codex runs on one ticket
 # started over and ended with no commit (2026-10-21). So the runner merges it
 # into the tree before the agent starts, on a first build and on a fix round
@@ -4484,7 +4805,9 @@ resume_earlier_attempt() {
   local side
   # Only the station's "## Earlier attempt" section names the branch: the
   # ticket body above it is the author's text, never a branch to merge.
-  side="$(section 'Earlier attempt' "$BRIEF" | grep -oE 'kept its edits on branch [A-Za-z0-9._/-]+-timedout-[0-9]+' | head -1 | awk '{print $NF}')"
+  # The newest kept branch wins: a drained run (keep_drained_run) appends its
+  # own after the station's, built on a tree that already merged the older one.
+  side="$(section 'Earlier attempt' "$BRIEF" | grep -oE 'kept its edits on branch [A-Za-z0-9._/-]+-(timedout|unvalidated)-[0-9]+' | tail -n 1 | awk '{print $NF}')"
   [ -n "$side" ] || return 0
   if [ -n "$CONFLICTS" ]; then
     echo "[$(date -u +%FT%TZ)] $TICKET: could not merge the earlier attempt's branch $side while the default branch merge conflicts; the agent starts without it" >> "$LOG"
@@ -4575,22 +4898,21 @@ markers_left() {
 }
 
 # A codex agent has no network, so its tests could not fetch the packages
-# the base check had already downloaded (loom#1665). Give it a copy of the
-# check's uv cache (a clone on APFS, so it costs no space): uv must write
-# the cache it reads, and a copy keeps the agent from changing the cache the
-# final check reads. Sets AGENT_UV_DIR and AGENT_UV_PYTHON for agent_cli, or
-# leaves them empty when this ticket's base check left no uv cache.
+# the base check had already downloaded (loom#1665). Give it this repo's
+# uv cache in the checks' shared uv directory (loom#3591): uv must write
+# the cache it reads, and the agent's code is this repo's, which this
+# repo's checks already run with that cache writable. The managed Pythons
+# stay read-only to it. This was a per-run copy of the check home's cache,
+# a clone on APFS but a second full copy on a lane pod's disk. Sets
+# AGENT_UV_DIR (the repo's directory, holding cache/) and AGENT_UV_PYTHON
+# for agent_cli, or leaves them empty when the repo's cache is empty.
 agent_uv_cache() {
-  local src="$CHECK_HOME/.cache/uv" dir="$CHECK_HOME/agent-uv"
+  local key
   AGENT_UV_DIR="" AGENT_UV_PYTHON=""
-  [ "$LANE" = codex ] && [ -n "$HAS_CONTRACT" ] && [ -d "$src" ] || return 0
-  rm -rf "$dir"
-  if mkdir -p "$dir" && { cp -Rc "$src" "$dir/cache" 2> /dev/null ||
-       { rm -rf "$dir/cache"; cp -R "$src" "$dir/cache"; }; }; then
-    AGENT_UV_DIR="$dir" AGENT_UV_PYTHON="$CHECK_HOME/.local/share/uv/python"
-  else
-    echo "could not copy the base check's uv cache for the agent; its uv runs without one"
-  fi
+  [ "$LANE" = codex ] && [ -n "$HAS_CONTRACT" ] || return 0
+  key="$(check_uv_key)" || return 0
+  [ -n "$(ls -A "$CHECK_UV_DIR/repos/$key/cache" 2> /dev/null)" ] || return 0
+  AGENT_UV_DIR="$CHECK_UV_DIR/repos/$key" AGENT_UV_PYTHON="$CHECK_UV_DIR/python"
 }
 
 workersai_request() (
@@ -4619,6 +4941,7 @@ Do not search the whole filesystem (for example, find /). Search within the chec
   case "$LANE" in
     codex|claude) agent_cli "$LANE" lane "$brief_text" ;;
     openrouter) opencode_agent_continuing OPENROUTER_API_KEY text "$brief_text" ;;
+    tinker) opencode_agent_continuing TINKER_API_KEY text "$brief_text" ;;
     opencode-go) opencode_agent_continuing OPENCODE_API_KEY text "$brief_text" ;;
     zen) opencode_agent_continuing - text "$brief_text" ;;
     spark) opencode_agent_continuing "$(spark_key_var)" raw "$brief_text" ;;
@@ -4760,7 +5083,7 @@ lane_ready() {
   fi
   case "$LANE" in
     codex) cli=codex ;; claude|anthropic) cli=claude ;; copilot) cli=copilot ;;
-    openrouter|opencode-go|zen|zai|workersai|spark|free) cli="$(opencode_bin)" ;;
+    openrouter|opencode-go|zen|zai|workersai|spark|free|tinker) cli="$(opencode_bin)" ;;
     *) READY_REASON="unknown lane"; return 1 ;;
   esac
   command -v "$cli" > /dev/null || { READY_REASON="$cli not on PATH"; return 1; }
@@ -4836,6 +5159,29 @@ if [ "$LANE" = opencode-go ]; then
       exit 0
     fi
   done
+fi
+
+# The tinker lane runs one model, LOOM_TINKER_MODEL, and only a free one
+# (tinker_free_model): Tinker bills every id without ":free" against the
+# account's prepaid balance. Fail closed: with no model, a model that is not
+# free, a model ladder or an endpoint that is not https, the lane does not
+# start, takes no brief and calls nothing.
+if [ "$LANE" = tinker ]; then
+  TINKER_REFUSED=""
+  if [ -n "$(lane_setting MODELS)" ]; then
+    TINKER_REFUSED="$(setting_var "$SLOT" MODELS) is set; the tinker lane runs the one model $(setting_var "$SLOT" MODEL) names"
+  elif [ -z "$(lane_setting MODEL)" ]; then
+    TINKER_REFUSED="$(setting_var "$SLOT" MODEL) is not set; set it to a tinker/...:free model"
+  elif ! tinker_free_model "$(lane_setting MODEL)"; then
+    TINKER_REFUSED="model $(lane_setting MODEL) does not end in :free; Tinker bills every other id"
+  elif ! [[ "$TINKER_URL" =~ ^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._~/-]*)?$ ]]; then
+    TINKER_REFUSED="$(setting_var "$SLOT" URL) is not an https base URL"
+  fi
+  if [ -n "$TINKER_REFUSED" ]; then
+    echo "[$(date -u +%FT%TZ)] REFUSED: lane $SLOT: $TINKER_REFUSED" >&2
+    heartbeat false "REFUSED: $TINKER_REFUSED"
+    exit 0
+  fi
 fi
 
 if REST_UNTIL="$(transient_rest_until)"; then
@@ -4916,6 +5262,14 @@ fi
 
 AGENT_HOME="$LOOM_HOME/run/$SLOT-home"
 CHECK_HOME="$LOOM_HOME/run/$SLOT-check"
+# The checks' shared uv directory on this host or pod, beside the check
+# homes, never in one (loom#3591): one uv cache per repo, shared by every
+# slot's checks of that repo, and one read-only set of managed Pythons
+# (check_uv_prepare). Per-home caches downloaded a Python and every wheel
+# again for each check, and a pod's run/ volume filled until the pod was
+# evicted. uv's cache is safe for concurrent use; bound_check_uv_cache
+# bounds it.
+CHECK_UV_DIR="$LOOM_HOME/run/uv-shared"
 # The run's own TMPDIR, exported before anything else runs: the runner's
 # git calls and the subscription lanes' agents (which inherit this
 # environment) get a temp dir that exists, so git prints no confstr
@@ -4961,6 +5315,10 @@ fi
 
 for BRIEF in "$INBOX"/*.md; do
   [ -e "$BRIEF" ] || continue
+  if pod_draining; then
+    echo "[$(date -u +%FT%TZ)] the lane pod is stopping: no new brief this pass" >&2
+    break
+  fi
   drop_build_output
   drop_run_scratch
   AGENT_GH_CALLS=""
@@ -5084,6 +5442,13 @@ for BRIEF in "$INBOX"/*.md; do
     anthropic:claude*) ;;
     claude:*|anthropic:*) park "$BRIEF" "model $MODEL is not a claude model"; continue ;;
     openrouter:openrouter/*:free) ;;
+    tinker:*)
+      if [ "$MODEL" != "$(lane_setting MODEL)" ]; then
+        echo "[$(date -u +%FT%TZ)] $TICKET REFUSED the brief's Model: $MODEL: lane $SLOT runs $(lane_setting MODEL) only" | tee -a "$LOG" >&2
+        MODEL="$(lane_setting MODEL)" PINNED_MODEL=""
+      fi
+      tinker_free_model "$MODEL" ||
+        { park "$BRIEF" "tinker lane runs free models only (tinker/...:free), not $MODEL"; continue; } ;;
     openrouter:*) park "$BRIEF" "openrouter lane runs free models only (openrouter/...:free), not $MODEL"; continue ;;
     opencode-go:opencode-go/*)
       # A pin off the allow-list runs the lane's own model, which the start
@@ -5285,7 +5650,7 @@ for BRIEF in "$INBOX"/*.md; do
      # The job cap, in this subshell only (lanes/build_jobs.sh).
      build_jobs_export &&
      cd "$TREE" && unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN "${!LOOM_GITHUB_APP_@}" "${!GIT_CONFIG_@}" &&
-      { [ -z "$AGENT_GH_CONFIG" ] || export GH_CONFIG_DIR="$AGENT_GH_CONFIG"; } &&
+      export GH_CONFIG_DIR="$AGENT_GH_CONFIG" && github_auth_agent_path &&
       run_agent "$RUN_BRIEF") >> "$LOG" 2>&1 &
     agent_pid=$!
     echo $agent_pid > "$LOCK/pgid"
@@ -5315,7 +5680,7 @@ for BRIEF in "$INBOX"/*.md; do
   [ -s "$LOCK/egress-opened" ] || AGENT_GH_CALLS="$(agent_gh_calls)"
   # The token in the store outlives the agent by up to an hour: remove it now.
   GH_CLEANUP_FAILURE=""
-  if [ -n "$AGENT_GH_CONFIG" ] && ! rm -rf "$AGENT_GH_CONFIG"; then
+  if ! rm -rf "$AGENT_GH_CONFIG"; then
     GH_CLEANUP_FAILURE="could not remove the agent's gh credential store"
     if [ ! -s "$LOCK/egress-opened" ]; then
       park "$BRIEF" "$GH_CLEANUP_FAILURE" transient; continue
@@ -5326,6 +5691,8 @@ for BRIEF in "$INBOX"/*.md; do
     # The pod gets no idle heartbeat after this job to sample its usage.
     lane_meter --refresh
   fi
+  # A codex run's own session holds the newest reading, limited or not.
+  [ "$LANE" != codex ] || lane_meter --refresh
   if [ "$MODEL_KIND" = paid ] && [ -f "$WORKDIR/$TICKET.opencode-events" ]; then
     # An unknown spend fails closed: the marker stops paid picks for an hour.
     if ! model_pick settle "$MODEL" < "$WORKDIR/$TICKET.opencode-events" 2>> "$LOG"; then
@@ -5347,6 +5714,10 @@ for BRIEF in "$INBOX"/*.md; do
     break
   fi
   if [ "$TOKEN_READY" = 0 ]; then park "$BRIEF" "$APP_TOKEN_WHY" transient; continue; fi
+  # A lane pod that is stopping stopped this agent: keep the run for the next
+  # pod rather than fail it (keep_drained_run). The loop's next turn sees the
+  # drain and ends the pass.
+  if [ "$STATUS" -ne 0 ] && pod_draining; then keep_drained_run; continue; fi
   # A spark run that ended because the box went hot is a limit, not a failure.
   if [ "$STATUS" -ne 0 ] && { [ "$LANE" = spark ] || [ "$LANE" = free ]; } && { spark_probe; [ $? -eq 1 ]; }; then
     mark_limit
@@ -5541,6 +5912,8 @@ for BRIEF in "$INBOX"/*.md; do
       park "$BRIEF" "answer refused: $REASON"; continue
     fi
     rm -f "$LOGDIR/$TICKET.answer-error"
+    # The final checks can outlast the token minted after the agent.
+    fresh_app_token || true
     if ! timeout "$NET_TIMEOUT" gh issue comment "$ISSUE_NUMBER" -R "$REPO" --body "$(signed "$ANSWER_TEXT")" >> "$LOG" 2>&1; then
       park "$BRIEF" "answer comment failed" transient; continue
     fi
@@ -5646,13 +6019,30 @@ for BRIEF in "$INBOX"/*.md; do
       *) park "$BRIEF" "could not check the committed validation contract: $CONTRACT_REFUSAL" transient; continue ;;
     esac
   fi
+  # The base contract's formatter on the lane's own files, before the final
+  # check reads them (loom#3577). It never parks the run.
+  if [ -n "$HAS_CONTRACT" ] && [ "$COMMITTED" -eq 1 ]; then
+    contract_autoformat
+  fi
   # An agent's exit code is not evidence: only a passing check on the
   # committed head hands the work on.
   REMOTE_FINAL=""
   if [ -n "$HAS_CONTRACT" ] && [ -z "$FIX_PR" ] && [ "$COMMITTED" -eq 1 ] && remote_checks_on; then
     REMOTE_FINAL=1
   fi
-  if [ -n "$HAS_CONTRACT" ] && ! final_validation; then
+  # A new run that committed nothing has the base as its tree, and the base
+  # check (or GitHub's checks on the base) already covered that. A second run
+  # of the whole suite says nothing about the agent, holds a check slot, and
+  # where the suite outlasts the timeout it parked four no-commit runs in a
+  # day as "[transient] the check timed out", each retried on another lane
+  # (loom#3576). The no-commit handling below records what the agent said.
+  SKIP_FINAL=""
+  if [ -n "$HAS_CONTRACT" ] && [ -z "$FIX_PR" ] && [ "$COMMITTED" -eq 0 ]; then
+    SKIP_FINAL=1
+    echo "[$(date -u +%FT%TZ)] $TICKET: no commit on the lane branch: the final check is not run" >> "$LOG"
+    drop_check_home
+  fi
+  if [ -n "$HAS_CONTRACT" ] && [ -z "$SKIP_FINAL" ] && ! final_validation; then
     HANDOFF="no pull request opened"
     [ -n "$FIX_PR" ] && HANDOFF="nothing pushed to #$FIX_PR"
     park "$BRIEF" "$VALIDATION_REASON; $(preserve_unvalidated); $HANDOFF" "$PARK_CLASS"; continue
@@ -5851,6 +6241,8 @@ for BRIEF in "$INBOX"/*.md; do
     if [[ ! "$ISSUE_NUMBER" =~ ^[0-9]+$ ]]; then
       park "$BRIEF" "agent made no commit and its reason has no ticket number to go on"; continue
     fi
+    # Minted here, not in post_no_change's subshell, so the token stays.
+    fresh_app_token || true
     if ! WHY="$(post_no_change)"; then
       rm -f "$LOGDIR/$TICKET.answered.tmp"; park "$BRIEF" "$WHY" transient; continue
     fi
@@ -5865,6 +6257,18 @@ for BRIEF in "$INBOX"/*.md; do
   # brief's branch moved by someone else during the run (another lane's
   # round, a person's commit) is not this run's failure: it is parked as
   # "branch moved", and the station hands the new head back to the factory.
+  # A commit whose author email ends in @local has no GitHub login: the merge
+  # gate refuses it as an unknown writer, and the pull request then waits a
+  # fix round. Refuse it here, before anything is pushed.
+  if [ "$COMMITTED" -eq 1 ]; then
+    if ! LOCAL_AUTHORS="$(safe_git log --format='%h %ae' "$BASE..$BRANCH" 2>> "$LOG")"; then
+      park "$BRIEF" "could not read the commit authors before the push" transient; continue
+    fi
+    LOCAL_AUTHORS="$(awk '$2 ~ /@local$/ {print $1}' <<<"$LOCAL_AUTHORS" | head -3 | tr '\n' ' ')"
+    if [ -n "$LOCAL_AUTHORS" ]; then
+      park "$BRIEF" "nothing pushed: commit ${LOCAL_AUTHORS% } has an author email ending in @local, which has no GitHub login"; continue
+    fi
+  fi
   if [ "$COMMITTED" -eq 1 ]; then
     fresh_app_token || { park "$BRIEF" "the GitHub App token could not be refreshed before the push; the edits are committed in the lane tree" transient; continue; }
     if ! PUSH_OUT="$(timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false push -q -u origin "$BRANCH" 2>&1)"; then

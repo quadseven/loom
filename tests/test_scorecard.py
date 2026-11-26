@@ -159,6 +159,15 @@ class AuditCounts(unittest.TestCase):
         self.assertEqual(slots, {"codex": "x", "codex-2": "x", "free-kilo": "y",
                                  "opencode-go-3": "z"})
 
+    def test_a_tinker_pull_request_counts_on_its_own_row(self):
+        # loom#3579: the tinker lane's merges are scored apart from openrouter's.
+        body = ("## Why\nx\n\n---\nLoom ticket quadseven/loom#1, lane tinker, model "
+                "tinker/thinkingmachines/Inkling-2-Mini:peft:65536:free.\n")
+        self.assertEqual(scorecard.footer(body),
+                         ("tinker", "tinker/thinkingmachines/Inkling-2-Mini:peft:65536:free"))
+        self.assertEqual(scorecard.labels.base_lane("tinker"), "tinker")
+        self.assertEqual(factory.lane_kind("tinker"), "free")
+
 
 def runs(lane, total, bad, at, model="gpt-6-luna"):
     """`total` lane pull requests in the window, `bad` of them bad-work."""
@@ -294,6 +303,66 @@ class Records(unittest.TestCase):
                            audits={"zen": later + 3600, "zen-x": later})
         self.assertEqual(got.table()[("zen", "")]["audit failed"], 1)
         self.assertNotIn("zen", got.demoted())
+
+
+LIVE_CRITERION = "Live: the nightly job's report shows the new row within 24 hours"
+CODE_CRITERION = "tests/test_report.py covers the new row"
+
+
+def mismatch(*criteria, rule="intent-mismatch"):
+    """An Elder finding that names ticket criteria the diff cannot meet, in
+    the review bot's own quoting: `#N criterion K "text"`."""
+    named = "; ".join('#201 criterion %d "%s"' % (n + 1, text) for n, text in enumerate(criteria))
+    return {"isResolved": True, "comments": {"nodes": [{
+        "author": {"__typename": "Bot", "login": BOT}, "createdAt": iso(NOW),
+        "body": "* high | _general_ | `%s` | heavy lift\n\n**What Elder sees**\n\n"
+                "No hunk in this diff can satisfy %s. The PR says \"Change 101\"." % (rule, named)}]}}
+
+
+class LiveOnlyCriteria(unittest.TestCase):
+    """loom#3625: a ticket whose criteria only a live result can meet fails
+    every lane's review on intent-mismatch. That finding is the ticket's,
+    not the lane's, when every criterion it names is one the brief marks
+    live (bus/criteria_gate.py kind, the brief's Proof checks)."""
+
+    def outcome(self, threads):
+        body = ("## Acceptance criteria\n\n- [ ] %s\n- [ ] %s\n" % (LIVE_CRITERION, CODE_CRITERION))
+        fake = Route({"/repos/%s/pulls?state=closed" % REPO: [lane_pr(101)],
+                      "/repos/%s/issues/201/comments" % REPO: [],
+                      "/repos/%s/issues/201" % REPO: {"number": 201, "body": body}},
+                     {101: threads})
+        got = card()
+        quiet(got.refresh, GitHub("t", transport=fake), [REPO], [LANES_LOGIN], BOT, {}, {})
+        return got.data["records"]["%s#101" % REPO]["review"], got.bad("spark")[0]
+
+    def test_the_brief_marks_the_same_criterion_live(self):
+        from bus import tickets
+        body = "## Acceptance criteria\n\n- [ ] %s\n- [ ] %s\n" % (LIVE_CRITERION, CODE_CRITERION)
+        self.assertEqual(tickets.proof_checks(body),
+                         [(LIVE_CRITERION, tickets.PROOF_CHECK_BY_KIND["live"]),
+                          (CODE_CRITERION, tickets.PROOF_CHECK_BY_KIND["code"])])
+
+    def test_an_intent_mismatch_on_a_live_criterion_leaves_the_bad_work_count_unchanged(self):
+        self.assertEqual(self.outcome([mismatch(LIVE_CRITERION)]), (scorecard.FINDINGS, 0))
+
+    def test_an_intent_mismatch_on_a_code_criterion_still_counts(self):
+        self.assertEqual(self.outcome([mismatch(LIVE_CRITERION, CODE_CRITERION)]),
+                         (scorecard.BAD_WORK, 1))
+
+    def test_an_intent_mismatch_naming_no_criterion_still_counts(self):
+        self.assertEqual(self.outcome([mismatch()]), (scorecard.BAD_WORK, 1))
+
+    def test_another_bad_work_finding_beside_it_still_counts(self):
+        self.assertEqual(self.outcome([mismatch(LIVE_CRITERION), finding("dead-code")]),
+                         (scorecard.BAD_WORK, 1))
+
+    def test_another_rule_on_a_live_criterion_still_counts(self):
+        self.assertEqual(self.outcome([mismatch(LIVE_CRITERION, rule="unmet-criterion")]),
+                         (scorecard.BAD_WORK, 1))
+
+    def test_a_criterion_the_ticket_does_not_carry_still_counts(self):
+        self.assertEqual(self.outcome([mismatch("Live: some other box seen in the logs")]),
+                         (scorecard.BAD_WORK, 1))
 
 
 class Table(unittest.TestCase):

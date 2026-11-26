@@ -15,9 +15,11 @@ base-check incident, its last repeat, which ticket is its fix, and the brief.
 from __future__ import annotations
 
 import calendar
+import hashlib
 import re
+import sys
 import time
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from . import status
 from . import tickets
@@ -40,6 +42,17 @@ _COUNT_RE = re.compile(r"^Still failing: (\d+) times since ", re.M)
 _CAUSE_RE = re.compile(r"^Cause:[ \t]*\S", re.M)
 _REPO_RE = re.compile(r"^Repo:[ \t]*([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)[ \t]*$", re.M)
 CAUSE_DETAIL_MAX = 1500
+# A private repo's incident names it "private repo <alias>" on the public
+# factory repo (lanes/run_lane.sh incident_subject). The alias is the first 8
+# hex digits of SHA-256 over this prefix and the repo's numeric GitHub id, so
+# every lane host and the station derive the same one with no shared secret
+# (loom#3573: the shared key in SSM never existed, so a cluster lane could not
+# rebuild the title and close an incident another host filed). The id says
+# nothing about the repo's name to anyone who cannot read the repo.
+ALIAS_PREFIX = "loom factory incident alias v1\n"
+# The incident kinds that describe the repo and its check, which a pass on any
+# host closes; an environment incident describes the host that filed it.
+REPO_KINDS = ("base-check", "contract")
 
 
 def epoch(stamp: Any) -> Optional[float]:
@@ -55,6 +68,33 @@ def open_base_check(issue: Any) -> bool:
         return False
     lines = str(issue.get("body") or "").splitlines()
     return INCIDENT_MARKER in lines and "Kind: base-check" in lines
+
+
+def repo_alias(repo_id: int) -> str:
+    """The 8-hex alias a private repo's incident title and Repo: line carry."""
+    if isinstance(repo_id, bool) or not isinstance(repo_id, int) or repo_id <= 0:
+        raise ValueError("a repo id is a positive integer")
+    return hashlib.sha256((ALIAS_PREFIX + str(repo_id)).encode()).hexdigest()[:8]
+
+
+def subjects(repo: str, repo_id: Optional[int]) -> List[str]:
+    """Every way an incident's Repo: line can name `repo`: by name (a public
+    repo), or by the alias its GitHub id derives (a private one)."""
+    found = [repo]
+    if isinstance(repo_id, int) and not isinstance(repo_id, bool) and repo_id > 0:
+        found.append("private repo %s" % repo_alias(repo_id))
+    return found
+
+
+def holds_repo(issue: Any, names: Sequence[str]) -> bool:
+    """Whether `issue` is an open base-check or contract incident whose Repo:
+    line is one of `names`: such an incident holds every ticket of its repo."""
+    if not isinstance(issue, dict) or issue.get("state") != "open" or "pull_request" in issue:
+        return False
+    lines = str(issue.get("body") or "").splitlines()
+    return (INCIDENT_MARKER in lines
+            and any("Kind: %s" % kind in lines for kind in REPO_KINDS)
+            and any("Repo: %s" % name in lines for name in names))
 
 
 def last_repeat(issue: Dict[str, Any], comments: Iterable[Any]) -> Optional[float]:
@@ -177,3 +217,20 @@ def with_cause(body: Any, line: str) -> str:
     at = next((i + 1 for i, text in enumerate(lines) if text.startswith("Ticket:")), len(lines))
     lines.insert(at, "Cause: " + line)
     return "\n".join(lines) + "\n"
+
+
+def main(argv: Sequence[str]) -> int:
+    """`alias <repo id>` prints the repo's incident alias (lanes/run_lane.sh)."""
+    if len(argv) != 2 or argv[0] != "alias" or not argv[1].isdigit():
+        print("usage: python3 -m bus.incident_probe alias <repo id>", file=sys.stderr)
+        return 2
+    try:
+        print(repo_alias(int(argv[1])))
+    except ValueError as err:
+        print(err, file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

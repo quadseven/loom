@@ -64,6 +64,10 @@ _Avoid_: heartbeat, dashboard
 The usage a lane's inference source still allows before its limit, window or credit runs out.
 _Avoid_: budget, allowance
 
+**Pace**:
+A subscription's used share of its window minus the share of the window elapsed, in percentage points; behind or ahead past `LOOM_PACE_SLACK` (default 10), else on pace.
+_Avoid_: burn rate, velocity
+
 **Demotion**:
 A lane or model the scorecard benches from build tickets: its bad outcomes in the last `LOOM_LANE_DEMOTE_DAYS` days reach `LOOM_LANE_DEMOTE_AT` (default 3) and are at least `LOOM_LANE_DEMOTE_RATE` (default 0.1) of its pull requests in that window; it lifts when a completed refresh finds either below again.
 _Avoid_: ban, disable

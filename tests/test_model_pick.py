@@ -6,7 +6,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
-from bus import model_pick, tickets
+from bus import model_pick, tickets, usage
 
 NOW = 2_000_000_000.0
 GO_LIST = "https://go.test/models"
@@ -201,6 +201,19 @@ class ModelPickTest(unittest.TestCase):
 
     def test_an_easy_ticket_stays_free_first(self):
         self.assertEqual(self.pick(tier=model_pick.TIER_EASY).kind, "free")
+
+    def test_the_go_plan_check_feeds_its_short_and_weekly_usage_to_the_board(self):
+        self.provider.usage = {"rolling": 13, "weekly": 27}
+        got = model_pick.pick("opencode-go", "opencode-go-2", False, "fake-key", self.home,
+                              NOW, ENV, self.provider, tier=model_pick.TIER_STRONG,
+                              brief_demoted=self.brief_demoted)
+        self.assertEqual(got.kind, "paid")
+        rows = usage.collect(str(self.home), env={}, now=NOW,
+                             lane_names=["opencode-go", "opencode-go-2"], host="test-host")
+        meters = [(row["window"], row["used_pct"], row["resets_at"]) for row in rows]
+        self.assertIn(("rolling", 13, "2033-05-18T04:33:20+00:00"), meters)
+        self.assertIn(("weekly", 27, "2033-05-21T03:33:20+00:00"), meters)
+        self.assertEqual(rows[0]["lanes"], ["opencode-go", "opencode-go-2"])
 
     def test_beam_takes_easy_tickets_only(self):
         self.provider.usage = {"rolling": 95}

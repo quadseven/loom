@@ -8,9 +8,15 @@ edits, as the real one does in print mode.
 """
 
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
+
+from bus import usage
+from dashboard import usage as board
 
 ROOT = Path(__file__).resolve().parents[1]
 AGENT_CLI = ROOT / "lanes" / "agent_cli.sh"
@@ -20,6 +26,15 @@ case "$*" in
   *"--permission-mode acceptEdits"*) echo changed > "$FAKE_TREE/edited.txt" ;;
   *) echo "Claude requested permissions to write edited.txt, but you haven't granted it yet." ;;
 esac
+case "$*" in
+  *"--output-format stream-json"*)
+    printf '%s\n' \
+      '{"type":"system","debug":"discard-this-metadata"}' \
+      '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","unifiedWindows":{"five_hour":{"utilization":0.21,"resetsAt":2000003600},"seven_day":{"utilization":0.34,"resetsAt":2000043200}}},"debug":"discard-this-metadata"}' \
+      '{"type":"result","result":"finished"}'
+    ;;
+esac
+exit "${FAKE_EXIT:-0}"
 """
 
 
@@ -42,15 +57,16 @@ class ClaudeLanePermissionsTest(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def run_lane(self, auth_file=True):
+    def run_lane(self, auth_file=True, status=0):
         script = '. "$1"; MODEL=claude-test; AGENT_TIMEOUT=30; agent_cli claude lane "do the brief"'
-        env = {"PATH": "%s:/usr/bin:/bin" % (self.root / "bin"),
-               "HOME": str(self.root), "FAKE_TREE": str(self.tree)}
+        env = {"PATH": "%s:%s:/usr/bin:/bin" % (self.root / "bin", Path(sys.executable).parent),
+               "HOME": str(self.root), "FAKE_TREE": str(self.tree), "FAKE_EXIT": str(status),
+               "LOOM_ROOT": str(ROOT), "LOOM_HOME": str(self.root), "SLOT": "claude"}
         if auth_file:
             env["LOOM_CLAUDE_AUTH_FILE"] = str(self.token)
         result = subprocess.run(["/bin/bash", "-c", script, "run", str(AGENT_CLI)],
-                                capture_output=True, text=True, env=env, timeout=60)
-        self.assertEqual(result.returncode, 0, result.stderr)
+                                cwd=self.tree, capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(result.returncode, status, result.stderr)
         return result.stdout
 
     def test_a_pod_run_with_the_cluster_token_can_edit_the_tree(self):
@@ -59,3 +75,20 @@ class ClaudeLanePermissionsTest(unittest.TestCase):
 
     def test_a_pod_run_leaves_no_permission_refusal(self):
         self.assertNotIn("haven't granted", self.run_lane())
+
+    def test_a_regular_run_feeds_short_and_weekly_windows_to_the_usage_board(self):
+        (self.tree / "bus").mkdir()
+        (self.tree / "bus" / "__init__.py").touch()
+        stdout = self.run_lane(auth_file=False, status=7)
+        self.assertIn("finished", stdout)
+        now = time.time()
+        rows = usage.collect(str(self.root), env={}, now=now, lane_names=["claude"], host="test-host")
+        self.assertEqual([(row["window"], row["used_pct"]) for row in rows], [("5-hour", 21), ("weekly", 34)])
+        self.assertEqual(rows[1]["resets_at"], "2033-05-18T15:33:20+00:00")
+        rendered = board.render(board.build(rows, datetime.fromtimestamp(2000000000, timezone.utc)))
+        self.assertIn("5-hour", rendered)
+        self.assertIn("Weekly", rendered)
+        self.assertIn("(in 1h 0m)", rendered)
+        self.assertIn("(in 12h 0m)", rendered)
+        meter = self.root / "state" / "usage" / "claude.meter.json"
+        self.assertNotIn("discard-this-metadata", stdout + meter.read_text())

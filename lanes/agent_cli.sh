@@ -13,11 +13,12 @@
 # its own checkout, so its agent gets the network and skips every prompt.
 # Neither reads the keychain: both CLIs keep their sign-in in a file.
 # A codex lane run has no network, so uv could not fetch the packages a test
-# needs and the run failed on a DNS error (loom#1665). When the runner left
-# the agent a copy of the base check's uv cache (AGENT_UV_DIR, with the
-# check's Pythons in AGENT_UV_PYTHON), uv runs offline from it: the copy is
-# the one extra directory codex may write (uv locks its cache), and the
-# network stays closed.
+# needs and the run failed on a DNS error (loom#1665). When the runner names
+# the repo's uv cache in the checks' shared uv directory (AGENT_UV_DIR/cache,
+# with the read-only managed Pythons in AGENT_UV_PYTHON; loom#3591), uv runs
+# offline from it: that cache is the one extra directory codex may write (uv
+# locks its cache), the Pythons are not writable, and the network stays
+# closed.
 # A codex lane run writes its final message to AGENT_LAST_MESSAGE when the
 # runner names one: the reason a run that committed nothing quotes
 # (loom#1799), instead of whatever the agent printed last.
@@ -55,6 +56,9 @@ codex_lane_home() {
     else
       rm -f "$dest/auth.json" || return 2
     fi
+    # A Codex home with no sessions folder yet gets one, so the first run's
+    # session lands where the lane meter reads it (loom#3630).
+    mkdir -p "$src/sessions" 2> /dev/null || true
     if [ -d "$src/sessions" ]; then
       if [ -L "$dest/sessions" ]; then
         rm -f "$dest/sessions" || return 2
@@ -65,6 +69,35 @@ codex_lane_home() {
     fi
   fi
   printf '%s\n' "$dest"
+}
+
+claude_lane_print() {
+  # The brief is the first argument; any further arguments are CLI options.
+  local brief="$1"
+  shift
+  if [ -n "${LOOM_CLAUDE_AUTH_FILE:-}" ] && [ -f "$LOOM_CLAUDE_AUTH_FILE" ]; then
+    # A cluster pod has no operator settings file. In print mode the CLI
+    # needs permission to edit and run tests. The pod is the isolation.
+    # --allowedTools takes a list, so the brief goes over stdin: written
+    # after it, the CLI read the brief as a tool name and exited with no
+    # prompt on every run.
+    printf '%s' "$brief" | CLAUDE_CODE_OAUTH_TOKEN="$(cat "$LOOM_CLAUDE_AUTH_FILE")" timeout "$AGENT_TIMEOUT" \
+      claude -p --model "$MODEL" --permission-mode acceptEdits --allowedTools Bash "$@"
+  else
+    timeout "$AGENT_TIMEOUT" claude -p --model "$MODEL" "$@" "$brief" < /dev/null
+  fi
+}
+
+claude_lane_cli() {
+  local slot="${SLOT:-claude}" root="${LOOM_ROOT:-}"
+  if [ -z "${LOOM_HOME:-}" ] || [ -z "$root" ]; then
+    claude_lane_print "$1"
+    return $?
+  fi
+  claude_lane_print "$1" --output-format stream-json --verbose |
+    (unset CLAUDE_CODE_OAUTH_TOKEN; cd "$root" && python3 -EsB -m bus.meter \
+      --claude-stream "$LOOM_HOME/state/usage/$slot.meter.json")
+  return "${PIPESTATUS[0]}"
 }
 
 agent_cli() {
@@ -82,24 +115,11 @@ agent_cli() {
   [ "$1:$2" = codex:lane ] && [ -n "${AGENT_LAST_MESSAGE:-}" ] && last=(--output-last-message "$AGENT_LAST_MESSAGE")
   if [ "$1:$2" = codex:lane ] && [ -n "${AGENT_UV_DIR:-}" ]; then
     uv_env=("UV_CACHE_DIR=$AGENT_UV_DIR/cache" "UV_PYTHON_INSTALL_DIR=$AGENT_UV_PYTHON"
-            UV_OFFLINE=1 UV_MANAGED_PYTHON=1 PIP_NO_INDEX=1)
-    uv_dir=(--add-dir "$AGENT_UV_DIR")
+            UV_OFFLINE=1 UV_MANAGED_PYTHON=1 UV_PYTHON_DOWNLOADS=never PIP_NO_INDEX=1)
+    uv_dir=(--add-dir "$AGENT_UV_DIR/cache")
   fi
   case "$1:$2" in
-    claude:lane)
-      if [ -n "${LOOM_CLAUDE_AUTH_FILE:-}" ] && [ -f "$LOOM_CLAUDE_AUTH_FILE" ]; then
-        # A cluster pod has no operator settings file that allows edits, and
-        # print mode cannot answer a permission prompt: the CLI denied every
-        # Edit, Write and shell call, exited 0 and the run ended "agent made
-        # no commit". acceptEdits plus the shell tool lets it edit and run
-        # the tests; the pod is the isolation. --allowedTools takes a list,
-        # so the brief goes over stdin: written after it, the CLI read the
-        # brief as a tool name and exited with no prompt on every run.
-        printf '%s' "$3" | CLAUDE_CODE_OAUTH_TOKEN="$(cat "$LOOM_CLAUDE_AUTH_FILE")" timeout "$AGENT_TIMEOUT" \
-          claude -p --model "$MODEL" --permission-mode acceptEdits --allowedTools Bash
-      else
-        timeout "$AGENT_TIMEOUT" claude -p --model "$MODEL" "$3" < /dev/null
-      fi ;;
+    claude:lane) claude_lane_cli "$3" ;;
     claude:brain) timeout "$AGENT_TIMEOUT" claude -p --model "$MODEL" \
       --permission-mode bypassPermissions "$3" < /dev/null ;;
     codex:lane) codex_home="$(codex_lane_home)" || return 2

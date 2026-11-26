@@ -144,9 +144,12 @@ Neither needs a model:
 - A queued ticket pinned to a model no free lane takes, waiting for it
   past LOOM_PIN_FALLBACK_MINUTES (default 30), takes the first free lane
   with that lane's own model and loses its Model: line (_pin_fallback,
-  loom#3151), unless the pin is hard (hard_pin: a person opened the ticket,
-  or it carries class:sensitive or tier:security). It never takes a lane it
-  ran on, and falls back at most PIN_FALLBACK_MAX times.
+  loom#3151), unless the pin is hard (hard_pin: it carries class:sensitive
+  or tier:security) or a ladder marker says its model is the ladder's rung
+  (loom#3191). Who opened the ticket does not matter (loom#3592). The wait
+  is the station's no_lane_since, kept in ticket-waits.json through the
+  state store, so a station restart does not reset it. It never takes a
+  lane it ran on, and falls back at most PIN_FALLBACK_MAX times.
 - A ticket waiting with no lane that takes it (NO_LANE_RE) for
   LOOM_NO_LANE_REROUTE hours (default 6) is rerouted to the first rung the
   climb rules allow with a free lane its repo may run on; with none, by
@@ -296,18 +299,13 @@ def pin_fallback_after(env: Optional[Dict[str, str]] = None) -> Optional[float]:
 
 
 def hard_pin(issue: Dict[str, Any]) -> str:
-    """Why a ticket's Model: line binds however long it waits, or "": a
-    person opened the ticket (the operator wrote the pin), or it carries a
-    HARD_PIN_LABELS label. A pin a brain's App or the ladder wrote is a
-    default the factory may route around."""
+    """Why a ticket's Model: line binds however long it waits, or "": it
+    carries a HARD_PIN_LABELS label. Any other pin is a default the factory
+    may route around, whoever opened the ticket: agent sessions post as the
+    person account, so its authorship says nothing about who chose the model,
+    and every lane may try every ticket (loom#3550, loom#3592)."""
     found = [x for x in HARD_PIN_LABELS if x in _labels(issue)]
-    if found:
-        return "it carries %s" % found[0]
-    user = issue.get("user") or {}
-    login = str(user.get("login") or "")
-    if login and user.get("type") != "Bot" and not login.endswith("[bot]"):
-        return "a person opened it"
-    return ""
+    return "it carries %s" % found[0] if found else ""
 
 
 def no_lane(reason: str) -> bool:
@@ -413,10 +411,11 @@ LADDER: Tuple[Tuple[Tuple[str, ...], str], ...] = (
 # this list). Difficulty: no longer routes. Review on the head, CI, live
 # verification, the merge gate and the model ladder judge the work; on
 # 2026-11-24 the old per-difficulty lists assigned 0 of 176 queued.
-# The Sparks first (operator 2026-10-17: "I wanna use my sparks"): four slots
-# on the operator's own hardware, open to private repos. A ticket a lane
-# fails still climbs the model ladder, so nothing waits on a cheap lane.
-SPARKS = ("spark", "spark-2", "spark-3", "spark-4")
+# The Sparks first (operator 2026-10-17: "I wanna use my sparks"): eight slots
+# on the operator's own hardware (spark to spark-8, loom#3605), open to private
+# repos. A ticket a lane fails still climbs the model ladder, so nothing waits
+# on a cheap lane.
+SPARKS = ("spark",) + tuple("spark-%d" % n for n in range(2, 9))
 # One slot per free provider in the spark-gateway's pool (infra#5617): spark-
 # type slots whose endpoint is the gateway's route pinned to that provider,
 # never a Spark. Operator 2026-10-19: make every free provider a lane, spend
@@ -432,7 +431,7 @@ OPENCODE_GO = ("opencode-go", "opencode-go-1", "opencode-go-2", "opencode-go-3",
 # anthropic credit last.
 LANE_ORDER: Tuple[str, ...] = (
     SPARKS
-    + FREE_POOL + ("openrouter", "workersai", "zen", "zai", "copilot")
+    + FREE_POOL + ("openrouter", "tinker", "workersai", "zen", "zai", "copilot")
     + OPENCODE_GO + CODEX + ("claude", "agy", "muse")
     + ANTHROPIC)
 # What a lane costs, for the dashboard's Tiers and allowances page (loom#968):
@@ -445,7 +444,7 @@ LANE_ORDER: Tuple[str, ...] = (
 KINDS = ("own-hardware", "free", "subscription", "never-paid")
 LANE_KINDS: Dict[str, str] = {
     "spark": "own-hardware",
-    **{lane: "free" for lane in FREE_POOL + ("openrouter", "workersai", "zen", "zai", "copilot")},
+    **{lane: "free" for lane in FREE_POOL + ("openrouter", "tinker", "workersai", "zen", "zai", "copilot")},
     **{lane: "subscription" for lane in ("claude", "codex", "opencode-go", "agy", "muse")},
     "anthropic": "never-paid",
 }
@@ -2011,6 +2010,7 @@ class Factory:
         # Lanes whose heartbeat says available; None trusts every lane not
         # at a limit.
         self.available = None if available is None else set(available)
+        self.preferred_lanes: Set[str] = set()
         # The tickets the station holds, "owner/repo#n": held for a factory
         # incident (they keep their running label and lane, but no lane is
         # working them) or refused this pass by the unproven-work gate.
@@ -2089,6 +2089,7 @@ class Factory:
         self._merged_prs: Dict[str, Dict[int, int]] = {}
         # Each repo's open pull requests, read once a pass by _open_lane_pull.
         self._open_pulls: Dict[str, List[Dict[str, Any]]] = {}
+        self._closed_pulls: Dict[str, List[Dict[str, Any]]] = {}
         self._stack_checked: set = set()
         self._overlap_unknown: set = set()
         self._overlap_health: Dict[Tuple[str, int, str], bool] = {}
@@ -2202,6 +2203,9 @@ class Factory:
         running ticket."""
         return self._takes_work(lane) and self.load.get(lane, 0) == 0
 
+    def _preferred_first(self, lanes: Iterable[str]) -> List[str]:
+        return sorted(lanes, key=lambda lane: lane not in self.preferred_lanes)
+
     def _runner_stops(self, lane: str, repo: str, base: str) -> bool:
         """Whether the runner ledger stops `repo` on `lane`'s slot for
         `base`, through the station's runner_stops (bus/runners.py
@@ -2223,7 +2227,7 @@ class Factory:
         when it should wait."""
         base = base_of(issue)
         agy_ok = agy_takes_header(issue, rung_only=True)
-        return next((x for x in lanes_for(self._is_private(repo))
+        return next((x for x in self._preferred_first(lanes_for(self._is_private(repo)))
                      if x != old and (allow_remote or x not in REMOTE_LANES)
                      and (x != "agy" or agy_ok) and not self._runner_stops(x, repo, base)
                      and self._free(x)), None)
@@ -2972,7 +2976,12 @@ class Factory:
                     continue
                 if pr.get("merged_at") is None and not pr.get("merged"):
                     continue
-                assoc = self._association(repo, pr)
+                # This historical lookup needs merged PRs; the normal
+                # association path skips them without logging conflicts.
+                try:
+                    assoc = brain._ticket_association(repo, pr)
+                except ValueError:
+                    continue
                 if assoc and assoc[0] == repo:
                     t_num = assoc[1]
                     if t_num not in merged or int(pr["number"]) > merged[t_num]:
@@ -3122,6 +3131,8 @@ class Factory:
         return issue if issue is not None and _state(issue) == "pr" else None
 
     def _association(self, repo: str, pr: Dict[str, Any]) -> Optional[Tuple[str, int]]:
+        if pr.get("merged_at") is not None or pr.get("merged"):
+            return None
         try:
             return brain._ticket_association(repo, pr)
         except brain.OtherRepoTicket:
@@ -5377,7 +5388,7 @@ class Factory:
         """The first lane that takes `model` and is free; with `busy_ok`, the
         first that is merely up and not limited for the model, busy or not."""
         from .station import model_lanes, needs_public_repo
-        return next((candidate for candidate in model_lanes(model)
+        return next((candidate for candidate in self._preferred_first(model_lanes(model))
                      if ((self._takes_work(candidate) and self._serves(candidate, model))
                          if busy_ok else (self._free(candidate) and self._serves(candidate, model)))
                      and (not needs_public_repo(candidate, model)
@@ -5464,6 +5475,8 @@ class Factory:
             return "%s is claimed by the claim:%s label" % (ref, label_claim)
         if self._move_queued_refs_pr(repo, issue):
             return "%s has an open trusted pull request" % ref
+        if self._move_queued_merged_pr(repo, issue):
+            return "%s has a merged trusted pull request" % ref
         briefer_pr = self._briefer_refs_pr(repo, issue)
         if briefer_pr:
             reason = "an open pull request #%s names it" % briefer_pr
@@ -5551,6 +5564,37 @@ class Factory:
             _say("%s: linked pull request #%s is open" % (ref, pr.get("number", "?")))
             return True
         return False
+
+    def _move_queued_merged_pr(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """Move a queued ticket to loom:merged when a merged same-repo PR from
+        a trusted author or briefer names it with a bare Refs line, so its work
+        is not given a lane again."""
+        number = int(issue["number"])
+        ref = "%s#%d" % (repo, number)
+        authors = self.trusted | self.briefers
+        for pr in self._closed_pull_requests(repo):
+            login = str((pr.get("user") or {}).get("login") or "").lower()
+            if (not pr.get("merged_at") or login not in authors
+                    or ((pr.get("head") or {}).get("repo") or {}).get("full_name") != repo
+                    or not self._refs_ticket(str(pr.get("body") or ""), number)):
+                continue
+            labels = brain._moved_labels(_labels(issue), "merged", "")
+            self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": labels})
+            issue["labels"] = [{"name": name} for name in labels]
+            _say("%s: linked pull request #%s is merged" % (ref, pr.get("number", "?")))
+            return True
+        return False
+
+    def _closed_pull_requests(self, repo: str) -> List[Dict[str, Any]]:
+        """The repo's most recently updated closed pull requests (first page
+        only), read once a pass for queued ticket checks."""
+        if repo not in self._closed_pulls:
+            rows = self.gh.rest("GET", "/repos/%s/pulls?state=closed&sort=updated"
+                                "&direction=desc&per_page=100" % repo).data
+            self._closed_pulls[repo] = [pr for pr in rows if isinstance(pr, dict)] \
+                if isinstance(rows, list) else []
+        return self._closed_pulls[repo]
 
     def _briefer_refs_pr(self, repo: str, issue: Dict[str, Any]) -> Any:
         """The number of an open same-repo pull request, opened by a
@@ -5783,7 +5827,7 @@ class Factory:
         """The lane for a pin fallback: the first free local lane by cost its
         repo may run on, not in `skip`."""
         base = base_of(issue)
-        return next((x for x in lanes_for(self._is_private(repo))
+        return next((x for x in self._preferred_first(lanes_for(self._is_private(repo)))
                      if x not in REMOTE_LANES and x not in skip and self._free(x)
                      and not self._runner_stops(x, repo, base)), None)
 
