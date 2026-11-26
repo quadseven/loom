@@ -19401,14 +19401,22 @@ class Station:
     def tend_lane_feed(self) -> None:
         """The slots in LOOM_POD_FEED_SLOTS: offer their briefs to lane pods
         on other nodes through the lane_feed table and mirror back each
-        pod's heartbeat and outcome (bus/lane_feed.py). A bad setting or an
-        unreadable row is logged and feeds nothing this pass; a lost lease
-        still stops the pass."""
+        pod's heartbeat and outcome (bus/lane_feed.py). On the shared
+        backend the pods' grants are reconciled every pass: an empty setting
+        revokes them all, and so does a bad one (fail closed). An unreadable
+        row is logged and feeds nothing this pass; a lost lease still stops
+        the pass."""
         env = dict(os.environ)
         store = state_store.active()
         rows = None
         try:
-            if not lane_feed.feed_slots(env):
+            try:
+                slots = lane_feed.feed_slots(env)
+            except ValueError as err:
+                _say("lane feed: %s; no lane pod keeps a grant" % err)
+                env.pop(lane_feed.SLOTS_SETTING, None)
+                slots = {}
+            if not slots and state_store.backend_name(env) != "postgres":
                 return
             rows = lane_feed.station_rows(env, self.s.home)
             lane_feed.Feed(self.s.home, env, rows, _say, now=self.now,

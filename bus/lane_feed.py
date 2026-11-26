@@ -127,6 +127,7 @@ PUT_ROW_FENCED = ("INSERT INTO lane_feed (slot, name, value, writer, updated_at)
 PUT_GRANT = ("INSERT INTO lane_feed_grant (slot, principal) VALUES (%s, %s) "
              "ON CONFLICT (slot) DO UPDATE SET principal = EXCLUDED.principal")
 DROP_GRANTS = "DELETE FROM lane_feed_grant WHERE NOT (slot = ANY(%s))"
+DROP_ALL_GRANTS = "DELETE FROM lane_feed_grant"
 
 
 def feed_slots(env: Mapping[str, str]) -> Dict[str, str]:
@@ -269,11 +270,15 @@ class PostgresRows:
                             % (slot, name, epoch))
 
     def grant(self, slots: Mapping[str, str]) -> None:
-        """Keep lane_feed_grant equal to the station's setting."""
+        """Keep lane_feed_grant equal to the station's setting; an empty
+        setting revokes every grant."""
         def write(cur: Any) -> None:
             for slot, principal in sorted(slots.items()):
                 cur.execute(PUT_GRANT, (slot, principal))
-            cur.execute(DROP_GRANTS, (sorted(slots),))
+            if slots:
+                cur.execute(DROP_GRANTS, (sorted(slots),))
+            else:
+                cur.execute(DROP_ALL_GRANTS, ())
         self._run(write)
 
     def close(self) -> None:
@@ -395,9 +400,11 @@ class Feed:
 
     def tend(self) -> None:
         slots = feed_slots(self.env)
+        # Every pass, even with no slot: a pod dropped from the setting
+        # loses its grant at once.
+        self.rows.grant(slots)
         if not slots:
             return
-        self.rows.grant(slots)
         for slot, pod in slots.items():
             self._mirror_beat(slot, pod)
             row = self.rows.read(slot, "offer")

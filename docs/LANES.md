@@ -2989,8 +2989,10 @@ before.
   security on `lane_feed`: a role reads only the rows of the slots
   `lane_feed_grant` gives it, and writes only their `claim`, `beat` and
   `report` rows, as itself. Each row records its writer as the database
-  sets it (`current_user`). The station keeps `lane_feed_grant` equal to
-  its setting each pass.
+  sets it (`current_user`). On the shared backend the station keeps
+  `lane_feed_grant` equal to its setting every pass, so a pod dropped from
+  it loses its rows at once; an empty setting revokes every grant, and so
+  does one it cannot read (fail closed, with a log line).
 - The station believes a pod's row only when the slot's role wrote it, and
   applies a report only when that role also wrote the claim of the offer
   the report answers. A pod takes only an offer addressed to it. Moving a

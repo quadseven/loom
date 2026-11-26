@@ -104,6 +104,11 @@ class FeedDb:
                 self.refuse("permission denied for table lane_feed_grant")
             self.grants = {s: p for s, p in self.grants.items() if s in params[0]}
             return [], 0
+        if sql == lane_feed.DROP_ALL_GRANTS:
+            if not owner:
+                self.refuse("permission denied for table lane_feed_grant")
+            self.grants = {}
+            return [], 0
         self.refuse("permission denied: %s" % sql[:40])
 
 
@@ -552,6 +557,33 @@ class PostgresFeedTest(RemoteLaneClaimsBeatsFinishesTest):
         self.env = {lane_feed.SLOTS_SETTING: "spark=%s" % self.POD}
         self.tend()
         self.assertEqual(self.db.grants, {"spark": self.POD})
+
+    def station_pass(self, env):
+        """One station tend_lane_feed on the shared backend, its rows on
+        this test's database."""
+        env = dict(env, LOOM_STATE_BACKEND="postgres")
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(lane_feed, "station_rows", lambda e, h: self.station_rows), \
+                mock.patch.object(station, "_say") as said:
+            if lane_feed.SLOTS_SETTING not in env:
+                os.environ.pop(lane_feed.SLOTS_SETTING, None)
+            self.station().tend_lane_feed()
+        return " ".join(str(c) for c in said.call_args_list)
+
+    def test_removing_every_slot_revokes_every_grant(self):
+        self.station_pass(self.env)
+        self.assertEqual(self.db.grants, {SLOT: self.POD})
+        self.station_pass({})
+        self.assertEqual(self.db.grants, {})
+        self.assertIsNone(self.pod_rows().read(SLOT, "offer"))
+
+    def test_a_bad_setting_revokes_every_grant(self):
+        self.station_pass(self.env)
+        said = self.station_pass({lane_feed.SLOTS_SETTING: "zen=pod-a zen=pod-b"})
+        self.assertEqual(self.db.grants, {})
+        self.assertIn("no lane pod keeps a grant", said)
+        with self.assertRaises(state_store.StateError):
+            self.pod_rows().write(SLOT, "beat", {"alive": 1})
 
     def test_a_pod_sends_only_lane_feed_reads_and_its_own_writes(self):
         name = self.queue()
