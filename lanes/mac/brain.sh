@@ -507,6 +507,25 @@ for lane in $RUNGS; do
   [ "$FAIL_CLASS" = limit ] || break
   say "lane $RUNG hit a limit; the tick moves to the next rung with usage"
 done
+# An agent that ended well with tick steps not run and the clock open gets
+# the tick back, at most CONTINUES times (loom#3593): on 2026-11-25 every
+# tick ended after merge with 10 of its 12 minutes left, so brief and triage
+# never ran. bus.brain step-pending exits 0, naming the steps, only then.
+CONTINUES="${LOOM_BRAIN_CONTINUES:-2}"
+continued=0
+while [ "$runs" -gt 0 ] && [ "$code" -eq 0 ] && [ "$continued" -lt "$CONTINUES" ]; do
+  now="$(date +%s)"
+  [ $((deadline - now)) -ge 300 ] || break
+  pending="$(brain step-pending --lock-repo "$LOCK_REPO" 2>> "$LOG")" || break
+  continued=$((continued + 1))
+  say "tick continues: $pending"
+  AGENT_TIMEOUT=$((deadline - now))
+  (cd "$WORK" && run_rung "$PROMPT
+
+The tick is not finished: $pending. Continue it from that step. The steps already recorded stay done; do not repeat them. Record each remaining step with bus.brain step, with a note saying so when it has nothing to do, then journal.") >> "$LOG" 2>&1
+  code=$?
+  say "tick end (exit $code)"
+done
 # The roll trees a tick leaves in $WORK/work are retired here, under the lock,
 # so no tick of this brain is using them (loom#2438): a landed tree goes, and
 # each tree kept is named in the log with its reason (bus/brain_trees.py).

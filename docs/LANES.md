@@ -2335,7 +2335,9 @@ anthropic slot reports itself unavailable with that reason, and the station
 sends the anthropic slots nothing more. Ephemeral runners return their spend
 rows in the sealed report. The station appends them once per report to the
 same ledger and checks the shared balance before dispatching more Anthropic
-briefs.
+briefs. The floor holds the anthropic slots only: the spend line says every
+other lane takes briefs as usual, and `bus.brain brief --lane` refuses only
+an anthropic slot under the floor (loom#3593).
 
 ## Skills on every lane
 

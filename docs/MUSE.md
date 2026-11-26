@@ -357,9 +357,15 @@ below; where the steps leave room, this is how to spend it.
     its own. Read that line instead of judging the time. A step may be
     deferred on budget only when the printed elapsed is 20 minutes or more;
     under 20, a `step` or `defer` note that defers on budget is refused
-    (recorded as refused, exit 1), so do the step instead (loom#2104). Until
-    the clock is in (a `step` that prints no elapsed line) and the tick is
-    short, run triage before verify.
+    (recorded as refused, exit 1), so do the step instead (loom#2104). A
+    refused step still counts as not run. Every step from status to sweep is
+    recorded before the journal, a step with nothing to do with a note
+    saying so: under the budget, `step journal` is refused while one is not
+    run, and names the next (loom#3593). `python3 -m bus.brain step-pending`
+    lists the steps not run; the lane machine wrapper reads it when the
+    agent exits and hands the tick back while steps are left and the clock
+    is open. Until the clock is in (a `step` that prints no elapsed line)
+    and the tick is short, run triage before verify.
 12. The journal ends with what moved, counted: merged N, briefed N (with
     numbers), closed or verified N, escalated N, factory tickets filed N,
     deferred N with their stages. A tick that moved nothing says so as its
@@ -1034,6 +1040,11 @@ An anthropic slot whose heartbeat says "out of credit" is unavailable. Do not
 brief, re-brief, move a limit-held ticket, or climb the ladder onto it until
 its hold expires. When the API credit is gone, route hard work to codex and
 the claude lane.
+
+The Anthropic spend floor (`LOOM_ANTHROPIC_FLOOR_USD`, the lane status line
+"Under the $5.00 floor") parks the anthropic slots only. It is never a
+reason to brief nothing: brief every other lane as usual. `brief --lane`
+refuses only an anthropic slot under the floor (loom#3593).
 
 Spark takes one ticket at a time and steps aside while its box is hot: the
 factory moves its waiting tickets to the first free other lane as above,
