@@ -772,6 +772,12 @@ print('leak guard: clean (shape patterns only)')
             stop.set()
             thread.join(10)
             self.assertFalse(thread.is_alive(), "the fake station thread did not stop")
+        # The station thread may have left files in state/remote-checks that
+        # race with rmtree on macOS (Errno 66 ENOTEMPTY). Remove it explicitly
+        # now that the writer has stopped.
+        rc = self.loom / "state" / "remote-checks"
+        if rc.exists():
+            shutil.rmtree(rc)
         self._tmp.cleanup()
 
     @staticmethod
