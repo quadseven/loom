@@ -2343,6 +2343,11 @@ cannot query the viewer or any other local service.
   endpoint. zai and zen have no meter: Z.ai documents no usage endpoint for
   API keys (its quota monitor covers the GLM Coding Plan only) and Zen's free
   models take no key, so Usage says "no meter: provider exposes no usage".
+  A codex lane reads no provider: on the same heartbeat, and after each run,
+  it copies the newest 5-hour and weekly readings from `CODEX_HOME/sessions`
+  into `state/usage/<slot>.meter.json` (`python3 -m bus.meter
+  --codex-sessions`), so a station that cannot see that Codex home still
+  records Codex usage (loom#3630).
 
 ### One slot on opencode 2.0
 
