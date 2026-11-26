@@ -9,7 +9,9 @@
 #
 # Defaults for a pod: LOOM_SANDBOX=bwrap (no sandbox-exec on Linux) and
 # LOOM_DROP_TREES=1 (each run's scratch goes when it ends). LOOM_POD_ONCE=1
-# runs one round, waits for it and exits (tests). What the pod needs:
+# runs one round, waits for it and exits (tests). LOOM_POD_FEED=1 starts each
+# round with `python3 -m bus.lane_feed sync`, for a pod fed by the station
+# through the state store instead of its disk. What the pod needs:
 # docs/LANES.md, "Lane pods".
 #
 # A stopping pod drains: on SIGTERM it starts no runner and
@@ -43,6 +45,7 @@ done
 : "${LOOM_HOME:?set LOOM_HOME}"
 export LOOM_SANDBOX="${LOOM_SANDBOX:-bwrap}" LOOM_DROP_TREES="${LOOM_DROP_TREES:-1}"
 RUNNER="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/run_lane.sh"
+ROOT="$(dirname "$(dirname "$RUNNER")")"
 PROBE="$(dirname "$RUNNER")/signin_probe.sh"
 mkdir -p "$LOOM_HOME/logs" "$LOOM_HOME/run" || { echo "cannot write $LOOM_HOME" >&2; exit 2; }
 # This pod is the only runner set for its slots, and a restarted container
@@ -111,6 +114,15 @@ drain() {
 trap drain TERM INT
 
 while :; do
+  # A pod on another node takes its briefs from the station through the
+  # state store and sends back each heartbeat and report the same way
+  # (bus/lane_feed.py, loom#3621). A failed round is logged; the runners
+  # still start and work any brief already here.
+  if [ "${LOOM_POD_FEED:-}" = 1 ]; then
+    # shellcheck disable=SC2086 # one slot a word
+    (cd "$ROOT" && python3 -m bus.lane_feed sync $SLOTS) >> "$LOOM_HOME/logs/lane-feed.log" 2>&1 ||
+      echo "[$(date -u +%FT%TZ)] lane feed round failed; see logs/lane-feed.log" >&2
+  fi
   for slot in $SLOTS; do
     bash "$RUNNER" "$slot" >> "$LOOM_HOME/logs/$slot-service.log" 2>&1 &
   done

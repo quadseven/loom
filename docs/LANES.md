@@ -2955,8 +2955,49 @@ low, medium, high, xhigh or max) sets a codex lane run's reasoning effort with
 `-c model_reasoning_effort=...` over the Codex home's `config.toml`; unset, the
 config's own setting applies. A brain run ignores it.
 
-A long-lived lane pod takes no work from the station. Lane runs on the
-cluster go through ephemeral runners instead (next section).
+A lane pod on the station's own disk takes work from that disk. A lane pod
+on another node takes it through the state store (next section). Ephemeral
+lane runs go through cluster runners ("Lanes on cluster runners").
+
+### Lane pods fed through the state store
+
+A slot named in `LOOM_POD_FEED_SLOTS` (space- or comma-separated, empty by
+default) on the station runs in a lane pod on any node that reaches the
+station's state store, not on the station's disk (`bus/lane_feed.py`,
+loom#3621). The one station stays the only claimer. With the setting empty
+nothing is offered, written or read, and every lane works as before.
+
+- The station claims the ticket and writes its brief to the slot's inbox as
+  for any lane. Each pass it offers the slot's next brief as a row in the
+  store (`state/lane-feed/<slot>/offer.json`), one at a time.
+- The pod runs `pod.sh` with `LOOM_POD_FEED=1`. Each round first runs
+  `python3 -m bus.lane_feed sync <slots>`: it pushes each slot's heartbeat,
+  side files and keepalive stamp (`beat.json`), pushes a finished run's
+  files (`report.json`: the brief's move to done/ or failed/, its logs and
+  answers, as a cluster runner's report carries them), and takes the next
+  offered brief into its own inbox (`claim.json`). Then `run_lane.sh` runs
+  it as usual. Its output goes to `logs/lane-feed.log`.
+- Each row has one writer: the station writes the offer, the pod the
+  claim, the beat and the report.
+- The station mirrors the pod's heartbeat and keepalive stamp into its own
+  `state/usage/`, so the slot is free, busy, limited or silent exactly as a
+  local slot is. It applies a report with the cluster runner's own checks
+  (`Runners.apply`): a file outside the run refuses the whole report and
+  parks the brief `[transient]`, as does a run that ended without moving
+  its brief.
+- A pod that stops pushing lets its heartbeat and stamp age. After
+  `SILENT_MAX` the factory moves its running ticket as it moves a silent
+  local lane's, the station returns the brief, and its next pass withdraws
+  the offer. A revived pod moves an unstarted withdrawn brief to
+  `returned/`, and the station ignores a late report.
+- On another node the store is the shared Postgres backend: both sides set
+  `LOOM_STATE_BACKEND=postgres` and `LOOM_DB_*`, and the database role is
+  the pod's credential. With the file backend a pod must share the station's
+  loom home, named by `LOOM_POD_FEED_HOME` (tests do this).
+- The station's lease fences its offer writes. A fed slot is never held by
+  the station host's load, and is not a cluster runner slot (a slot in both
+  settings is refused). Pod clocks are trusted as runner clocks are.
+- `LOOM_POD_NAME` names the pod in its rows (default the host name).
 
 ## Lanes on cluster runners
 

@@ -44,6 +44,7 @@ from . import brain_memory
 from . import brain_hold
 from . import claimed
 from . import human_claims
+from . import lane_feed
 from . import claim_referee
 from . import close_audit
 from . import closing
@@ -3567,7 +3568,8 @@ class Station:
                 if len(cols := line.split()) == 3}
         if jobs.get("com.loom.station") != str(os.getpid()):
             return
-        nonlocal_lanes = set(runners.runner_slots()) | set(REMOTE_LANES)
+        nonlocal_lanes = (set(runners.runner_slots()) | set(REMOTE_LANES)
+                          | {lane for lane in LANES if lane_feed.is_fed(lane)})
         self._missing_lane_jobs = {lane for lane in LANES if lane not in nonlocal_lanes
                                    and "com.loom." + lane not in jobs}
         for lane in sorted(self._missing_lane_jobs):
@@ -4042,8 +4044,10 @@ class Station:
         """True while the host is too loaded for a local lane to take a
         ticket. Only a station whose settings came from the environment
         asks (Settings.host_load_gate); runner slots and remote lanes do
-        their work elsewhere and are never held."""
-        if not self.s.host_load_gate or lane in runners.runner_slots() or lane in REMOTE_LANES:
+        their work elsewhere and are never held, nor are slots fed to lane
+        pods on other nodes (bus/lane_feed.py)."""
+        if (not self.s.host_load_gate or lane in runners.runner_slots() or lane in REMOTE_LANES
+                or lane_feed.is_fed(lane)):
             return False
         script = os.path.join(os.path.dirname(__file__), "..", "lanes", "host_load.sh")
         note = subprocess.check_output(["/bin/bash", script], text=True).strip()
@@ -19191,6 +19195,10 @@ class Station:
             except (GitHubError, OSError, runners.ReportError) as err:
                 _say("tend_runners failed: %s" % err)
             try:
+                self._timed(self.tend_lane_feed)
+            except (OSError, runners.ReportError) as err:
+                _say("tend_lane_feed failed: %s" % err)
+            try:
                 self._timed(self.tend_remote_checks)
             except RateLimited:
                 raise
@@ -19389,6 +19397,20 @@ class Station:
             actor = None
         runners.Runners(self.gh, self.s.home, repo, slots, dict(os.environ), self._public, _say,
                         actor=actor, now=self.now).tend()
+
+    def tend_lane_feed(self) -> None:
+        """The slots in LOOM_POD_FEED_SLOTS: offer their briefs to lane pods
+        on other nodes through the state store and mirror back each pod's
+        heartbeat and outcome (bus/lane_feed.py). A bad setting or an
+        unreadable row is logged and feeds nothing this pass; a lost lease
+        still stops the pass."""
+        try:
+            lane_feed.Feed(self.s.home, dict(os.environ), state_store.active(), _say,
+                           now=self.now).tend()
+        except station_lease.LeaseLost:
+            raise
+        except (ValueError, state_store.StateError) as err:
+            _say("lane feed: %s" % err)
 
     def tend_remote_checks(self) -> None:
         """Dispatch the check requests lanes filed under LOOM_REMOTE_CHECKS and
