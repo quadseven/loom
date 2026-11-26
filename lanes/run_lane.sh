@@ -2167,7 +2167,32 @@ file_ask() {
              --label needs:human --body "$(signed "$body")" 2>>"$LOG" ||
            gh issue create --repo "$FACTORY_REPO" --title "$title" --body "$(signed "$body")" 2>>"$LOG")"
   number="${number##*/}"
-  case "$number" in ''|*[!0-9]*) echo "needs:human ask filing failed" >> "$LOG" ;; esac
+  case "$number" in
+    ''|*[!0-9]*) echo "needs:human ask filing failed" >> "$LOG" ;;
+    *) settle_ask "$title" "$number" "$headline" ;;
+  esac
+  return 0
+}
+
+# Two lanes that hit one expired key in the same second both search, find no
+# open ask (the search index lags a new issue), and both file (loom#3536).
+# Just after filing ask $2 titled $1, list the open issues again with the
+# issue list, which sees a new issue at once. The lowest number with the same
+# title is the one ask: a higher one closes itself and counts its lane on the
+# lowest. The earlier filer never closes, since every later ask has a higher
+# number and every later listing sees it. A failed listing keeps the ask.
+settle_ask() {
+  local title="$1" number="$2" headline="$3" first
+  first="$(TITLE="$title" gh issue list --repo "$FACTORY_REPO" --state open --limit 500 \
+             --json number,title --jq '.[] | select(.title == env.TITLE) | .number' \
+             2>>"$LOG" | tr -cd '0-9\n' | sort -n | head -1)" || return 0
+  [ -n "$first" ] && [ "$first" -lt "$number" ] || return 0
+  gh issue close "$number" --repo "$FACTORY_REPO" --reason "not planned" \
+    --comment "$(printf 'Filed in the same moment as #%s, which holds this ask.%s' "$first" "$(sign_tail)")" \
+    >/dev/null 2>>"$LOG" || echo "could not close the duplicate ask $FACTORY_REPO#$number" >> "$LOG"
+  printf '' | upsert_sticky_comment "$FACTORY_REPO" "$first" "$KEY_REPEAT_MARKER" repeat \
+    --headline "$headline" --items-label "Lanes seen" --item "$SLOT" ||
+    echo "could not update the open ask $FACTORY_REPO#$first" >> "$LOG"
   return 0
 }
 
