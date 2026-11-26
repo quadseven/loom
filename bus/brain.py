@@ -7720,13 +7720,15 @@ _BRANCH_TICKET = re.compile(r"^loom/([0-9]+)(?:-[A-Za-z0-9._/-]+)?$")
 
 
 class OtherRepoTicket(ValueError):
-    """The pull request's one ticket reference names another repository."""
+    """The pull request's ticket references span or name another repository."""
 
 
 def _ticket_association(repo: str, pr: Dict[str, Any]) -> Optional[Tuple[str, int]]:
     """Resolve the PR's ticket from its runner reference and/or Loom branch."""
     refs = {(match.group(1), int(match.group(2)))
             for match in _TICKET_REF.finditer(str(pr.get("body") or ""))}
+    if len({ref_repo for ref_repo, _ in refs}) > 1:
+        raise OtherRepoTicket("ticket references span multiple repositories")
     branch = _BRANCH_TICKET.fullmatch(str((pr.get("head") or {}).get("ref") or ""))
     if branch:
         refs.add((repo, int(branch.group(1))))

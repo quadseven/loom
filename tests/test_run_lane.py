@@ -107,9 +107,12 @@ if [ "$1" = api ]; then
   store="$FAKE_LOG.comments"
   case "$*" in
     # A commit's GitHub checks, one "status conclusion" line each, from
-    # $FAKE_GH_CHECKS (default none).
+    # $FAKE_GH_CHECKS (default none), with optional tab-separated names.
     "api --paginate repos/"*"/check-runs"*)
-      printf '%s' "${FAKE_GH_CHECKS:-}"; exit 0 ;;
+      case "$*" in
+        *'.name'*) printf '%s' "${FAKE_GH_CHECKS:-}" ;;
+        *) printf '%s' "${FAKE_GH_CHECKS:-}" | cut -f1 ;;
+      esac; exit 0 ;;
     "api --paginate repos/"*"/comments --jq "*)
       [ -z "${FAKE_GH_COMMENTS_FAIL:-}" ] || { echo "HTTP 502" >&2; exit 1; }
       where="${3#repos/}"; where="${where%/comments}"; repo="${where%/issues/*}"; num="${where##*/}"
@@ -9665,6 +9668,89 @@ echo fixed > fix.txt
         self.assertEqual(dispatched[0]["check"], "test -f .prepared && loom-test-python check.py")
         self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()), log)
         self.assertIn("refs/heads/loom/T042-fix-the-thing", self.remote_heads())
+
+    def run_remote_fix_base(self, checks, advance_default=False, **env):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo(contract="check: echo HOST_BASE_CHECK\n")
+        name, head = self.fix_brief(with_head=True)
+        if advance_default:
+            self.advance_main("main.txt", "updated default branch\n")
+        result = self.run_contract_lane(
+            **{"LOOM_REMOTE_CHECKS": "1", "FAKE_GH_CHECKS": checks,
+               "FAKE_AGENT": "say", "FAKE_EXIT": "1", "FAKE_OUT": "agent started", **env})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        records = [json.loads(line) for line in (self.loom / "logs" / "codex" /
+                   (name + ".validation.jsonl")).read_text().splitlines()]
+        baseline = next(row for row in records if row["phase"] == "baseline")
+        self.assertEqual(baseline["revision"], head)
+        self.assertTrue(any(c.startswith("codex ") for c in self.calls()))
+        return self.run_log(name + ".log"), baseline
+
+    def test_fix_round_uses_github_base_verdict_without_a_host_check(self):
+        log, baseline = self.run_remote_fix_base(self.GREEN_CHECKS)
+        self.assertNotIn("HOST_BASE_CHECK\n", log)
+        self.assertIn("GitHub", baseline["detail"])
+        self.assertTrue(baseline["ok"])
+        self.assertEqual(baseline["exit"], 0)
+        self.assertTrue(any(f"/commits/{baseline['revision']}/check-runs?" in call
+                            for call in self.calls()))
+
+    def test_fix_round_without_head_checks_records_the_host_base_verdict(self):
+        log, baseline = self.run_remote_fix_base("")
+        self.assertIn("HOST_BASE_CHECK\n", log)
+        self.assertIn("host", baseline["detail"])
+        self.assertTrue(baseline["ok"])
+
+    def test_fix_round_ignores_failed_review_when_ci_passed(self):
+        log, baseline = self.run_remote_fix_base(
+            "completed success\tunittest\ncompleted failure\tGrug - Elder\n")
+        self.assertNotIn("HOST_BASE_CHECK\n", log)
+        self.assertIn("GitHub", baseline["detail"])
+        self.assertTrue(baseline["ok"])
+        self.assertEqual(baseline["exit"], 0)
+
+    def test_fix_round_with_only_review_checks_runs_host_base_check(self):
+        log, baseline = self.run_remote_fix_base(
+            "completed success\tGrug - Elder\ncompleted success\tGrug - Chief\n")
+        self.assertIn("HOST_BASE_CHECK\n", log)
+        self.assertIn("host", baseline["detail"])
+
+    def test_fix_round_reads_the_pr_head_checks_after_merging_the_default_branch(self):
+        log, baseline = self.run_remote_fix_base(self.GREEN_CHECKS, advance_default=True)
+        self.assertNotIn("HOST_BASE_CHECK\n", log)
+        self.assertIn("GitHub", baseline["detail"])
+        self.assertTrue(any(f"/commits/{baseline['revision']}/check-runs?" in call
+                            for call in self.calls()))
+
+    def test_cluster_fix_round_reads_existing_github_checks(self):
+        log, baseline = self.run_remote_fix_base(self.GREEN_CHECKS, LOOM_CLUSTER_RUNNER="1")
+        self.assertNotIn("HOST_BASE_CHECK\n", log)
+        self.assertIn("GitHub", baseline["detail"])
+
+    def test_fix_round_consumes_a_red_github_verdict_before_the_default_gate(self):
+        log, baseline = self.run_remote_fix_base("completed failure\n")
+        self.assertEqual(baseline["exit"], 1)
+        self.assertFalse(baseline["ok"])
+        self.assertIn("GitHub", baseline["detail"])
+        # Only the default branch runs on the host; its pass allows the agent.
+        self.assertEqual(log.count("HOST_BASE_CHECK\n"), 1)
+
+    def test_fix_round_with_pending_head_checks_uses_the_host(self):
+        log, baseline = self.run_remote_fix_base("completed success\nin_progress null\n")
+        self.assertIn("HOST_BASE_CHECK\n", log)
+        self.assertIn("host", baseline["detail"])
+
+    def test_private_fix_round_keeps_the_host_base_check(self):
+        log, baseline = self.run_remote_fix_base(self.GREEN_CHECKS, FAKE_GH_PRIVATE="true")
+        self.assertIn("HOST_BASE_CHECK\n", log)
+        self.assertIn("host", baseline["detail"])
+        self.assertFalse(any("/check-runs?" in call for call in self.calls()))
+
+    def test_fix_round_with_remote_checks_off_keeps_the_host_base_check(self):
+        log, baseline = self.run_remote_fix_base(self.GREEN_CHECKS, LOOM_REMOTE_CHECKS="0")
+        self.assertIn("HOST_BASE_CHECK\n", log)
+        self.assertIn("host", baseline["detail"])
+        self.assertFalse(any("/check-runs?" in call for call in self.calls()))
 
     def test_remote_checks_on_a_private_repo_still_take_a_check_slot(self):
         _, dispatched = self.fake_station()
