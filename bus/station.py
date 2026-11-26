@@ -53,6 +53,7 @@ from . import journal
 from . import lane_markers
 from . import log_capture
 from . import operator_budget
+from . import pace
 from . import fabric, fabric_reviews
 from . import fixrounds
 from . import logrotate
@@ -11427,6 +11428,7 @@ class Station:
                for row in rows]
             + ["", "Remote claims: muse %d/%d" % (
                 self._remote_claim_count("muse"), REMOTE_LANES["muse"]["slots"])]
+            + pace.lines(pace.read(self.s.home))
             + (pr_lines or [])
             + self._scorecard_lines()
             + (["", summary.line()] if summary is not None else []))
@@ -11529,6 +11531,8 @@ class Station:
         # Claims paused or resumed for disk republishes (loom#1808).
         values["disk"] = "paused" if self._disk_status_line() else "ok"
         values["disk watchdog"] = self._watchdog_notice() or ""
+        # A new pace verdict or slot request republishes (loom#3630).
+        values["pace"] = pace.summary(pace.read(self.s.home))
         if refresh_pr_counts:
             read_lines, read_at = self._repo_pr_lines(), self.now
             pr_lines = read_lines
@@ -19372,6 +19376,9 @@ class Station:
             records = usage.collect(self.s.home, now=self.now)
             usage.write(self.s.home, records)
             self.upload_usage_limits(records)
+            waits = _read_json(os.path.join(self.state, "ticket-waits.json"), {}, strict=False)
+            pace.write(self.s.home, pace.plan(self.s.home, records, pace.queued(waits),
+                                              os.environ, self.now))
         except OSError as err:
             _say("could not write usage limits: %s" % err)
         try:
