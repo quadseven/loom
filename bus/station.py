@@ -586,7 +586,7 @@ REMOTE_RE = re.compile(r"[:/]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?$")
 # keeps its rung, and the brain re-queues it when the incident closes.
 # An [auth] one is the operator's key, which no lane can renew: it is not a
 # failure, not an attempt spent and never a runaway.
-CLASS_RE = re.compile(r"^\[(size|limit|transient|work|factory|auth|egress-opened)\] ")
+CLASS_RE = re.compile(r"^\[(size|limit|transient|work|factory|auth|operator|egress-opened)\] ")
 RETRY_CLASSES = ("limit", "transient")
 RETRY_MAX = 2
 # Whether this process has said the send-back comparison is off (unset target).
@@ -1816,7 +1816,7 @@ def _int_or_default(raw: str, default: int) -> int:
 
 def _is_work_attempt(reason: str) -> bool:
     """Whether an attempt ending counts as a work attempt rather than a
-    non-work exit ([transient], [limit], [auth], or [factory])."""
+    non-work exit such as a limit or an operator decision."""
     return not reason or failure_class(reason) not in NOT_WORK
 
 
@@ -2210,7 +2210,7 @@ def provider(lane: str) -> str:
 
 
 # Failure classes that did no work on the ticket (loom#572).
-NOT_WORK = ("size", "factory", "transient", "limit", "auth")
+NOT_WORK = ("size", "factory", "transient", "limit", "auth", "operator")
 
 
 def failure_class(reason: str) -> str:
@@ -10081,6 +10081,9 @@ class Station:
         reason = self._failure_reason(lane, name)
         fix_pr = self._field(text, "Fix-PR")
         klass, bare = failure_class(reason), CLASS_RE.sub("", reason)
+        if klass == "operator" and not fix_pr:
+            self._report_operator_park(repo, number, lane)
+            return True
         if lane == "workersai" and klass == "size":
             names = _label_names(self._issue(repo, number))
             if RUNNING in names and "lane:workersai" in names:
@@ -10187,6 +10190,16 @@ class Station:
         _say("reported %s#%d failed: %s" % (repo, number, reason))
         return True
 
+    def _report_operator_park(self, repo: str, number: int, lane: str) -> None:
+        names = _label_names(self._issue(repo, number))
+        if RUNNING not in names or "lane:" + lane not in names:
+            return
+        if not needs_human(names):
+            names.append(NEEDS_HUMAN)
+        self._end_run(repo, number, names, "loom:queued")
+        # The runner already scanned and posted the question and answers.
+        self._stopped(repo, number, lane, "operator", "decision needs an operator")
+
     def _retry_factory_check(self, repo: str, number: int, lane: str, reason: str) -> None:
         note = self._retry(repo, number, lane, "transient", reason)
         if note:
@@ -10285,7 +10298,7 @@ class Station:
         skipped = len(attempts) - len(work)
         if skipped:
             body += ("\n\nNot counted as work attempts: %d that ended [transient], [limit], "
-                     "[auth] or [factory]." % skipped)
+                     "[auth], [factory] or [operator]." % skipped)
         self._comment(repo, number, body, notify.RUNAWAY)
         return True
 

@@ -113,11 +113,12 @@ def merge_repeat(old: Optional[str], marker: str, headline: str, items_label: st
     return "\n".join(lines) + "\n"
 
 
-def merge_outcome(old: Optional[str], marker: str, headline: str, text: str, now: str) -> str:
+def merge_outcome(old: Optional[str], marker: str, headline: str, text: str, now: str,
+                  limit: int = MAX_OUTCOME) -> str:
     """The parked-run comment: one readable outcome line, replacing the last
     run's, so a ticket that fails again keeps one comment, not one per
-    failure. Only the first non-blank line of the text is kept, capped at
-    MAX_OUTCOME, outside any code block. The old body is not read; it is a
+    failure. Only the first non-blank line of the text is kept, up to the
+    outcome limit, outside any code block. The old body is not read; it is a
     parameter so every mode has the same shape. The text cannot open a
     marker, mention anyone or start a code block."""
     line = next((l.strip() for l in text.splitlines() if l.strip()), "")
@@ -125,8 +126,8 @@ def merge_outcome(old: Optional[str], marker: str, headline: str, text: str, now
     # The reason can carry agent text: no link, image, tag or emphasis renders.
     line = line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     line = re.sub(r"([\\\[\]()!*_|#~])", r"\\\1", line)
-    if len(line) > MAX_OUTCOME:
-        line = line[:MAX_OUTCOME].rstrip() + " ..."
+    if len(line) > limit:
+        line = line[:limit].rstrip() + " ..."
     return "\n".join([marker, "%s, as of %s." % (headline, now), "", line, "", OUTCOME_FOOTER]) + "\n"
 
 
@@ -150,6 +151,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         p.add_argument("--old")
         if name in ("repeat", "outcome"):
             p.add_argument("--headline", required=True)
+        if name == "outcome":
+            p.add_argument("--operator-ask", action="store_true")
         if name == "repeat":
             p.add_argument("--items-label", required=True)
             p.add_argument("--item", default="")
@@ -159,7 +162,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.command == "rounds":
         out = merge_round(old, args.marker, text, args.now)
     elif args.command == "outcome":
-        out = merge_outcome(old, args.marker, args.headline, text, args.now)
+        out = merge_outcome(old, args.marker, args.headline, text, args.now,
+                            MAX_ENTRY if args.operator_ask else MAX_OUTCOME)
     else:
         out = merge_repeat(old, args.marker, args.headline, args.items_label,
                            args.item, text, args.now)
