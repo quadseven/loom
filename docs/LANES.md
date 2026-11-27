@@ -34,6 +34,10 @@ never merges. Heartbeats usage + model catalog to `state/usage/<lane>.json`.
 - Each pass writes `state/usage/<lane>.json` with the lane state, runner
   readiness, and time. A lane whose CLI or key is missing reports unavailable
   and leaves its briefs alone. The station routes only to serving lanes.
+- Each claude slot signs in with `LOOM_<SLOT>_AUTH_FILE`, else
+  `LOOM_CLAUDE_AUTH_FILE` (a file holding a `claude setup-token` OAuth
+  token). A slot with its own file is another account: it has its own meter,
+  and the pod's sign-in probe checks it alone.
 
 ## How a lane is told to work
 

@@ -71,17 +71,30 @@ codex_lane_home() {
   printf '%s\n' "$dest"
 }
 
+# The token file claude slot $1 (default SLOT, else claude) signs in with:
+# LOOM_<SLOT>_AUTH_FILE, else LOOM_CLAUDE_AUTH_FILE. A second account runs on
+# its own slot (claude-2 with LOOM_CLAUDE_2_AUTH_FILE), and its meter is that
+# slot's own (state/usage/<slot>.meter.json), so each account is metered
+# alone. Empty when neither is set.
+claude_auth_file() {
+  local slot="${1:-${SLOT:-claude}}" var
+  [[ "$slot" =~ ^[a-z][a-z0-9-]*$ ]] || slot=claude
+  var="LOOM_$(printf '%s' "$slot" | tr '[:lower:]-' '[:upper:]_')_AUTH_FILE"
+  printf '%s' "${!var:-${LOOM_CLAUDE_AUTH_FILE:-}}"
+}
+
 claude_lane_print() {
   # The brief is the first argument; any further arguments are CLI options.
-  local brief="$1"
+  local brief="$1" auth
   shift
-  if [ -n "${LOOM_CLAUDE_AUTH_FILE:-}" ] && [ -f "$LOOM_CLAUDE_AUTH_FILE" ]; then
+  auth="$(claude_auth_file)"
+  if [ -n "$auth" ] && [ -f "$auth" ]; then
     # A cluster pod has no operator settings file. In print mode the CLI
     # needs permission to edit and run tests. The pod is the isolation.
     # --allowedTools takes a list, so the brief goes over stdin: written
     # after it, the CLI read the brief as a tool name and exited with no
     # prompt on every run.
-    printf '%s' "$brief" | CLAUDE_CODE_OAUTH_TOKEN="$(cat "$LOOM_CLAUDE_AUTH_FILE")" timeout "$AGENT_TIMEOUT" \
+    printf '%s' "$brief" | CLAUDE_CODE_OAUTH_TOKEN="$(cat "$auth")" timeout "$AGENT_TIMEOUT" \
       claude -p --model "$MODEL" --permission-mode acceptEdits --allowedTools Bash "$@"
   else
     timeout "$AGENT_TIMEOUT" claude -p --model "$MODEL" "$@" "$brief" < /dev/null

@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 AGENT_CLI = ROOT / "lanes" / "agent_cli.sh"
 
 FAKE_CLAUDE = """#!/usr/bin/env bash
+[ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] || printf '%s' "$CLAUDE_CODE_OAUTH_TOKEN" > "$FAKE_TREE/token.txt"
 case "$*" in
   *"--permission-mode acceptEdits"*) echo changed > "$FAKE_TREE/edited.txt" ;;
   *) echo "Claude requested permissions to write edited.txt, but you haven't granted it yet." ;;
@@ -57,11 +58,11 @@ class ClaudeLanePermissionsTest(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def run_lane(self, auth_file=True, status=0):
+    def run_lane(self, auth_file=True, status=0, slot="claude", **extra):
         script = '. "$1"; MODEL=claude-test; AGENT_TIMEOUT=30; agent_cli claude lane "do the brief"'
         env = {"PATH": "%s:%s:/usr/bin:/bin" % (self.root / "bin", Path(sys.executable).parent),
                "HOME": str(self.root), "FAKE_TREE": str(self.tree), "FAKE_EXIT": str(status),
-               "LOOM_ROOT": str(ROOT), "LOOM_HOME": str(self.root), "SLOT": "claude"}
+               "LOOM_ROOT": str(ROOT), "LOOM_HOME": str(self.root), "SLOT": slot, **extra}
         if auth_file:
             env["LOOM_CLAUDE_AUTH_FILE"] = str(self.token)
         result = subprocess.run(["/bin/bash", "-c", script, "run", str(AGENT_CLI)],
@@ -72,6 +73,21 @@ class ClaudeLanePermissionsTest(unittest.TestCase):
     def test_a_pod_run_with_the_cluster_token_can_edit_the_tree(self):
         self.run_lane()
         self.assertTrue((self.tree / "edited.txt").exists())
+
+    def test_a_slot_with_its_own_sign_in_runs_on_its_own_account(self):
+        # loom#3660: a second account on claude-2 signs in with its own file.
+        other = self.root / "other-token"
+        other.write_text("second-account-token\n")
+        self.run_lane(slot="claude-2", LOOM_CLAUDE_2_AUTH_FILE=str(other))
+        self.assertEqual((self.tree / "token.txt").read_text(), "second-account-token")
+        # Its meter is its own, so its cap reads its account alone.
+        meters = self.root / "state" / "usage"
+        self.assertTrue((meters / "claude-2.meter.json").exists())
+        self.assertFalse((meters / "claude.meter.json").exists())
+
+    def test_a_slot_without_its_own_sign_in_shares_the_lane_one(self):
+        self.run_lane(slot="claude-2")
+        self.assertEqual((self.tree / "token.txt").read_text(), "token-for-test")
 
     def test_a_pod_run_leaves_no_permission_refusal(self):
         self.assertNotIn("haven't granted", self.run_lane())
