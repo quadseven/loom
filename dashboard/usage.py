@@ -8,6 +8,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from bus import daily_allowance
+
 
 def validate(raw: Any) -> list[dict[str, Any]]:
     if not isinstance(raw, list) or len(raw) > 200:
@@ -442,6 +444,26 @@ def _subscription_rows(by_name: dict[str, list[dict[str, Any]]], now: datetime) 
     return out
 
 
+def _daily_rows(by_name: dict[str, list[dict[str, Any]]], now: datetime) -> list[tuple[str, str]]:
+    out = []
+    for provider in daily_allowance.PROVIDER_UNITS:
+        for reading in by_name.get(provider, []):
+            saved = reading.get("daily_allowance")
+            if not isinstance(saved, dict) or saved.get("provider") != provider:
+                continue
+            row = daily_allowance.refresh(provider, saved, now.timestamp())
+            label, amount, reset, pacing = daily_allowance.cells(row)
+            detail = "No reading."
+            if reset is not None:
+                reset_text = datetime.fromisoformat(reset).strftime("%Y-%m-%d %H:%M UTC")
+                detail = "%s used. Resets %s." % (amount, reset_text)
+                if pacing is not None:
+                    detail += " " + pacing + "."
+            out.append((label, detail))
+            break
+    return out
+
+
 def build(rows: list[dict[str, Any]], now: datetime, prs: list[dict[str, Any]] | None = None,
           models: dict[str, str] | None = None,
           lane_rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -460,6 +482,7 @@ def build(rows: list[dict[str, Any]], now: datetime, prs: list[dict[str, Any]] |
     newest = max((p["read"] for p in providers if p["read"]), default=None)
     return {"providers": providers, "asks": _asks(providers, newest, now), "now": now, "newest": newest,
             "subscriptions": _subscription_rows(by_name, now),
+            "daily_allowances": _daily_rows(by_name, now),
             **_lane_totals(providers)}
 
 
@@ -710,7 +733,7 @@ def _asks_html(asks: list[tuple[str, str]]) -> str:
     return head + '<ul class="ua-list">%s</ul></section>' % items
 
 
-def _subscriptions_html(rows: list[tuple[str, str]]) -> str:
+def _summary_rows_html(heading_id: str, heading: str, rows: list[tuple[str, str]]) -> str:
     if not rows:
         return ""
     esc = html.escape
@@ -718,9 +741,9 @@ def _subscriptions_html(rows: list[tuple[str, str]]) -> str:
         '<li class="uq"><div class="uq-head"><h3 class="up-name">%s</h3></div>'
         '<div class="uq-body"><span class="up-lanes">%s</span></div></li>'
         % (esc(name), esc(detail)) for name, detail in rows)
-    return ('<section class="usage-section" aria-labelledby="usage-subscriptions">'
-            '<h2 class="label" id="usage-subscriptions">Subscriptions</h2>'
-            '<ul class="uq-list">%s</ul></section>' % items)
+    return ('<section class="usage-section" aria-labelledby="%s">'
+            '<h2 class="label" id="%s">%s</h2>'
+            '<ul class="uq-list">%s</ul></section>' % (esc(heading_id), esc(heading_id), esc(heading), items))
 
 
 def render(data: dict[str, Any]) -> str:
@@ -733,7 +756,9 @@ def render(data: dict[str, Any]) -> str:
                 'The station uploads one on each pass (POST /api/usage); this page fills in after '
                 'its next pass. If it stays empty, the station is not running or its upload fails.</p>')
     parts = [_freshness_html(newest, now), _summary(data),
-             _subscriptions_html(data["subscriptions"]), _asks_html(data["asks"])]
+             _summary_rows_html("usage-subscriptions", "Subscriptions", data["subscriptions"]),
+             _summary_rows_html("usage-daily-allowances", "Daily free allowances", data["daily_allowances"]),
+             _asks_html(data["asks"])]
     loud = [p for p in providers if p["status"] != "no meter"]
     quiet = [p for p in providers if p["status"] == "no meter"]
     if loud:

@@ -48,6 +48,7 @@ from . import lane_feed
 from . import claim_referee
 from . import close_audit
 from . import closing
+from . import daily_allowance
 from . import decision_claim
 from . import evidence_close
 from . import journal
@@ -11489,12 +11490,17 @@ class Station:
 
     def _lanes_body(self, rows: List[Tuple[str, str, str, str]],
                     pr_lines: Optional[List[str]] = None,
-                    subscriptions: Optional[List[Dict[str, Any]]] = None) -> str:
+                    subscriptions: Optional[List[Dict[str, Any]]] = None,
+                    allowances: Optional[List[Dict[str, Any]]] = None) -> str:
         summary = self._spend_shown()
         disk = [line for line in (self._disk_status_line(), self._watchdog_notice()) if line]
         probes = signin.by_slot(signin.read(self.s.home))
-        if subscriptions is None:
-            subscriptions = subscription_view.read(self.s.home, self.now, os.environ)
+        if subscriptions is None or allowances is None:
+            records = usage.read_snapshot(self.s.home)
+            if subscriptions is None:
+                subscriptions = subscription_view.read(self.s.home, self.now, os.environ, records)
+            if allowances is None:
+                allowances = daily_allowance.snapshot(records, self.now, os.environ)
         body = "\n".join(
             [LANES_MARKER, "Updated " + self._utc(self.now),
              station_beat.stamp_line(station_beat.station_settings(os.environ)[0]), ""]
@@ -11506,6 +11512,7 @@ class Station:
             + ["", "Remote claims: muse %d/%d" % (
                 self._remote_claim_count("muse"), REMOTE_LANES["muse"]["slots"])]
             + subscription_view.lines(subscriptions)
+            + daily_allowance.lines(allowances)
             + (pr_lines or [])
             + self._scorecard_lines()
             + (["", summary.line()] if summary is not None else []))
@@ -11608,8 +11615,11 @@ class Station:
         # Claims paused or resumed for disk republishes (loom#1808).
         values["disk"] = "paused" if self._disk_status_line() else "ok"
         values["disk watchdog"] = self._watchdog_notice() or ""
-        subscriptions = subscription_view.read(self.s.home, self.now, os.environ)
+        records = usage.read_snapshot(self.s.home)
+        subscriptions = subscription_view.read(self.s.home, self.now, os.environ, records)
+        allowances = daily_allowance.snapshot(records, self.now, os.environ)
         values["pace"] = subscription_view.signature(subscriptions)
+        values["daily allowances"] = daily_allowance.signature(allowances)
         if refresh_pr_counts:
             read_lines, read_at = self._repo_pr_lines(), self.now
             pr_lines = read_lines
@@ -11620,7 +11630,7 @@ class Station:
             return
         number = self._lanes_issue(repo)
         comment_id = self._upsert_lanes_comment(
-            repo, number, self._lanes_body(rows, pr_lines, subscriptions))
+            repo, number, self._lanes_body(rows, pr_lines, subscriptions, allowances))
         record = {"repo": repo, "issue": number, "comment_id": comment_id,
                   "values": values, "at": self.now}
         if read_lines is not None:
@@ -19608,7 +19618,9 @@ class Station:
             records = usage.collect(self.s.home, now=self.now)
             usage.write(self.s.home, records)
             subscriptions = subscription_view.read(self.s.home, self.now, os.environ, records)
-            self.upload_usage_limits(subscription_view.for_upload(records, subscriptions, self.now))
+            allowances = daily_allowance.snapshot(records, self.now, os.environ)
+            payload = subscription_view.for_upload(records, subscriptions, self.now)
+            self.upload_usage_limits(daily_allowance.for_upload(payload, allowances, self.now))
             waits = _read_json(os.path.join(self.state, "ticket-waits.json"), {}, strict=False)
             pace.write(self.s.home, pace.plan(self.s.home, records, pace.queued(waits),
                                               os.environ, self.now))
