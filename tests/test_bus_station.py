@@ -1683,6 +1683,55 @@ class ReconcilePullRequestTest(Base):
                 self.assertIn("Pull request #99 merged while this ticket was at loom:" + state,
                               self.fake.comments[12][-1]["body"])
 
+    def test_a_queued_ticket_with_a_merged_refs_pull_is_not_claimed_after_relabeling(self):
+        self.fake.add(12, state="queued")
+        self.fake.pulls = [self.merged_pr()]
+
+        def transport(method, url, headers, body):
+            if (method == "GET" and url.endswith(CLOSED_PULLS % REPO)
+                    and CLOSED_PULLS % REPO not in self.fake.paths("GET")):
+                self.fake.issues[12]["labels"] = [
+                    {"name": name} for name in
+                    ("loom:ticket", "loom:briefed", "lane:codex", "priority:P1")]
+            return self.fake(method, url, headers, body)
+
+        runner = station.Station(GitHub("token", transport=transport), self.settings)
+        with mock.patch("bus.station._say") as say:
+            runner.reconcile_pull_requests()
+            runner.claim_new()
+
+        names = self.fake.names(12)
+        self.assertIn("loom:merged", names)
+        self.assertIn("priority:P1", names)
+        self.assertFalse({"loom:queued", "loom:briefed", "loom:running"}.intersection(names))
+        self.assertEqual(self.listing(), [])
+        lines = [call.args[0] for call in say.call_args_list if "pull request #99" in call.args[0]]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("loom:merged", lines[0])
+
+    def test_a_queued_ticket_is_reconciled_when_its_merge_is_on_the_second_page(self):
+        self.fake.add(12, state="queued", lane="muse", body=BODY_WITH_CRITERIA)
+        self.fake.pulls = [{"number": n, "state": "closed"} for n in range(100, 200)]
+        self.fake.pulls.append(self.merged_pr())
+        self.run_pass()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertNotIn("loom:queued", self.fake.names(12))
+        self.assertEqual(self.listing(), [])
+
+    def test_reconciliation_preserves_a_ticket_that_shipped_during_the_merge_scan(self):
+        self.fake.add(12, state="queued")
+        self.fake.pulls = [self.merged_pr()]
+
+        def transport(method, url, headers, body):
+            if method == "GET" and url.endswith(CLOSED_PULLS % REPO):
+                self.fake.issues[12]["labels"] = [{"name": "loom:ticket"}, {"name": "loom:shipped"}]
+            return self.fake(method, url, headers, body)
+
+        runner = station.Station(GitHub("token", transport=transport), self.settings)
+        runner.reconcile_pull_requests()
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "loom:shipped"])
+        self.assertNotIn("/repos/%s/issues/12/labels" % REPO, self.fake.paths("PUT"))
+
     def test_a_merged_pull_request_that_may_not_deliver_moves_nothing(self):
         cases = {
             "untrusted author": self.merged_pr(author="stranger"),
