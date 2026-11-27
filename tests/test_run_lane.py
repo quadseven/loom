@@ -9706,13 +9706,19 @@ echo fixed > fix.txt
                 'echo "end" >> "$MARKS"\nrelease_check_slot\n')
         env = {"LOOM_CHECK_SLOTS": "1", "LOOM_CHECK_SLOT_POLL": "0.1", "MARKS": str(marks)}
         procs = [self.slot_script(body, **env) for _ in range(2)]
+        outcomes = []
         for proc in procs:
-            out, err = proc.communicate(timeout=60)
-            self.assertEqual(proc.returncode, 0, err)
+            _, err = proc.communicate(timeout=60)
+            outcomes.append((proc.pid, proc.returncode, err))
+        log_path = tmp / "slots.log"
+        slot_log = log_path.read_text() if log_path.exists() else ""
+        detail = f"Processes (PID, exit, stderr): {outcomes!r}\nSlot log:\n{slot_log}"
+        for _, returncode, _ in outcomes:
+            self.assertEqual(returncode, 0, detail)
         events = marks.read_text().split()
-        self.assertEqual(events, ["start", "end", "start", "end"])
-        self.assertIn("waiting for a check slot", (tmp / "slots.log").read_text())
-        self.assertEqual(list((self.loom / "run" / "check-slots").iterdir()), [])
+        self.assertEqual(events, ["start", "end", "start", "end"], detail)
+        self.assertIn("waiting for a check slot", slot_log, detail)
+        self.assertEqual(list((self.loom / "run" / "check-slots").iterdir()), [], detail)
 
     def test_slots_default_to_three(self):
         body = ('echo "$CHECK_SLOTS"\n')

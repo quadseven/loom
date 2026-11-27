@@ -24,7 +24,10 @@ class CheckSlotReclaimTest(unittest.TestCase):
     def test_second_reaper_waits_while_the_first_renames(self):
         self.race_reapers(second_before_rename=True)
 
-    def race_reapers(self, *, second_before_rename):
+    def test_a_fresh_live_owner_survives_one_failed_pid_probe(self):
+        self.race_reapers(second_before_rename=False, fresh=True)
+
+    def race_reapers(self, *, second_before_rename, fresh=False):
         functions = re.search(
             r"^CHECK_SLOTS=.*?^release_check_slot\(\) \{\n.*?^\}\n",
             (ROOT / "lanes/run_lane.sh").read_text(),
@@ -34,7 +37,15 @@ class CheckSlotReclaimTest(unittest.TestCase):
             r"""
 LOG="$CASE/log"
 kill() {
-  if [ "$2" = "$STALE_PID" ] && [ ! -e "$CASE/saw-$LANE" ]; then
+  if [ "$FRESH" = 1 ] && [ "$LANE" = second ]; then
+    if [ ! -e "$CASE/false-dead" ]; then
+      # Verify the owner is alive before simulating one failed observation.
+      builtin kill "$@" || return 1
+      touch "$CASE/false-dead"
+      return 1
+    fi
+    touch "$CASE/rechecked"
+  elif [ "$2" = "$STALE_PID" ] && [ ! -e "$CASE/saw-$LANE" ]; then
     touch "$CASE/saw-$LANE"
     while [ ! -e "$CASE/go-$LANE" ]; do sleep 0.01; done
   fi
@@ -65,17 +76,21 @@ fi
             case = Path(directory)
             home = case / "home"
             slot = home / "run/check-slots/slot-1"
-            slot.mkdir(parents=True)
-            with subprocess.Popen(["true"]) as exited:
-                exited.wait(timeout=5)
-            (slot / "pid").write_text(f"{exited.pid}\n")
+            stale_pid = ""
+            if not fresh:
+                slot.mkdir(parents=True)
+                with subprocess.Popen(["true"]) as exited:
+                    exited.wait(timeout=5)
+                stale_pid = str(exited.pid)
+                (slot / "pid").write_text(f"{stale_pid}\n")
             env = {
                 "PATH": "/usr/bin:/bin",
                 "LOOM_ROOT": str(ROOT),
                 "LOOM_HOME": str(home),
                 "LOOM_CHECK_SLOTS": "1",
                 "CASE": directory,
-                "STALE_PID": str(exited.pid),
+                "STALE_PID": stale_pid,
+                "FRESH": str(int(fresh)),
                 "PAUSE_RENAME": str(int(second_before_rename)),
             }
             processes = {}
@@ -85,14 +100,21 @@ fi
                         ["bash", "-c", script],
                         env=dict(env, LANE=lane),
                     )
-                    self.wait_for(case / f"saw-{lane}")
-                (case / "go-first").touch()
-                self.wait_for(
-                    case / ("renaming" if second_before_rename else "done-first")
-                )
-                (case / "go-second").touch()
+                    if not fresh:
+                        self.wait_for(case / f"saw-{lane}")
+                    elif lane == "first":
+                        self.wait_for(case / "done-first")
+                if not fresh:
+                    (case / "go-first").touch()
+                    self.wait_for(
+                        case / ("renaming" if second_before_rename else "done-first")
+                    )
+                    (case / "go-second").touch()
                 self.wait_for(case / "done-second")
                 self.assertEqual((case / "result-second").read_text(), "busy\n")
+                if fresh:
+                    self.assertTrue((case / "false-dead").exists())
+                    self.assertTrue((case / "rechecked").exists())
                 (case / "rename").touch()
                 self.wait_for(case / "done-first")
                 self.assertEqual((case / "result-first").read_text(), "took\n")
