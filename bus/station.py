@@ -60,6 +60,7 @@ from . import fixrounds
 from . import logrotate
 from . import flake
 from . import rebuttal
+from . import readiness
 from . import lane_state, remote_checks, runners
 from . import station_beat
 from . import scope_fit
@@ -7219,7 +7220,8 @@ class Station:
                      self.adopt_untracked_pulls, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
                      self.close_done_tickets, self.audit_closes, self.settle_orphan_sources,
-                     self.settle_claimed_tickets, self.release_stale_claims,
+                     self.settle_claimed_tickets, self.refresh_ticket_readiness,
+                     self.release_stale_claims,
                      self.referee_claims,
                      self.withdraw_held_pr_waits, self.clean_labels,
                      self.queue_stateless_tickets, self.intake_ready_for_agent,
@@ -14248,6 +14250,141 @@ class Station:
                 return
             page += 1
 
+    def refresh_ticket_readiness(self) -> None:
+        """Refresh an hourly batch per repo, resuming from the last ticket read."""
+        path = os.path.join(self.state, readiness.STATE_FILE)
+        saved = _read_json(path, {}, strict=False)
+        saved = saved if isinstance(saved, dict) else {}
+        repos = self._verify_repos()
+        rows = {repo: saved.get(repo) if isinstance(saved.get(repo), dict) else {}
+                for repo in repos}
+        ordered = sorted(repos, key=lambda repo: self._readiness_stamp(rows[repo]))
+        for repo in ordered:
+            if self._deferred():
+                break
+            row = rows[repo]
+            if 0 <= self.now - self._readiness_stamp(row) < readiness.EVERY:
+                continue
+            tally = readiness.Tally()
+            mark = self._requests_sent()
+            try:
+                self._refresh_repo_readiness(repo, row, tally)
+            except RateLimited:
+                raise
+            except GitHubError as err:
+                _say("readiness could not read %s: %s" % (repo, err))
+            finally:
+                self._stamp_every(row, mark)
+                _write_json(path, rows)
+                _say("readiness: " + tally.line(repo))
+
+    def _readiness_stamp(self, row: Dict[str, Any]) -> float:
+        stamp = row.get("_at")
+        return stamp if self._num(stamp) else float("-inf")
+
+    def _refresh_repo_readiness(self, repo: str, row: Dict[str, Any],
+                                tally: readiness.Tally) -> None:
+        after = row.get("after", 0)
+        after = after if type(after) is int else 0
+        issues = self._paginate("/repos/%s/issues?labels=loom:ticket&state=open&per_page=100" % repo)
+        due = sorted((issue for issue in issues if isinstance(issue, dict)
+                      and "pull_request" not in issue and type(issue.get("number")) is int
+                      and issue["number"] > after), key=lambda issue: issue["number"])
+        if due:
+            pulls = self.gh.paginate("/repos/%s/pulls?state=open&per_page=100" % repo)
+            opened = [pr for pr in pulls if isinstance(pr, dict) and pr.get("state", "open") == "open"]
+            merged = self._closed_pulls(repo)
+            apps = self._own_apps()
+            for issue in due[:readiness.PER_REPO]:
+                if self._deferred():
+                    return
+                try:
+                    self._refresh_ticket_readiness(repo, issue, opened, merged, apps, tally)
+                except RateLimited:
+                    raise
+                except GitHubError as err:
+                    _say("readiness could not check %s#%d: %s" % (repo, issue["number"], err))
+                row["after"] = issue["number"]
+        if len(due) <= readiness.PER_REPO:
+            row["after"] = 0
+
+    def _refresh_ticket_readiness(self, repo: str, issue: Dict[str, Any],
+                                  opened: Sequence[Dict[str, Any]], merged: Sequence[Dict[str, Any]],
+                                  apps: Set[str], tally: readiness.Tally) -> None:
+        number = issue["number"]
+        timeline = ([] if any(n in readiness.DONE_STATES for n in _label_names(issue))
+                    else self._paginate("/repos/%s/issues/%d/timeline?per_page=100" % (repo, number)))
+        references = self._readiness_references(timeline)
+        updates = [pr.get("updated_at") for pr in opened if _covers_pr(issue, repo, pr)]
+        updates.extend(pr.get("updated_at") for pr in references if pr.get("state") == "open")
+        delivered = self._readiness_merged(repo, issue, timeline, merged, references)
+        verdict = readiness.classify(issue, timeline, updates, self.now,
+                                     self.s.claim_idle_hours * 3600, self.s.authors, delivered, apps)
+        self._apply_readiness(repo, issue, verdict, tally)
+
+    @staticmethod
+    def _readiness_references(timeline: List[Any]) -> List[Dict[str, Any]]:
+        pulls = []
+        for event in timeline:
+            if not isinstance(event, dict) or event.get("event") != "cross-referenced":
+                continue
+            source = event.get("source")
+            pull = source.get("issue") if isinstance(source, dict) else None
+            if isinstance(pull, dict) and isinstance(pull.get("pull_request"), dict):
+                pulls.append(pull)
+        return pulls
+
+    def _readiness_merged(self, repo: str, issue: Dict[str, Any], timeline: List[Any],
+                          merged: Sequence[Dict[str, Any]],
+                          references: Sequence[Dict[str, Any]]) -> bool:
+        linked = [pr for pr in merged if _covers_pr(issue, repo, pr)]
+        known = {pr.get("number") for pr in merged}
+        linked.extend(self._readiness_older_merges(repo, issue, references, known))
+        if not linked:
+            return False
+        branch = self._default_branch(repo)
+        rejected = set(tickets.rejected_pulls(self._status_texts(repo, issue["number"])))
+        return any((pr.get("base") or {}).get("ref", branch) == branch
+                   and not _rejected_pull(pr, repo, rejected)
+                   and not tickets.merged_before_requeue(pr["merged_at"], timeline)
+                   for pr in linked)
+
+    def _readiness_older_merges(self, repo: str, issue: Dict[str, Any],
+                                references: Sequence[Dict[str, Any]],
+                                known: Set[Any]) -> Iterator[Dict[str, Any]]:
+        """Read older linked merges in full because timeline references lack the base."""
+        home = "/repos/" + repo.lower()
+        for pull in references:
+            number = pull.get("number")
+            here = str(pull.get("repository_url") or "").lower().endswith(home)
+            if (type(number) is not int or number in known or not here
+                    or not pull["pull_request"].get("merged_at") or not _covers_pr(issue, repo, pull)):
+                continue
+            known.add(number)
+            pr = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data
+            if isinstance(pr, dict) and pr.get("merged_at") and _covers_pr(issue, repo, pr):
+                yield pr
+
+    def _apply_readiness(self, repo: str, issue: Dict[str, Any], verdict: readiness.Verdict,
+                         tally: readiness.Tally) -> None:
+        number = issue["number"]
+        ready = readiness.marker_change(verdict, issue)
+        done = verdict.kind == readiness.DONE
+        had_done = readiness.DONE_MARKER in _label_names(issue)
+        path = "/repos/%s/issues/%d/labels" % (repo, number)
+        for marker, remove in ((readiness.READY_MARKER, ready == "remove"),
+                               (readiness.DONE_MARKER, had_done and not done)):
+            if remove:
+                self.gh.rest("DELETE", path + "/" + quote(marker, safe=""), ok=(404,))
+        if verdict.kind == readiness.CLEAR_CLAIM:
+            login, label = next(iter(stale_claims.own_claims(issue, self.s.authors).items()))
+            self._drop_own_claim(repo, issue, {login: label})
+            tally.add(repo, verdict)
+        elif ready == "add" or (done and not had_done):
+            marker = readiness.READY_MARKER if ready == "add" else readiness.DONE_MARKER
+            self.gh.rest("POST", path, {"labels": [marker]})
+            tally.add(repo, verdict)
+
     def release_stale_claims(self) -> None:
         """Take back another operator's claims their claimer left alone for
         claim_idle_hours (bus/stale_claims.py): remove the claim label and
@@ -14673,8 +14810,8 @@ class Station:
                 break
             timeline = self._paginate("/repos/%s/issues/%d/timeline?per_page=100" % (repo, number))
             due = {login: label for login, label in stale_claims.own_claims(issue, ours).items()
-                   if stale_claims.lapsed(issue, timeline, pulls.get(number, []), label,
-                                          self.now, idle, apps)}
+                   if readiness.claim_lapsed(issue, timeline, pulls.get(number, []), login,
+                                             label, self.now, idle, apps)}
             if due:
                 self._drop_own_claim(repo, issue, due)
                 lapsed += 1
