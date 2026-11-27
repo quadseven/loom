@@ -16645,6 +16645,37 @@ class PaceTest(Base):
     """loom#3630: each pass the station paces every windowed subscription and
     the lane status shows used, elapsed and verdict per subscription."""
 
+    def test_usage_upload_carries_one_summary_per_subscription(self):
+        # The serialized same-tick observation rounds up to a microsecond.
+        now = 1_800_000_000.000_000_8
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings, now=now)
+        base = {"provider": "codex", "lanes": ["codex"], "source": "lane meter",
+                "resets_at": station.usage._iso(now + 1000),
+                "as_of": station.usage._iso(now), "used_pct": 0}
+        records = [
+            dict(base, window="5-hour", window_minutes=300),
+            dict(base, window="weekly", window_minutes=10080),
+        ]
+        self.write(os.path.join(self.home, "state", "usage", "claude.json"),
+                   json.dumps({"at": now - 601, "available": True}))
+        self.write(os.path.join(self.home, "state", "usage", "claude.alive"), str(now - 5))
+        with mock.patch.dict(os.environ, {"LOOM_PACE_MAX_CLAUDE": "1"}), \
+                mock.patch.object(station.usage, "collect", return_value=records), \
+                mock.patch.object(runner, "_refresh_model_catalogue"), \
+                mock.patch.object(runner, "post_chain"), \
+                mock.patch.object(runner, "upload_usage_limits") as upload:
+            runner._tend_usage()
+        payload = upload.call_args.args[0]
+        summaries = [row["subscription_pace"] for row in payload if "subscription_pace" in row]
+        codex = [row for row in summaries if row["provider"] == "codex"]
+        self.assertEqual(len(codex), 1, payload)
+        self.assertEqual((codex[0]["window"], codex[0]["used_pct"]), ("weekly", 0))
+        (missing,) = [row for row in summaries if row["provider"] == "claude"]
+        self.assertIsNone(missing["used_pct"])
+        self.assertEqual((missing["running"], missing["allowed"]), (1, 1))
+        self.assertEqual(missing["running_until"], station.usage._iso(now - 5 + station.ALIVE_MAX_AGE))
+        self.assertEqual(station.usage.read_snapshot(self.home), records)
+
     def test_a_pass_writes_the_pace_plan_and_the_status_shows_it(self):
         from bus import pace
         now = time.time()
@@ -16667,6 +16698,147 @@ class PaceTest(Base):
         self.assertIn(f"| codex | weekly | 2% | 50% | {reset} | behind | "
                       "1 of 2 (asks for 2) |", body)
 
+    def test_published_subscription_counts_a_beat_after_pass_start_without_a_stale_ask(self):
+        from bus import pace
+
+        now = 1_800_000_000.0
+        self.settings.status_repo = REPO
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings, now=now)
+        reset = station.usage._iso(now + 10080 * 30)
+        records = [{"provider": "claude", "lanes": ["claude"], "window": "weekly",
+                    "window_minutes": 10080, "used_pct": 2, "resets_at": reset,
+                    "observed_at": station.usage._iso(now - 30)}]
+        self.write(os.path.join(self.home, "state", "usage", "claude.json"),
+                   json.dumps({"at": now + 1, "available": True}))
+        station.usage.write(self.home, records)
+        self.write(os.path.join(self.home, "state", "usage", "claude.meter.json"),
+                   json.dumps({"at": now - 30, "windows": [
+                       {"window": "weekly", "window_minutes": 10080, "used_pct": 2,
+                        "resets_at": now + 10080 * 30}]}))
+        plan = pace.plan(self.home, records, queued=1, env={}, now=now)
+        pace.write(self.home, plan)
+        self.assertEqual((plan["providers"]["claude"]["open"], plan["providers"]["claude"]["want"]), (0, 1))
+
+        with mock.patch.object(station, "LANES", ["claude"]), \
+                mock.patch.object(station.time, "time", return_value=now), \
+                mock.patch.object(runner, "_lanes_issue", return_value=1), \
+                mock.patch.object(runner, "_remote_claim_count", return_value=0), \
+                mock.patch.object(runner, "_upsert_lanes_comment", return_value=2) as post:
+            runner.publish_lanes(refresh_pr_counts=False)
+
+        post.assert_called_once()
+        body = post.call_args.args[2]
+        self.assertIn("| claude | serving |", body)
+        self.assertIn(f"| claude | weekly | 2% | 50% | {reset} | behind | 1 of 1 |", body)
+        self.assertEqual(pace.read(self.home), plan)
+
+    def test_subscription_status_counts_running_evidence_independently_of_availability(self):
+        now = 1_800_000_000.0
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings, now=now)
+        usage_dir = Path(self.home) / "state" / "usage"
+        heart = usage_dir / "claude.json"
+        alive = usage_dir / "claude.alive"
+        held = {"at": now - 5, "available": False, "reason": "held: fixture"}
+        limited = dict(held, reason="limit: fixture", retry_at=now + 300)
+        old_limit = dict(limited, at=now - 601)
+        cases = (
+            ("held runner", held, None, False, 1),
+            ("limited runner", limited, None, False, 1),
+            ("old limit with live runner", old_limit, str(now - 5), False, 1),
+            ("old limit with no runner evidence", old_limit, None, False, 0),
+            ("startup stamp without heartbeat", None, str(now - 5), False, 1),
+            ("expired runner stamp", None, str(now - 301), False, 0),
+            ("out-of-range runner stamp", None, str(now + 61), False, 0),
+            ("nonfinite runner stamp", None, "NaN", False, 0),
+            ("heartbeat without availability", {"at": now - 5}, None, False, 0),
+            ("known missing job", held, str(now - 5), True, 0),
+        )
+        with mock.patch.dict(os.environ, {"LOOM_PACE_MAX_CLAUDE": "1"}), \
+                mock.patch.object(station.time, "time", return_value=now):
+            for label, beat, stamp, absent, expected in cases:
+                with self.subTest(label=label):
+                    heart.unlink(missing_ok=True)
+                    alive.unlink(missing_ok=True)
+                    if beat is not None:
+                        heart.write_text(json.dumps(beat))
+                    if stamp is not None:
+                        alive.write_text(stamp)
+                    runner._missing_lane_jobs = {"claude"} if absent else set()
+                    body = runner._lanes_body([])
+                    self.assertIn(f"| claude | - | no reading | - | - | - | {expected} of 1 |", body)
+                    self.assertFalse((usage_dir / "claude.last-limit.json").exists())
+
+    def test_two_claude_subscriptions_keep_separate_meters_in_status_and_upload(self):
+        now = 1_800_000_000.0
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings, now=now)
+        state = Path(self.home) / "state" / "usage"
+        primary, second = [state / (slot + ".meter.json") for slot in ("claude", "claude-2")]
+        reset = now + 10080 * 30
+
+        def meter(file, used, observed, window="weekly", source="test meter"):
+            file.write_text(json.dumps({"at": observed, "source": source, "windows": [
+                {"window": window, "window_minutes": 10080,
+                 "used_pct": used, "resets_at": reset}]}))
+
+        meter(primary, 3, now - 100)
+        meter(second, 97, now - 60)
+        body = runner._lanes_body([])
+        self.assertIn("| claude | weekly | 3% |", body)
+        self.assertIn("| claude-2 | weekly | 97% |", body)
+        primary.write_text(json.dumps({"at": float("nan")}))
+        body = runner._lanes_body([])
+        self.assertIn("| claude | - | no reading |", body)
+        self.assertIn("| claude-2 | weekly | 97% |", body)
+        meter(primary, 3, now - 100)
+
+        from dashboard import usage as usage_page
+
+        cases = ((97, "weekly", "test meter", 97), (True, "weekly", "test meter", None),
+                 (97, "x" * 201, "test meter", None), (97, "weekly", "x" * 201, 97))
+        for used, window, source, expected in cases:
+            with self.subTest(second_meter=(used, len(window), len(source))):
+                meter(second, used, now - 120 if len(window) > 200 or len(source) > 200 else now - 60,
+                      window, source)
+                with mock.patch.dict(os.environ, {"LOOM_PACE_MAX_CLAUDE": "2"}), \
+                        mock.patch.object(station.labels, "LANES", ["claude", "claude-2"]), \
+                        mock.patch.object(runner, "_refresh_model_catalogue"), \
+                        mock.patch.object(runner, "post_chain"), \
+                        mock.patch.object(runner, "upload_usage_limits") as upload:
+                    runner._tend_usage()
+                store = usage_page.Store()
+                store.upload(upload.call_args.args[0])
+                rows = store.snapshot()["readings"]
+                self.assertEqual({row["provider"]: row["used_pct"] for row in rows},
+                                 {"claude": 3, "claude-2": expected})
+                self.assertEqual({row["provider"]: row["lanes"] for row in rows},
+                                 {"claude": ["claude"], "claude-2": ["claude-2"]})
+                summaries = {row["provider"]: row["subscription_pace"] for row in rows}
+                self.assertEqual([summaries[slot]["allowed"] for slot in ("claude", "claude-2")],
+                                 [1, 1])
+                self.assertEqual(summaries["claude-2"]["used_pct"], expected)
+                local_rows = station.usage.read_snapshot(self.home)
+                self.assertEqual({row["provider"] for row in local_rows}, {"claude"})
+                self.assertEqual(local_rows[0]["lanes"], ["claude", "claude-2"])
+
+    def test_usage_upload_remembers_the_limit_of_an_account_without_a_meter(self):
+        now = 1_800_000_000.0
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings, now=now)
+        state = Path(self.home) / "state" / "usage"
+        (state / "claude.meter.json").write_text(json.dumps({"at": now, "windows": [
+            {"window": "weekly", "window_minutes": 10080, "used_pct": 3,
+             "resets_at": now + 10080 * 30}]}))
+        second = state / "claude-2.json"
+        second.write_text(json.dumps({"at": now, "available": False, "reason": "limit: account cap"}))
+        with mock.patch.object(station.labels, "LANES", ["claude", "claude-2"]), \
+                mock.patch.object(runner, "_refresh_model_catalogue"), \
+                mock.patch.object(runner, "post_chain"), \
+                mock.patch.object(runner, "upload_usage_limits") as upload:
+            runner._tend_usage()
+            second.write_text(json.dumps({"at": now, "available": True}))
+            runner._tend_usage()
+        rows = [row for row in upload.call_args.args[0] if row["provider"] == "claude-2"]
+        self.assertEqual([row["note"] for row in rows], ["last limit: account cap"])
+
     def test_subscription_status_preserves_zero_and_refuses_old_windows(self):
         runner = station.Station(GitHub("token", transport=self.fake), self.settings)
         now = runner.now
@@ -16680,10 +16852,16 @@ class PaceTest(Base):
         reset = now + 50 * 60
         station.usage.write(self.home, [
             row("codex", "weekly", 100, 0, reset),
-            row("claude", "weekly", 10080, 23, reset, age=7201),
-            row("claude", "five-hour", 300, 30, reset),
             row("agy", "weekly", 10080, 8, now - 1),
         ])
+        windows = [
+            {"window": "weekly", "window_minutes": 10080, "used_pct": 23,
+             "resets_at": reset, "at": now - 7201},
+            {"window": "five-hour", "window_minutes": 300, "used_pct": 30,
+             "resets_at": reset, "at": now - 10},
+        ]
+        self.write(os.path.join(self.home, "state", "usage", "claude.meter.json"),
+                   json.dumps({"at": now - 10, "windows": windows}))
         body = runner._lanes_body([])
         self.assertIn(f"| codex | weekly | 0% | 50% | {station.usage._iso(reset)} | behind |", body)
         self.assertIn("| claude | weekly | no reading |", body)

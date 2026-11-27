@@ -3387,21 +3387,26 @@ class Station:
         # on and opened the run's pull request (loom#2094).
         return self._agent_group_alive(lock) is not None
 
-    def _keepalive_age(self, lane: str) -> Optional[float]:
-        """Seconds since lane's runner last stamped state/usage/<lane>.alive
-        (a unix time, written every minute while the runner lives); None when
-        there is no readable stamp. A runner writes its heartbeat only between
-        runs, so a lane deep in a run is told alive by this stamp (loom#1281)."""
+    def _keepalive_stamp(self, lane: str) -> Optional[float]:
+        """Read the runner's process keepalive timestamp, if present."""
         if lane not in LANES:
             return None
         path = os.path.join(self.s.home, "state", "usage", lane + ".alive")
         try:
             with open(path) as fh:
-                at = float(fh.read().strip())
+                return float(fh.read().strip())
         except (OSError, ValueError):
             return None
-        if at - max(self.now, time.time()) > 60:
-            return None  # from the future: not a stamp this runner wrote
+
+    def _keepalive_age(self, lane: str) -> Optional[float]:
+        """Seconds since the runner last stamped its keepalive, or None when unknown.
+
+        Runners write their heartbeats between runs, so the keepalive is their
+        liveness signal during a run (loom#1281).
+        """
+        at = self._keepalive_stamp(lane)
+        if at is None or at - max(self.now, time.time()) > 60:
+            return None
         return max(0.0, self.now - at)
 
     def _keepalive_fresh(self, lane: str) -> bool:
@@ -3595,6 +3600,21 @@ class Station:
     def _local_beat(self, lane: str) -> Any:
         return _read_json(os.path.join(self.s.home, "state", "usage", lane + ".json"),
                           None, strict=False)
+
+    def _usage_slot_running_until(self, slot: str) -> Optional[float]:
+        """Expiry of the freshest evidence that a runner is running or held."""
+        if slot not in LANES or slot in self._missing_lane_jobs:
+            return None
+        expiries = []
+        beat = self._local_beat(slot)
+        if isinstance(beat, dict) and isinstance(beat.get("available"), bool):
+            at = lane_state.epoch(beat.get("at"))
+            if at is not None and beat_fresh(at, self.now):
+                expiries.append(at + HEARTBEAT_MAX_AGE)
+        at = lane_state.epoch(self._keepalive_stamp(slot))
+        if at is not None and beat_fresh(at, self.now, ALIVE_MAX_AGE):
+            expiries.append(at + ALIVE_MAX_AGE)
+        return max(expiries, default=None)
 
     def _refresh_lane_jobs(self) -> None:
         """Only the launchd station has an authoritative list of local jobs."""
@@ -11510,7 +11530,8 @@ class Station:
         disk = [line for line in (self._disk_status_line(), self._watchdog_notice()) if line]
         probes = signin.by_slot(signin.read(self.s.home))
         if subscriptions is None:
-            subscriptions = subscription_view.read(self.s.home, self.now, os.environ)
+            subscriptions = subscription_view.read(
+                self.s.home, self.now, os.environ, slot_running_until=self._usage_slot_running_until)
         body = "\n".join(
             [LANES_MARKER, "Updated " + self._utc(self.now),
              station_beat.stamp_line(station_beat.station_settings(os.environ)[0]), ""]
@@ -11624,7 +11645,8 @@ class Station:
         # Claims paused or resumed for disk republishes (loom#1808).
         values["disk"] = "paused" if self._disk_status_line() else "ok"
         values["disk watchdog"] = self._watchdog_notice() or ""
-        subscriptions = subscription_view.read(self.s.home, self.now, os.environ)
+        subscriptions = subscription_view.read(
+            self.s.home, self.now, os.environ, slot_running_until=self._usage_slot_running_until)
         values["pace"] = subscription_view.signature(subscriptions)
         if refresh_pr_counts:
             read_lines, read_at = self._repo_pr_lines(), self.now
@@ -19623,7 +19645,10 @@ class Station:
         try:
             records = usage.collect(self.s.home, now=self.now)
             usage.write(self.s.home, records)
-            self.upload_usage_limits(records)
+            published = subscription_view.dashboard_records(self.s.home, records, self.now, persist=True)
+            subscriptions = subscription_view.read(
+                self.s.home, self.now, os.environ, published, slot_running_until=self._usage_slot_running_until)
+            self.upload_usage_limits(subscription_view.for_upload(published, subscriptions, self.now))
             waits = _read_json(os.path.join(self.state, "ticket-waits.json"), {}, strict=False)
             pace.write(self.s.home, pace.plan(self.s.home, records, pace.queued(waits),
                                               os.environ, self.now))
