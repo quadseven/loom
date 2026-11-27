@@ -6195,7 +6195,9 @@ class ClaimTest(Base):
         self.assertIn("loom:running", self.fake.names(12))
         self.assertEqual(self.listing(), ["example-owner.example-repo-12.md"])
 
-    def test_revision_with_a_buildable_deliverable_releases_the_hold(self):
+    def test_revision_adding_a_code_criterion_releases_the_hold(self):
+        # The briefing turns an all-live ticket into a fix plus a regression
+        # test; the test box is the code criterion that lifts the hold.
         self.settings.factory_on = True
         self.fake.add(12, body=self.LIVE_ONLY, state="queued")
         self.fake.issues[12]["labels"].pop()

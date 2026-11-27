@@ -252,7 +252,10 @@ def criteria_verdict(body: str) -> Optional[Verdict]:
 
 
 def live_only_hold(body: str) -> str:
-    """Why an all-live build brief waits for a buildable deliverable, or empty."""
+    """Why a build brief whose acceptance criteria are all live waits in the
+    queue, or empty. The hold lifts once the brief gains a criterion a lane
+    can meet in code (the fix's regression test that the briefing adds,
+    docs/BRIEF_FORMAT.md), or when the brief is an answer brief."""
     body = brief_text(body)
     live = criteria_gate.live_criteria(body)
     if not live or len(live) != len(tickets._criteria_texts(body)):
