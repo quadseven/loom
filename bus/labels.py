@@ -23,13 +23,15 @@ LANES = ["codex", "claude", "openrouter", "opencode-go", "anthropic", "zen",
          "zai", "workersai", "agy", "spark", "copilot", "tinker"]
 # Extra slots: parallel copies of a lane on the same provider (run_lane.sh
 # maps a slot to its lane). anthropic has credits that expire, so it gets the
-# most; claude has none, because it spends the operator's own subscription.
+# most. claude spends a subscription, so it gets one slot per subscription:
+# claude-2 is a second account with its own sign-in file and its own meter
+# (LOOM_CLAUDE_AUTH_FILE in its own lane container, state/usage/claude-2.meter.json).
 # opencode-go-3 runs its own model (LOOM_OPENCODE_GO_3_MODEL), a separate
 # allowance on the same subscription; opencode-go-4 runs Muse Spark
 # Contributor (LOOM_OPENCODE_GO_4_MODEL), which trains on prompts, so it
 # takes public repos only.
 SLOTS = ["anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5", "anthropic-6",
-         "anthropic-7", "anthropic-8", "codex-2",
+         "anthropic-7", "anthropic-8", "claude-2", "codex-2",
          # Six more codex slots, all on gpt-6-luna, so the Codex allowance is
          # used rather than left to reset (operator, 2026-10-25).
          "codex-3", "codex-4", "codex-5", "codex-6", "codex-7", "codex-8",
