@@ -5640,6 +5640,7 @@ class Factory:
             self._waiting(repo, issue["number"], CAP_WAIT)
             return "waits: " + CAP_WAIT
         held = (self._brief_wait(repo, issue) or self._no_criteria(repo, issue)
+                or self._live_only_wait(repo, issue)
                 or self._no_split(repo, issue)
                 or self._no_area(repo, issue) or self._superseded_or_blocked(repo, issue))
         if held:
@@ -5687,6 +5688,31 @@ class Factory:
             _say("held queued %s#%d for the brain: no acceptance criteria" % (repo, number))
         reason = "has no acceptance criteria"
         self._waiting(repo, number, reason)
+        return reason
+
+    def _live_only_wait(self, repo: str, issue: Dict[str, Any]) -> str:
+        """Keep a live-only brief in the queue and record its hold once."""
+        reason = brief_check.live_only_hold(str(issue.get("body") or ""))
+        if not reason:
+            return ""
+        number = int(issue["number"])
+        self._waiting(repo, number, reason)
+        note = ("Held in the queue: %s. A lane can take it when the brief "
+                "names a buildable deliverable." % reason)
+        try:
+            if _lane(issue):
+                self._relabel(repo, issue, [name for name in _labels(issue)
+                                            if not name.startswith("lane:")])
+            allowed = status.logins(self.gh, self.trusted)
+            comments = status.expand(
+                self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)), allowed)
+            if not any(isinstance(c, dict) and c.get(status.EXPANDED) and c.get("body") == note
+                       and tickets._login(c.get("user")) in allowed for c in comments):
+                self._status_note(repo, number, note)
+        except (RateLimited, ShadowHeld):
+            raise
+        except GitHubError as err:
+            _say("could not record the live-only hold on %s#%d: %s" % (repo, number, err))
         return reason
 
     def _no_split(self, repo: str, issue: Dict[str, Any]) -> str:

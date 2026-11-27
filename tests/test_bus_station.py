@@ -5529,6 +5529,11 @@ class TrustTest(unittest.TestCase):
 
 
 class ClaimTest(Base):
+    LIVE_ONLY = ("Difficulty: medium\n\n## Acceptance criteria\n"
+                 "- [ ] Live: The deployed service reports the new total.\n"
+                 "- [x] Confirm the total appears in the production log.\n")
+    TOTAL_TEST = "- [ ] `tests/test_totals.py` covers the new total.\n"
+
     def setUp(self):
         super().setUp()
         self.fake.default_body = BODY_WITH_CRITERIA
@@ -6183,6 +6188,59 @@ class ClaimTest(Base):
         self.assertEqual(self.listing(), ["example-owner.example-repo-12.md"])
         self.assertIn("loom:briefed", self.fake.names(13))
         self.assertIn("lane:spark", self.fake.names(13))
+
+    def test_a_queued_live_only_ticket_stays_unassigned_with_one_status_event(self):
+        self.settings.factory_on = True
+        for number, in_body in ((12, False), (13, True)):
+            with self.subTest(status_in_body=in_body):
+                self.fake.add(number, body=self.LIVE_ONLY, state="queued")
+                if not in_body:
+                    self.fake.issues[number]["labels"].pop()
+                for _ in range(2):
+                    gh = GitHub("token", transport=self.fake)
+                    gh.status_in_body = in_body
+                    station.Station(gh, self.settings).assign_queued()
+                    self.assertEqual(self.fake.names(number), ["loom:ticket", "loom:queued"])
+                comments = self.fake.comments[number]
+                if in_body:
+                    self.assertEqual(comments, [])
+                    events = status.body_events(self.fake.issues[number]["body"])
+                else:
+                    (comment,) = comments
+                    self.assertTrue(status.is_status(comment["body"]))
+                    events = status.parse(comment["body"])
+                ((_, note),) = events
+                self.assertIn("all acceptance criteria require live evidence", note)
+                self.assertIn("buildable deliverable", note)
+
+    def test_queued_work_with_a_code_criterion_is_claimed(self):
+        self.settings.factory_on = True
+        self.fake.add(12, body=self.LIVE_ONLY + self.TOTAL_TEST, state="queued")
+        self.fake.issues[12]["labels"].pop()
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.assign_queued()
+        st.claim_new()
+        self.assertIn("loom:running", self.fake.names(12))
+        self.assertEqual(self.listing(), ["example-owner.example-repo-12.md"])
+
+    def test_revision_adding_a_code_criterion_releases_the_hold(self):
+        # The briefing turns an all-live ticket into a fix plus a regression
+        # test; the test box is the code criterion that lifts the hold.
+        self.settings.factory_on = True
+        self.fake.add(12, body=self.LIVE_ONLY, state="queued")
+        self.fake.issues[12]["labels"].pop()
+        gh = GitHub("token", transport=self.fake)
+        gh.status_in_body = True
+        station.Station(gh, self.settings).assign_queued()
+        self.assertIn("loom:queued", self.fake.names(12))
+        revised = (self.LIVE_ONLY + self.TOTAL_TEST + "\n## What\n"
+                   "Update the total calculation and add a regression test.\n")
+        gh.rest("PATCH", "/repos/%s/issues/12" % REPO, {"body": revised})
+        st = station.Station(gh, self.settings)
+        st.assign_queued()
+        st.claim_new()
+        self.assertIn("loom:running", self.fake.names(12))
+        self.assertIn("Update the total calculation", Path(self.inbox("codex", self.listing()[0])).read_text())
 
     def test_a_beat_stamped_ahead_of_the_wall_clock_is_not_fresh(self):
         self.heartbeat("spark", age=-120)
