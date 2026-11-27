@@ -759,6 +759,35 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertEqual(brain._waiting_brain_lines([plain], pr_of, {"prs": {}}, now, "bot"),
                          ["### Waiting on the brain", "- none"])
 
+    def test_waiting_brain_blocks_a_non_loom_head_from_an_untrusted_author(self):
+        now = datetime(2030, 1, 1, 5, 0, 0, tzinfo=timezone.utc)
+        ticket = {"number": 7, "title": "Worker", "created_at": "2020-01-01T00:00:00Z",
+                  "labels": [{"name": "loom:ticket"}, {"name": "needs-brain"}]}
+        pr = {"number": 5, "title": "Wall chat", "created_at": "2030-01-01T00:00:00Z",
+              "head": {"ref": "worker/7-classhunt-no-issue-refs"},
+              "body": "Refs #7\n",
+              "user": {"login": "app/agent-anthropic-claude-code"}}
+        pr_of = {7: pr}
+        data = {"prs": {5: ready_node()}}
+        lines = brain._waiting_brain_lines([ticket], pr_of, data, now, "bot", REPO, authors=())
+        self.assertEqual(lines[0], "### Waiting on the brain")
+        self.assertIn("blocked: pull request head is not a loom branch", lines[1])
+        self.assertNotIn("READY", lines[1])
+
+    def test_waiting_brain_ready_for_a_loom_head(self):
+        now = datetime(2030, 1, 1, 5, 0, 0, tzinfo=timezone.utc)
+        ticket = {"number": 7, "title": "Worker", "created_at": "2020-01-01T00:00:00Z",
+                  "labels": [{"name": "loom:ticket"}, {"name": "needs-brain"}]}
+        pr = {"number": 5, "title": "Wall chat", "created_at": "2030-01-01T00:00:00Z",
+              "head": {"ref": "loom/7-work"},
+              "body": "Refs #7\n",
+              "user": {"login": "app/agent-anthropic-claude-code"}}
+        pr_of = {7: pr}
+        data = {"prs": {5: ready_node()}}
+        lines = brain._waiting_brain_lines([ticket], pr_of, data, now, "bot", REPO, authors=())
+        self.assertEqual(lines[0], "### Waiting on the brain")
+        self.assertIn("READY", lines[1])
+
     def test_sensitive_pr_lines_helper(self):
         sensitive_pr = {"number": 4, "title": "Sensitive", "labels": [{"name": "class:sensitive"}]}
         ordinary_pr = {"number": 5, "title": "Ordinary", "labels": []}
@@ -4945,6 +4974,26 @@ class PastLastRungTests(unittest.TestCase):
         lines = [l for l in section.splitlines() if l.strip()]
         self.assertEqual(lines[0], "- #9 Past - PR #4 - mergeable mergeable - 0 unresolved threads")
         self.assertNotIn("no open pull request", section)
+
+    def test_status_lists_pull_requests_held_open_by_a_claim(self):
+        claimed = stuck_ticket("failed")
+        claimed["labels"].append({"name": "claim:example-maintainer"})
+        routes = {
+            ("GET", "/repos/%s/issues" % REPO): reply(200, [claimed]),
+            ("GET", "/repos/%s/pulls" % REPO): reply(200, [
+                {"number": 4, "title": "PR", "head": {"ref": "loom/9-work"}},
+                {"number": 5, "title": "PR2", "head": {"ref": "loom/9-second"}},
+            ]),
+            ("POST", "/graphql"): reply(200, {"data": {"repository": {
+                "p4": ready_node(threads=[]), "p5": ready_node(threads=[]),
+            }}}),
+        }
+        routes.update(lanes_routes(()))
+        report = brain.status(GitHub("t", transport=Routed(routes)), [REPO], REPO,
+                              env={"LOOM_BRIEF_AUTHORS": "example-brain"})
+        self.assertIn("### Claimed ticket pull requests\n"
+                      "- PR #4 - ticket #9 - claimed by example-maintainer\n"
+                      "- PR #5 - ticket #9 - claimed by example-maintainer", report)
 
     def test_status_lists_a_ticket_past_rung_3_with_its_answered_high_thread(self):
         answered = {"isResolved": False, "comments": {"nodes": [

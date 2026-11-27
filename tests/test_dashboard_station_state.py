@@ -92,6 +92,7 @@ class TwoReplicasTest(SharedBase):
             "provider": "example-subscription", "window": "weekly", "used_pct": 0,
             "elapsed_pct": 14.3, "resets_at": reset.isoformat(),
             "observed_at": now.isoformat(), "verdict": "behind", "running": 2, "allowed": 5,
+            "running_until": (now + timedelta(minutes=5)).isoformat(),
         }
         row = dict(READING, provider="example-subscription", lanes=["example-slot"],
                    as_of=now.isoformat(), resets_at=reset.isoformat(), used_pct=0,

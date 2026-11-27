@@ -3388,21 +3388,26 @@ class Station:
         # on and opened the run's pull request (loom#2094).
         return self._agent_group_alive(lock) is not None
 
-    def _keepalive_age(self, lane: str) -> Optional[float]:
-        """Seconds since lane's runner last stamped state/usage/<lane>.alive
-        (a unix time, written every minute while the runner lives); None when
-        there is no readable stamp. A runner writes its heartbeat only between
-        runs, so a lane deep in a run is told alive by this stamp (loom#1281)."""
+    def _keepalive_stamp(self, lane: str) -> Optional[float]:
+        """Read the runner's process keepalive timestamp, if present."""
         if lane not in LANES:
             return None
         path = os.path.join(self.s.home, "state", "usage", lane + ".alive")
         try:
             with open(path) as fh:
-                at = float(fh.read().strip())
+                return float(fh.read().strip())
         except (OSError, ValueError):
             return None
-        if at - max(self.now, time.time()) > 60:
-            return None  # from the future: not a stamp this runner wrote
+
+    def _keepalive_age(self, lane: str) -> Optional[float]:
+        """Seconds since the runner last stamped its keepalive, or None when unknown.
+
+        Runners write their heartbeats between runs, so the keepalive is their
+        liveness signal during a run (loom#1281).
+        """
+        at = self._keepalive_stamp(lane)
+        if at is None or at - max(self.now, time.time()) > 60:
+            return None
         return max(0.0, self.now - at)
 
     def _keepalive_fresh(self, lane: str) -> bool:
@@ -3514,8 +3519,10 @@ class Station:
                           for issue in open_issues)
             if pending:
                 continue
-            brain.brief_intake(self.gh, repo, int(goal["number"]), title, body,
-                               difficulty="medium")
+            # Loom's own template, not a ticket filed by hand: the claim-time
+            # test hold passes it over (brief_check.hand_filed_verdict).
+            brain.brief_intake(self.gh, repo, int(goal["number"]), title,
+                               brief_check.with_test_marker(body), difficulty="medium")
 
     def _still_ours(self, issue: Dict[str, Any], lane: str) -> bool:
         names = _label_names(issue)
@@ -3594,6 +3601,21 @@ class Station:
     def _local_beat(self, lane: str) -> Any:
         return _read_json(os.path.join(self.s.home, "state", "usage", lane + ".json"),
                           None, strict=False)
+
+    def _usage_slot_running_until(self, slot: str) -> Optional[float]:
+        """Expiry of the freshest evidence that a runner is running or held."""
+        if slot not in LANES or slot in self._missing_lane_jobs:
+            return None
+        expiries = []
+        beat = self._local_beat(slot)
+        if isinstance(beat, dict) and isinstance(beat.get("available"), bool):
+            at = lane_state.epoch(beat.get("at"))
+            if at is not None and beat_fresh(at, self.now):
+                expiries.append(at + HEARTBEAT_MAX_AGE)
+        at = lane_state.epoch(self._keepalive_stamp(slot))
+        if at is not None and beat_fresh(at, self.now, ALIVE_MAX_AGE):
+            expiries.append(at + ALIVE_MAX_AGE)
+        return max(expiries, default=None)
 
     def _refresh_lane_jobs(self) -> None:
         """Only the launchd station has an authoritative list of local jobs."""
@@ -6567,7 +6589,8 @@ class Station:
                 self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
                              {"labels": ["needs-brain"]})
                 self._routine(repo, number, brief_check.HEALTH_NOTE % (
-                    found.reason, "A lane gets it once its body names each acceptance "
+                    found.reason, brief_check.TEST_HINT if found.key.startswith("test-")
+                    else "A lane gets it once its body names each acceptance "
                     "criterion as a checkbox under `## Acceptance criteria`, stated as "
                     "an observable result: the brief restates each one as the check "
                     "that proves it."))
@@ -6726,7 +6749,7 @@ class Station:
         return None
 
     def _reconcile_pr_ticket(self, repo: str, pr: dict, tickets_by_number: dict,
-                             landed: Sequence[dict] = ()) -> None:
+                             landed: Sequence[dict] = (), *, drop_lane: bool = False) -> None:
         number = self._pr_ticket_number(repo, pr)
         ticket = tickets_by_number.get(number) if number is not None else None
         if ticket is None:
@@ -6763,7 +6786,9 @@ class Station:
         left: List[str] = []
         merged = target == "loom:merged"
         if merged:
-            left = self._unbuilt_criteria(ticket, [pr, *landed])
+            left = self._unbuilt_criteria(
+                ticket, [pr, *landed],
+                allow_unreported=bool({"loom:queued", "loom:briefed"}.intersection(labels)))
             if left:
                 events = self._paginate("/repos/%s/issues/%d/events" % (repo, number))
                 if (tickets.merged_before_requeue(pr.get("merged_at"), events)
@@ -6777,7 +6802,8 @@ class Station:
         states = {"loom:" + state for state in state_names}
         kept = self._drop_claim(
             name for name in labels
-            if name not in states and not (target == "loom:queued" and name.startswith("lane:")))
+            if name not in states
+            and not ((drop_lane or target == "loom:queued") and name.startswith("lane:")))
         # A merged pull request lands the lane's run, so a runaway hold the run
         # caused is cleared even when the ticket is requeued to build criteria
         # the pull request left unbuilt; otherwise a runaway ticket can never
@@ -6804,11 +6830,13 @@ class Station:
                  % (repo, number, int(pr["number"]), len(every)))
 
     @staticmethod
-    def _unbuilt_criteria(ticket: dict, merged: Sequence[dict]) -> List[str]:
+    def _unbuilt_criteria(ticket: dict, merged: Sequence[dict], *,
+                          allow_unreported: bool = False) -> List[str]:
         """The ticket's code criteria that no merged pull request for it ticks
         built: a box marked "not built: <reason>" is still unbuilt (loom#2026)."""
         return factory.unbuilt_criteria(str(ticket.get("body") or ""),
-                                        [str(pr.get("body") or "") for pr in merged])
+                                        [str(pr.get("body") or "") for pr in merged],
+                                        allow_unreported=allow_unreported)
 
     def _reconcile_adoptions(self, repo: str, open_tickets: List[Dict[str, Any]]) -> None:
         """Move each open adoption ticket to loom:merged once the pull
@@ -6874,8 +6902,7 @@ class Station:
             and not TREE_DONE_STATES.intersection(_label_names(i))}
         self._reconcile_adoptions(repo, open_tickets)
         # Only a closed pull request changes a ticket. Those PRs are the most
-        # recently updated closed ones, so one page of them is read, never the
-        # repo's whole PR history. A merged one delivers the ticket even while
+        # recently updated closed ones first. A merged one delivers the ticket even while
         # a second PR for it is still open (a duplicate lane run would
         # otherwise keep taking fix rounds on work already on main). A merge
         # before a regression re-queue cannot deliver its newer attempt. A
@@ -6943,8 +6970,8 @@ class Station:
         waiting = {n: t for n, t in tickets_by_number.items()
                    if not any(_linked_pr(t, repo, p) for p in open_prs)}
         # Fetch ALL closed PRs (paginated). The reconcile window uses only the
-        # first 100 (most recently updated); _clear_pull_gone uses the full
-        # list to find merged PRs beyond the 100-item window.
+        # first 100 (most recently updated) for linked tickets; the full list
+        # also finds older merges for unlinked tickets and vanished pulls.
         all_closed = self._paginate("/repos/%s/pulls?state=closed&sort=updated"
                                     "&direction=desc&per_page=100" % repo)
         closed = all_closed[:100] if isinstance(all_closed, list) else []
@@ -6958,6 +6985,11 @@ class Station:
                 self._reconcile_pr_ticket(repo, pr, pool, landed)
                 if merged:
                     self._deliver_unlinked(repo, pr, unlinked)
+        for pr in all_closed[100:]:
+            if not unlinked:
+                break
+            if isinstance(pr, dict) and self._terminal_label(pr) == "loom:merged":
+                self._deliver_unlinked(repo, pr, unlinked)
         for number, ticket in tickets_by_number.items():
             self._clear_pull_gone(repo, number, ticket, open_prs, all_closed)
 
@@ -7098,24 +7130,32 @@ class Station:
         outside loom/. A branch outside loom/ also takes the lane label off,
         and its note names the merge commit (loom#2938)."""
         number = self._pr_ticket_number(repo, pr)
-        ticket = unlinked.get(number) if number is not None else None
-        was = self._deliverable(repo, pr, ticket) if ticket is not None else None
+        if number not in unlinked:
+            return
+        base = (pr.get("base") or {}).get("ref")
+        if base and base != self._default_branch(repo):
+            return
+        ticket = self._issue(repo, number)
+        if ticket.get("state") != "open" or tickets.ticket_state(ticket) in tickets.MERGED_STATES:
+            del unlinked[number]
+            return
+        was = self._deliverable(repo, pr, ticket)
         if was is None:
             return
-        self._reconcile_pr_ticket(repo, pr, {number: ticket})
+        branch = str((pr.get("head") or {}).get("ref") or "")
+        outside_lane = not branch.startswith("loom/")
+        self._reconcile_pr_ticket(repo, pr, {number: ticket}, drop_lane=outside_lane)
         if "loom:merged" not in _label_names(ticket):
             return
         del unlinked[number]
         note = ("Pull request #%d merged while this ticket was at %s, so it moved to "
                 "loom:merged." % (int(pr["number"]), was))
-        branch = str((pr.get("head") or {}).get("ref") or "")
-        if not branch.startswith("loom/"):
-            self._drop_lane_label(repo, ticket)
+        if outside_lane:
             note += (" It merged from branch %s, outside loom/ (merge commit %s), so the "
                      "ticket no longer holds a lane." % (
                          branch, str(pr.get("merge_commit_sha") or "")[:12] or "unknown"))
-            _say("%s#%d merged from a non-lane branch: pull request #%d"
-                 % (repo, number, int(pr["number"])))
+        _say("%s#%d: merged pull request #%d moved %s ticket to loom:merged"
+             % (repo, number, int(pr["number"]), was))
         self._comment(repo, number, note, notify.MERGED)
 
     def _deliverable(self, repo: str, pr: Dict[str, Any],
@@ -7131,7 +7171,9 @@ class Station:
                 or not _linked_pr(ticket, repo, pr)):
             return None
         labels = _label_names(ticket)
-        was = next((s for s in UNLINKED_STATES if s in labels), "loom:queued")
+        was = next((s for s in UNLINKED_STATES if s in labels), None)
+        if was is None:
+            return None
         if str(head.get("ref") or "").startswith("loom/") and was not in (
                 "loom:queued", "loom:briefed"):
             return None
@@ -7141,17 +7183,6 @@ class Station:
         if tickets.merged_before_requeue(pr.get("merged_at"), events):
             return None
         return was
-
-    def _drop_lane_label(self, repo: str, ticket: Dict[str, Any]) -> None:
-        """Take the lane: labels off a ticket a pull request outside loom/
-        delivered: no lane run holds it, and the label read as lane load."""
-        names = _label_names(ticket)
-        kept = [n for n in names if not n.startswith("lane:")]
-        if kept == names:
-            return
-        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, int(ticket["number"])),
-                     {"labels": kept})
-        ticket["labels"] = [{"name": n} for n in kept]
 
     def _contributor_ticket(self, repo: str, pr: Dict[str, Any],
                             author: str) -> Optional[Dict[str, Any]]:
@@ -7549,8 +7580,11 @@ class Station:
             self._adoption_refused(repo, rec, "no goal home to file adoption tickets on")
             return
         try:
+            # Loom's own template, not a ticket filed by hand: the claim-time
+            # test hold passes it over (brief_check.hand_filed_verdict).
             url = brain.brief_intake(self.gh, repo, goal, self._adoption_title(repo, pr),
-                              adoption_body(number), difficulty="medium")
+                                     brief_check.with_test_marker(adoption_body(number)),
+                                     difficulty="medium")
         except ValueError as err:
             # The goal is at its cap or holds too much unproven work: tried
             # again after ADOPT_RETRY.
@@ -11500,7 +11534,10 @@ class Station:
         if subscriptions is None or allowances is None:
             records = usage.read_snapshot(self.s.home)
             if subscriptions is None:
-                subscriptions = subscription_view.read(self.s.home, self.now, os.environ, records)
+                published = subscription_view.dashboard_records(self.s.home, records, self.now)
+                subscriptions = subscription_view.read(
+                    self.s.home, self.now, os.environ, published,
+                    slot_running_until=self._usage_slot_running_until)
             if allowances is None:
                 allowances = daily_allowance.snapshot(records, self.now, os.environ)
         body = "\n".join(
@@ -11618,7 +11655,10 @@ class Station:
         values["disk"] = "paused" if self._disk_status_line() else "ok"
         values["disk watchdog"] = self._watchdog_notice() or ""
         records = usage.read_snapshot(self.s.home)
-        subscriptions = subscription_view.read(self.s.home, self.now, os.environ, records)
+        published = subscription_view.dashboard_records(self.s.home, records, self.now)
+        subscriptions = subscription_view.read(
+            self.s.home, self.now, os.environ, published,
+            slot_running_until=self._usage_slot_running_until)
         allowances = daily_allowance.snapshot(records, self.now, os.environ)
         values["pace"] = subscription_view.signature(subscriptions)
         values["daily allowances"] = daily_allowance.signature(allowances)
@@ -19619,9 +19659,12 @@ class Station:
         try:
             records = usage.collect(self.s.home, now=self.now)
             usage.write(self.s.home, records)
-            subscriptions = subscription_view.read(self.s.home, self.now, os.environ, records)
+            published = subscription_view.dashboard_records(self.s.home, records, self.now, persist=True)
+            subscriptions = subscription_view.read(
+                self.s.home, self.now, os.environ, published,
+                slot_running_until=self._usage_slot_running_until)
             allowances = daily_allowance.snapshot(records, self.now, os.environ)
-            payload = subscription_view.for_upload(records, subscriptions, self.now)
+            payload = subscription_view.for_upload(published, subscriptions, self.now)
             self.upload_usage_limits(daily_allowance.for_upload(payload, allowances, self.now))
             waits = _read_json(os.path.join(self.state, "ticket-waits.json"), {}, strict=False)
             pace.write(self.s.home, pace.plan(self.s.home, records, pace.queued(waits),

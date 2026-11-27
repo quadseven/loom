@@ -30,7 +30,9 @@ NO_OPUS = ("claude",) + factory.ANTHROPIC
 
 # An acceptance criteria section with one box: a queued ticket without one
 # gets no lane (loom#2249).
-ACCEPTANCE = "\n## Acceptance criteria\n\n- [ ] x\n"
+# The box names a test: a ticket created after brief_check.TEST_RULE_SINCE
+# whose boxes name none gets no lane (#3299).
+ACCEPTANCE = "\n## Acceptance criteria\n\n- [ ] tests/test_x.py passes\n"
 
 
 def lane_models(**models):
@@ -588,6 +590,12 @@ class PullRequests(Base):
         self.assertEqual(self.merged, [(50, (REPO, 5))])
         self.assertEqual(len(self.gh.filed), 1)
         self.assertIn("- [ ] A5", self.gh.filed[0]["body"])
+        # The factory wrote the ticket, no person by hand: created after the
+        # cutoff with no test named, it is still not held (#3299).
+        from bus import brief_check
+        made = dict(self.gh.filed[0], created_at=brief_check.TEST_RULE_SINCE)
+        self.assertIsNotNone(brief_check.test_verdict(made["body"]))
+        self.assertIsNone(brief_check.hand_filed_verdict(made))
 
     def test_moves_are_counted_since_the_last_claim_or_hold(self):
         def note(at, body, who=ME["login"]):
@@ -4054,6 +4062,63 @@ class Tickets(Base):
         self.assertIn({"name": "loom:failed"}, self.gh.issues[7]["labels"])
         self.go()  # once: nothing more on the next pass
         self.assertEqual(len(self.closed), 1)
+
+    def test_a_reopened_past_ladder_pull_request_is_not_closed_again(self):
+        self.gh.ticket(7, "failed")
+        self.gh.comments[7] += ALL_RUNGS + [
+            {"body": factory.GAVE_UP + " (x; ran on none).", "user": ME}]
+        self.gh.pull(70, 7, green=False, resolved=False)
+        self.go()
+        self.assertEqual([number for number, _ in self.closed], [70])
+
+        self.gh.events[70] = [
+            {"event": "reopened", "actor": {"login": "example-maintainer"},
+             "id": 2, "created_at": iso(3600)},
+            {"event": "closed", "actor": ME, "id": 1, "created_at": iso(3600)},
+            None,
+        ]
+        self.gh.pulls[70]["state"] = "open"
+        with mock.patch.object(brain, "writer_login", return_value=ME["login"]):
+            self.go()
+
+        self.assertEqual([number for number, _ in self.closed], [70])
+        self.assertEqual(self.gh.pulls[70]["state"], "open")
+
+    def test_only_a_different_actor_reversing_the_stations_latest_close_is_a_takeover(self):
+        maintainer = {"login": "example-maintainer"}
+        closed = {"event": "closed", "actor": ME, "id": 1, "created_at": iso(3600)}
+        reopened = {"event": "reopened", "actor": maintainer, "id": 2, "created_at": iso(3601)}
+        cases = {
+            "same actor": [closed, dict(reopened, actor=ME)],
+            "other closer": [dict(closed, actor={"login": "example-other"}), reopened],
+            "missing actor": [dict(closed, actor="unavailable"), reopened],
+            "stale reopen": [closed, reopened, dict(closed, id=3, created_at=iso(3602))],
+        }
+        self.gh.comments[70] = [{
+            "body": "Closed by the station: its ticket is past the last rung of the model ladder.",
+            "user": ME,
+        }]
+        f = factory.Factory(self.gh, [REPO], NOW, trusted=[ME["login"]])
+        with mock.patch.object(brain, "writer_login", return_value=ME["login"]):
+            for name, events in cases.items():
+                with self.subTest(name=name):
+                    self.gh.events[70] = events
+                    self.assertFalse(f._past_ladder_pr_reopened(REPO, 70))
+
+    def test_a_claim_keeps_a_failed_tickets_pull_requests_open(self):
+        self.gh.ticket(7, "failed")
+        self.gh.issues[7]["labels"].append({"name": "claim:example-maintainer"})
+        self.gh.comments[7] += ALL_RUNGS + [
+            {"body": factory.GAVE_UP + " (x; ran on none).", "user": ME}]
+        self.gh.pull(70, 7, green=False, resolved=False)
+        self.gh.pull(71, 7, green=False, resolved=False)
+
+        self.go()
+
+        self.assertEqual(self.closed, [])
+        self.assertEqual(self.moved, [])
+        self.assertEqual(self.gh.pulls[70]["state"], "open")
+        self.assertEqual(self.gh.pulls[71]["state"], "open")
 
     def test_a_ticket_rewritten_as_a_newer_ticket_closes_its_lane_pull_request(self):
         self.gh.ticket(7, "pr")

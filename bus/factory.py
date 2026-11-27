@@ -725,6 +725,14 @@ NO_CRITERIA_NOTE = (
     "can prove. Add an `## Acceptance criteria` section with at least one `- [ ]` "
     "checkbox; no lane takes it until then.")
 
+# The one note on a queued ticket filed by hand that names no test
+# (Factory._no_test, brief_check.hand_filed_verdict).
+NO_TEST_NOTE = (
+    "Held for the brain (needs-brain): none of this ticket's acceptance boxes names the "
+    "test that proves it. Add one `- [ ] ` box that names a test file path, a command "
+    "that runs tests in CI or a throwaway environment, or a test that fails without the "
+    "change and passes with it; no lane takes it until then.")
+
 NO_AREA_NOTE = (
     "Held for the brain (needs-brain): this repo files every ticket under an area of "
     "play, and this ticket carries no `area:` label. Add the one `area:` label that "
@@ -1524,11 +1532,15 @@ def unticked_criteria(ticket_body: str, pull_bodies: Sequence[str]) -> List[str]
     return left
 
 
-def unbuilt_criteria(ticket_body: str, pull_bodies: Sequence[str]) -> List[str]:
+def unbuilt_criteria(ticket_body: str, pull_bodies: Sequence[str], *,
+                     allow_unreported: bool = False) -> List[str]:
     """The unticked boxes that send a ticket back for more work: its code
     boxes. A box marked "not built: <reason>" answers a lane's gate but is
     still unbuilt, so a partial merge sends its ticket back (loom#2026). Live
-    and operator boxes are the verify path's, so alone they send nothing back."""
+    and operator boxes are the verify path's, so alone they send nothing back.
+    A pre-claim check can let verification judge a merge with no report."""
+    if allow_unreported and not any(acceptance_criteria(body) for body in pull_bodies):
+        return []
     return [text for text in unticked_criteria(ticket_body, pull_bodies)
             if criteria_gate.kind(NOT_BUILT_RE.sub("", text)) == criteria_gate.CODE]
 
@@ -2736,21 +2748,52 @@ class Factory:
             runs = self._runs[sha] = self._check_runs(repo, sha)
         return not any(r.get("conclusion") in brain.FAILED_CONCLUSIONS for r in (runs or ()))
 
-    def _close_past_ladder_pr(self, repo: str, pr: Dict[str, Any]) -> None:
+    def _past_ladder_pr_reopened(self, repo: str, number: int) -> bool:
+        """A different actor reversing the station's close takes over the pull request."""
+        notes = (str(c.get("body") or "") for c in self._comments(repo, number))
+        if not any(note.startswith("Closed by the station: its ticket ")
+                   and "past the last rung of the model ladder" in note for note in notes):
+            return False
+        events = self.gh.paginate("/repos/%s/issues/%d/events" % (repo, number))
+        lifecycle = sorted(
+            (e for e in events if isinstance(e, dict)
+             and e.get("event") in ("closed", "reopened")),
+            key=lambda e: (_ts(e.get("created_at")), str(e.get("id") or "").zfill(20)),
+        )
+        if len(lifecycle) < 2:
+            return False
+        closed, reopened = lifecycle[-2:]
+        if (closed["event"], reopened["event"]) != ("closed", "reopened"):
+            return False
+        closer, opener = (
+            rest_login(actor).lower() if isinstance(actor, dict) else ""
+            for actor in (closed.get("actor"), reopened.get("actor"))
+        )
+        if not closer or not opener or closer == opener:
+            return False
+        station = brain.writer_login(self.gh).lower()
+        return not station or closer == station
+
+    def _close_past_ladder_pr(self, repo: str, pr: Dict[str, Any],
+                              comment: str = "") -> bool:
         """Close an open lane pull request whose ticket is past the last rung of
         the model ladder, naming why, so the lane does not stall on it
         indefinitely. Leaves it open when its head has green checks and no
-        conflict, for the brain's ruling."""
+        conflict, or a different actor reopened it. Return whether it closed."""
         number = int(pr["number"])
         if self._past_ladder_pr_green(repo, pr):
             _say("%s#%d kept open past the model ladder: its head has green checks" % (repo, number))
-            return
-        comment = ("Closed by the station: its ticket is past the last rung of the "
+            return False
+        if self._past_ladder_pr_reopened(repo, number):
+            _say("%s#%d kept open past the model ladder: another actor reopened it" % (repo, number))
+            return False
+        comment = comment or ("Closed by the station: its ticket is past the last rung of the "
                    "model ladder and is left loom:failed for the brain, which re-briefs "
                    "the work as a new loom:ticket.")
         self.close(self.gh, repo, number, comment)
         self.actions += 1
         _say("closed %s#%d: its ticket is past the model ladder" % (repo, number))
+        return True
 
     def _send_back(self, repo: str, pr: Dict[str, Any], issue: Dict[str, Any],
                    comments: List[Dict[str, Any]], why: str,
@@ -3024,7 +3067,11 @@ class Factory:
                             prs: Sequence[Dict[str, Any]], closed: set) -> None:
         """Close the superseded lane pull requests of one ticket (item names it)."""
         ticket_number = int(item["number"])
-        ticket = ticket_map.get(ticket_number) or self._ticket(repo, ticket_number)
+        # Another operator's claim can exclude the ticket from the trusted map.
+        observed = ticket_map.get(ticket_number) or self._dependency(repo, ticket_number)
+        if observed and observed.get("state") == "open" and person_claim(observed):
+            return
+        ticket = observed if observed and self._trusted_ticket(observed) else None
         if ticket and _state(ticket) in ("merged", "shipped", "verified"):
             merged = self._merged_pull(repo, ticket_number)
             if merged is not None:
@@ -3041,14 +3088,16 @@ class Factory:
                 return
             if ticket.get("state") == "open":
                 return
-        ended =self._ended_note(repo, ticket, ticket_map) if ticket else None
+        ended = self._ended_note(repo, ticket, ticket_map) if ticket else None
         if ended is not None:
             for pr in prs:
                 if self.actions >= MAX_ACTIONS:
                     return
-                if "past the last rung of the model ladder" in ended and self._past_ladder_pr_green(repo, pr):
-                    continue
-                self._close_ended_pr(repo, pr, ended)
+                if "past the last rung of the model ladder" in ended:
+                    if not self._close_past_ladder_pr(repo, pr, ended):
+                        continue
+                else:
+                    self._close_ended_pr(repo, pr, ended)
                 closed.add(int(pr["number"]))
         elif len(prs) > 1:
             newest = max(prs, key=lambda p: (_ts(p.get("created_at")), int(p["number"])))
@@ -4267,7 +4316,11 @@ class Factory:
         body = ("Difficulty: medium\n\n## Why\nThe lane pull request marked these ticket criteria as not built.\n\n"
                 "## What\nComplete the remaining acceptance criteria.\n\n## Acceptance criteria\n" +
                 "\n".join("- [ ] " + item for item in criteria) +
-                "\n\n## Size\nS\n\n## Out of scope\n- None\n\nPart of #%d\n" % epic)
+                # The marker: the factory wrote this ticket from one a lane
+                # already built, no person by hand, so the claim-time test
+                # hold passes it over (brief_check.hand_filed_verdict).
+                "\n\n## Size\nS\n\n## Out of scope\n- None\n\n%s\n\nPart of #%d\n"
+                % (brief_check.TEST_MARKER, epic))
         made = self.gh.rest("POST", "/repos/%s/issues" % repo, {
             "title": title, "body": body, "labels": ["loom:ticket", "loom:queued"]}).data or {}
         if placed:
@@ -5645,7 +5698,7 @@ class Factory:
             self._waiting(repo, issue["number"], CAP_WAIT)
             return "waits: " + CAP_WAIT
         held = (self._brief_wait(repo, issue) or self._no_criteria(repo, issue)
-                or self._live_only_wait(repo, issue)
+                or self._live_only_wait(repo, issue) or self._no_test(repo, issue)
                 or self._no_split(repo, issue)
                 or self._no_area(repo, issue) or self._superseded_or_blocked(repo, issue))
         if held:
@@ -5692,6 +5745,27 @@ class Factory:
             self.actions += 1
             _say("held queued %s#%d for the brain: no acceptance criteria" % (repo, number))
         reason = "has no acceptance criteria"
+        self._waiting(repo, number, reason)
+        return reason
+
+    def _no_test(self, repo: str, issue: Dict[str, Any]) -> str:
+        """Why a queued ticket filed by hand whose boxes name no test gets no
+        lane, or "" (brief_check.hand_filed_verdict, the reading the station's
+        claim and the lane's own check share). Like _no_criteria it gains
+        needs-brain and one note naming the missing box, once. A ticket the
+        brief command or the rewrite filed, and one created before the rule,
+        are never held here."""
+        if brief_check.hand_filed_verdict(issue) is None:
+            return ""
+        number = int(issue["number"])
+        if "needs-brain" not in _labels(issue):
+            self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": ["needs-brain"]})
+            issue["labels"] = list(issue.get("labels") or []) + [{"name": "needs-brain"}]
+            notify.post(self.gh, repo, number, NO_TEST_NOTE, notify.HELD)
+            self.actions += 1
+            _say("held queued %s#%d for the brain: no acceptance box names a test" % (repo, number))
+        reason = "names no test in an acceptance box"
         self._waiting(repo, number, reason)
         return reason
 

@@ -49,7 +49,7 @@ BODY = "Difficulty: hard\nModel: model-x\n\n## Why\nBecause.\n\n## What\nDo it.\
 # passes dispatch their tickets set the fake's default_body to this; tests
 # that want the criteria-free body pass BODY itself.
 BODY_WITH_CRITERIA = (BODY + "\n## Acceptance criteria\n"
-                      "- [ ] A test shows the thing is fixed.\n")
+                      "- [ ] A test fails without the fix and passes with it.\n")
 
 
 def reply(status=200, body=None, headers=None):
@@ -1683,6 +1683,55 @@ class ReconcilePullRequestTest(Base):
                 self.assertIn("Pull request #99 merged while this ticket was at loom:" + state,
                               self.fake.comments[12][-1]["body"])
 
+    def test_a_queued_ticket_with_a_merged_refs_pull_is_not_claimed_after_relabeling(self):
+        self.fake.add(12, state="queued")
+        self.fake.pulls = [self.merged_pr()]
+
+        def transport(method, url, headers, body):
+            if (method == "GET" and url.endswith(CLOSED_PULLS % REPO)
+                    and CLOSED_PULLS % REPO not in self.fake.paths("GET")):
+                self.fake.issues[12]["labels"] = [
+                    {"name": name} for name in
+                    ("loom:ticket", "loom:briefed", "lane:codex", "priority:P1")]
+            return self.fake(method, url, headers, body)
+
+        runner = station.Station(GitHub("token", transport=transport), self.settings)
+        with mock.patch("bus.station._say") as say:
+            runner.reconcile_pull_requests()
+            runner.claim_new()
+
+        names = self.fake.names(12)
+        self.assertIn("loom:merged", names)
+        self.assertIn("priority:P1", names)
+        self.assertFalse({"loom:queued", "loom:briefed", "loom:running"}.intersection(names))
+        self.assertEqual(self.listing(), [])
+        lines = [call.args[0] for call in say.call_args_list if "pull request #99" in call.args[0]]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("loom:merged", lines[0])
+
+    def test_a_queued_ticket_is_reconciled_when_its_merge_is_on_the_second_page(self):
+        self.fake.add(12, state="queued", lane="muse", body=BODY_WITH_CRITERIA)
+        self.fake.pulls = [{"number": n, "state": "closed"} for n in range(100, 200)]
+        self.fake.pulls.append(self.merged_pr())
+        self.run_pass()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertNotIn("loom:queued", self.fake.names(12))
+        self.assertEqual(self.listing(), [])
+
+    def test_reconciliation_preserves_a_ticket_that_shipped_during_the_merge_scan(self):
+        self.fake.add(12, state="queued")
+        self.fake.pulls = [self.merged_pr()]
+
+        def transport(method, url, headers, body):
+            if method == "GET" and url.endswith(CLOSED_PULLS % REPO):
+                self.fake.issues[12]["labels"] = [{"name": "loom:ticket"}, {"name": "loom:shipped"}]
+            return self.fake(method, url, headers, body)
+
+        runner = station.Station(GitHub("token", transport=transport), self.settings)
+        runner.reconcile_pull_requests()
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "loom:shipped"])
+        self.assertNotIn("/repos/%s/issues/12/labels" % REPO, self.fake.paths("PUT"))
+
     def test_a_merged_pull_request_that_may_not_deliver_moves_nothing(self):
         cases = {
             "untrusted author": self.merged_pr(author="stranger"),
@@ -1870,6 +1919,12 @@ class AdoptUntrackedPullRequestTest(Base):
         self.assertEqual(made[0]["labels"], ["loom:ticket", "loom:queued"])
         body = made[0]["body"]
         self.assertTrue(body.startswith("Difficulty: medium\n\n## Why\n"))
+        # Loom's own template, no ticket filed by hand: created after the
+        # cutoff with no test named, it is still not held (#3299).
+        from bus import brief_check
+        self.assertIsNotNone(brief_check.test_verdict(body))
+        self.assertIsNone(brief_check.hand_filed_verdict(
+            {"body": body, "created_at": brief_check.TEST_RULE_SINCE}))
         for section in ("## What", "## Acceptance criteria", "## Size", "## Out of scope",
                         "## Definition of done"):
             self.assertIn(section, body)
@@ -5473,6 +5528,12 @@ class ValidationContractTest(Base):
         self.assertIn(".loom/validation.conf", file_ticket.call_args.args[4])
         # The brief says which commands a lane machine can run (loom#1290).
         self.assertIn("no secrets, simulators or unset variables", file_ticket.call_args.args[4])
+        # Loom's own template, no ticket filed by hand: created after the
+        # cutoff with no test named, it is still not held (#3299).
+        from bus import brief_check
+        made = {"body": file_ticket.call_args.args[4], "created_at": brief_check.TEST_RULE_SINCE}
+        self.assertIsNotNone(brief_check.test_verdict(made["body"]))
+        self.assertIsNone(brief_check.hand_filed_verdict(made))
 
         worker.gh.rest = mock.Mock(return_value=type("Response", (), {"data": [
             {"number": 3, "title": "Add the repository validation contract"}
@@ -5773,14 +5834,15 @@ class ClaimTest(Base):
         text = self.claimed_brief(
             "Difficulty: medium\n\n## Why\nTest\n\n## What\nDo it\n\n"
             "## Acceptance criteria\n- [ ] A test: the report reads each run row "
-            "from the runs table.\n")
+            "from the runs table.\n- [ ] tests/test_report.py passes.\n")
         self.assertIn(tickets.FIXTURE_NOTE, text)
         self.assertNotIn("Fixture-Source", text)
 
     def test_a_brief_for_a_ticket_that_reads_no_rows_has_no_fixture_line(self):
         text = self.claimed_brief(
             "Difficulty: medium\n\n## Why\nTest\n\n## What\nDo it\n\n"
-            "## Acceptance criteria\n- [ ] A test: the status line names the base.\n")
+            "## Acceptance criteria\n- [ ] A test: the status line names the base.\n"
+            "- [ ] tests/test_status.py passes.\n")
         self.assertNotIn(tickets.FIXTURE_NOTE, text)
 
     def test_a_limit_on_another_model_or_one_that_lifted_does_not_hold_the_claim(self):
@@ -6178,7 +6240,7 @@ class ClaimTest(Base):
         self.heartbeat("spark")
         self.fake.add(12)
         self.fake.add(13, body="Difficulty: medium\n\n## Why\nx\n"
-                      "\n## Acceptance criteria\n\n- [ ] x\n", state="queued")
+                      "\n## Acceptance criteria\n\n- [ ] tests/test_x.py passes\n", state="queued")
         self.fake.issues[13]["labels"] = [{"name": "loom:ticket"}, {"name": "loom:queued"}]
         st = station.Station(GitHub("token", transport=self.fake), self.settings,
                              now=time.time() - 300)
@@ -6279,7 +6341,7 @@ class ClaimTest(Base):
                 self.heartbeat("codex", available=available)
                 station.usage.write(self.home, rows)
                 self.fake.add(number, state="queued",
-                              body="Difficulty: %s\n\n## Why\nx\n\n## Acceptance criteria\n\n- [ ] x\n"
+                              body="Difficulty: %s\n\n## Why\nx\n\n## Acceptance criteria\n\n- [ ] tests/test_x.py passes\n"
                               % difficulty)
                 self.fake.issues[number]["labels"].pop()
                 st = station.Station(GitHub("token", transport=self.fake), self.settings, now=now)
@@ -6935,7 +6997,7 @@ EASY = PLAIN.replace("hard", "easy")
 # PLAIN with the criterion a dispatchable ticket carries (loom#2162), for
 # the helpers below whose tickets a pass goes on to claim or re-brief.
 PLAIN_WITH_CRITERIA = (PLAIN + "\n## Acceptance criteria\n"
-                       "- [ ] A test shows the thing is fixed.\n")
+                       "- [ ] A test fails without the fix and passes with it.\n")
 
 
 class RetryTest(Base):
@@ -8141,7 +8203,7 @@ class DeadLaneRunawayTest(Base):
     lane of its tier, naming the lane fault; this is not a failure, so the
     ladder does not move."""
     MEDIUM = ("Difficulty: medium\n\n## Why\nBecause.\n\n## What\nDo it.\n\n"
-              "## Acceptance criteria\n- [ ] A test shows the thing is fixed.\n")
+              "## Acceptance criteria\n- [ ] A test fails without the fix and passes with it.\n")
 
     def bodies(self, number=12):
         return [c["body"] for c in status.expand(self.fake.comments[number], AUTHORS)]
@@ -10355,7 +10417,10 @@ class VerifyBeforeBuildTest(Base):
     def sent(self):
         """Ticket 12 shipped after the station sent pull request 77 to verify."""
         self.fake.private = False
-        self.fake.add(12, lane="codex", body=SHIPPED_BODY, state="shipped",
+        # The box names its test: sent back to a build lane, the ticket is
+        # one the claim takes (#3299).
+        self.fake.add(12, lane="codex", state="shipped",
+                      body=SHIPPED_BODY.replace("A test passes", "tests/test_daily.py passes"),
                       events=[labeled("loom:briefed", "alice-example"),
                               labeled("lane:codex", "bob-example")] + shipped_at(30))
         self.merged()
@@ -16591,7 +16656,11 @@ class PaceTest(Base):
             dict(base, window="5-hour", window_minutes=300),
             dict(base, window="weekly", window_minutes=10080),
         ]
-        with mock.patch.object(station.usage, "collect", return_value=records), \
+        self.write(os.path.join(self.home, "state", "usage", "claude.json"),
+                   json.dumps({"at": now - 601, "available": True}))
+        self.write(os.path.join(self.home, "state", "usage", "claude.alive"), str(now - 5))
+        with mock.patch.dict(os.environ, {"LOOM_PACE_MAX_CLAUDE": "1"}), \
+                mock.patch.object(station.usage, "collect", return_value=records), \
                 mock.patch.object(runner, "_refresh_model_catalogue"), \
                 mock.patch.object(runner, "post_chain"), \
                 mock.patch.object(runner, "upload_usage_limits") as upload:
@@ -16603,6 +16672,8 @@ class PaceTest(Base):
         self.assertEqual((codex[0]["window"], codex[0]["used_pct"]), ("weekly", 0))
         (missing,) = [row for row in summaries if row["provider"] == "claude"]
         self.assertIsNone(missing["used_pct"])
+        self.assertEqual((missing["running"], missing["allowed"]), (1, 1))
+        self.assertEqual(missing["running_until"], station.usage._iso(now - 5 + station.ALIVE_MAX_AGE))
         self.assertEqual(station.usage.read_snapshot(self.home), records)
 
     def daily_reading(self, now, age=60):
@@ -16677,6 +16748,152 @@ class PaceTest(Base):
         self.assertIn(f"| codex | weekly | 2% | 50% | {reset} | behind | "
                       "1 of 2 (asks for 2) |", body)
 
+    def test_published_subscription_counts_a_beat_after_pass_start_without_a_stale_ask(self):
+        from bus import pace
+
+        now = 1_800_000_000.0
+        self.settings.status_repo = REPO
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings, now=now)
+        reset = station.usage._iso(now + 10080 * 30)
+        records = [{"provider": "claude", "lanes": ["claude"], "window": "weekly",
+                    "window_minutes": 10080, "used_pct": 2, "resets_at": reset,
+                    "observed_at": station.usage._iso(now - 30)}]
+        self.write(os.path.join(self.home, "state", "usage", "claude.json"),
+                   json.dumps({"at": now + 1, "available": True}))
+        station.usage.write(self.home, records)
+        self.write(os.path.join(self.home, "state", "usage", "claude.meter.json"),
+                   json.dumps({"at": now - 30, "windows": [
+                       {"window": "weekly", "window_minutes": 10080, "used_pct": 2,
+                        "resets_at": now + 10080 * 30}]}))
+        plan = pace.plan(self.home, records, queued=1, env={}, now=now)
+        pace.write(self.home, plan)
+        self.assertEqual((plan["providers"]["claude"]["open"], plan["providers"]["claude"]["want"]), (0, 1))
+
+        with mock.patch.object(station, "LANES", ["claude"]), \
+                mock.patch.object(station.time, "time", return_value=now), \
+                mock.patch.object(runner, "_lanes_issue", return_value=1), \
+                mock.patch.object(runner, "_remote_claim_count", return_value=0), \
+                mock.patch.object(runner, "_upsert_lanes_comment", return_value=2) as post:
+            runner.publish_lanes(refresh_pr_counts=False)
+
+        post.assert_called_once()
+        body = post.call_args.args[2]
+        self.assertIn("| claude | serving |", body)
+        self.assertIn(f"| claude | weekly | 2% | 50% | {reset} | behind | 1 of 1 |", body)
+        self.assertEqual(pace.read(self.home), plan)
+
+    def test_subscription_status_counts_running_evidence_independently_of_availability(self):
+        now = 1_800_000_000.0
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings, now=now)
+        usage_dir = Path(self.home) / "state" / "usage"
+        heart = usage_dir / "claude.json"
+        alive = usage_dir / "claude.alive"
+        held = {"at": now - 5, "available": False, "reason": "held: fixture"}
+        limited = dict(held, reason="limit: fixture", retry_at=now + 300)
+        old_limit = dict(limited, at=now - 601)
+        cases = (
+            ("held runner", held, None, False, 1),
+            ("limited runner", limited, None, False, 1),
+            ("old limit with live runner", old_limit, str(now - 5), False, 1),
+            ("old limit with no runner evidence", old_limit, None, False, 0),
+            ("startup stamp without heartbeat", None, str(now - 5), False, 1),
+            ("expired runner stamp", None, str(now - 301), False, 0),
+            ("out-of-range runner stamp", None, str(now + 61), False, 0),
+            ("nonfinite runner stamp", None, "NaN", False, 0),
+            ("heartbeat without availability", {"at": now - 5}, None, False, 0),
+            ("known missing job", held, str(now - 5), True, 0),
+        )
+        with mock.patch.dict(os.environ, {"LOOM_PACE_MAX_CLAUDE": "1"}), \
+                mock.patch.object(station.time, "time", return_value=now):
+            for label, beat, stamp, absent, expected in cases:
+                with self.subTest(label=label):
+                    heart.unlink(missing_ok=True)
+                    alive.unlink(missing_ok=True)
+                    if beat is not None:
+                        heart.write_text(json.dumps(beat))
+                    if stamp is not None:
+                        alive.write_text(stamp)
+                    runner._missing_lane_jobs = {"claude"} if absent else set()
+                    body = runner._lanes_body([])
+                    self.assertIn(f"| claude | - | no reading | - | - | - | {expected} of 1 |", body)
+                    self.assertFalse((usage_dir / "claude.last-limit.json").exists())
+
+    def test_two_claude_subscriptions_keep_separate_meters_in_status_and_upload(self):
+        now = 1_800_000_000.0
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings, now=now)
+        state = Path(self.home) / "state" / "usage"
+        primary, second = [state / (slot + ".meter.json") for slot in ("claude", "claude-2")]
+        reset = now + 10080 * 30
+
+        def meter(file, used, observed, window="weekly", source="test meter"):
+            file.write_text(json.dumps({"at": observed, "source": source, "windows": [
+                {"window": window, "window_minutes": 10080,
+                 "used_pct": used, "resets_at": reset}]}))
+
+        meter(primary, 3, now - 100)
+        meter(second, 97, now - 60)
+        body = runner._lanes_body([])
+        self.assertIn("| claude | weekly | 3% |", body)
+        self.assertIn("| claude-2 | weekly | 97% |", body)
+        primary.write_text(json.dumps({"at": float("nan")}))
+        body = runner._lanes_body([])
+        self.assertIn("| claude | - | no reading |", body)
+        self.assertIn("| claude-2 | weekly | 97% |", body)
+        meter(primary, 3, now - 100)
+
+        from dashboard import usage as usage_page
+
+        cases = ((97, "weekly", "test meter", 97), (True, "weekly", "test meter", None),
+                 (97, "x" * 201, "test meter", None), (97, "weekly", "x" * 201, 97))
+        for used, window, source, expected in cases:
+            with self.subTest(second_meter=(used, len(window), len(source))):
+                meter(second, used, now - 120 if len(window) > 200 or len(source) > 200 else now - 60,
+                      window, source)
+                with mock.patch.dict(os.environ, {"LOOM_PACE_MAX_CLAUDE": "2"}), \
+                        mock.patch.object(station.labels, "LANES", ["claude", "claude-2"]), \
+                        mock.patch.object(runner, "_refresh_model_catalogue"), \
+                        mock.patch.object(runner, "post_chain"), \
+                        mock.patch.object(runner, "upload_usage_limits") as upload:
+                    runner._tend_usage()
+                store = usage_page.Store()
+                store.upload(upload.call_args.args[0])
+                rows = store.snapshot()["readings"]
+                self.assertEqual(len(rows), 4)
+                self.assertEqual({row["provider"]: row["daily_allowance"]["used"]
+                                  for row in rows if "daily_allowance" in row},
+                                 {"openrouter": None, "workersai": None})
+                rows = [row for row in rows if "daily_allowance" not in row]
+                self.assertEqual({row["provider"]: row["used_pct"] for row in rows},
+                                 {"claude": 3, "claude-2": expected})
+                self.assertEqual({row["provider"]: row["lanes"] for row in rows},
+                                 {"claude": ["claude"], "claude-2": ["claude-2"]})
+                summaries = {row["provider"]: row["subscription_pace"] for row in rows}
+                self.assertEqual([summaries[slot]["allowed"] for slot in ("claude", "claude-2")],
+                                 [1, 1])
+                self.assertEqual(summaries["claude-2"]["used_pct"], expected)
+                local_rows = station.usage.read_snapshot(self.home)
+                self.assertEqual({row["provider"] for row in local_rows}, {"claude"})
+                self.assertEqual(local_rows[0]["lanes"], ["claude", "claude-2"])
+
+    def test_usage_upload_remembers_the_limit_of_an_account_without_a_meter(self):
+        now = 1_800_000_000.0
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings, now=now)
+        state = Path(self.home) / "state" / "usage"
+        (state / "claude.meter.json").write_text(json.dumps({"at": now, "windows": [
+            {"window": "weekly", "window_minutes": 10080, "used_pct": 3,
+             "resets_at": now + 10080 * 30}]}))
+        second = state / "claude-2.json"
+        second.write_text(json.dumps({"at": now, "available": False, "reason": "limit: account cap"}))
+        with mock.patch.object(station.labels, "LANES", ["claude", "claude-2"]), \
+                mock.patch.object(runner, "_refresh_model_catalogue"), \
+                mock.patch.object(runner, "post_chain"), \
+                mock.patch.object(runner, "upload_usage_limits") as upload:
+            runner._tend_usage()
+            second.write_text(json.dumps({"at": now, "available": True}))
+            runner._tend_usage()
+        rows = [row for row in upload.call_args.args[0] if row["provider"] == "claude-2"]
+        self.assertEqual([row["note"] for row in rows], ["last limit: account cap"])
+
     def test_subscription_status_preserves_zero_and_refuses_old_windows(self):
         runner = station.Station(GitHub("token", transport=self.fake), self.settings)
         now = runner.now
@@ -16690,10 +16907,16 @@ class PaceTest(Base):
         reset = now + 50 * 60
         station.usage.write(self.home, [
             row("codex", "weekly", 100, 0, reset),
-            row("claude", "weekly", 10080, 23, reset, age=7201),
-            row("claude", "five-hour", 300, 30, reset),
             row("agy", "weekly", 10080, 8, now - 1),
         ])
+        windows = [
+            {"window": "weekly", "window_minutes": 10080, "used_pct": 23,
+             "resets_at": reset, "at": now - 7201},
+            {"window": "five-hour", "window_minutes": 300, "used_pct": 30,
+             "resets_at": reset, "at": now - 10},
+        ]
+        self.write(os.path.join(self.home, "state", "usage", "claude.meter.json"),
+                   json.dumps({"at": now - 10, "windows": windows}))
         body = runner._lanes_body([])
         self.assertIn(f"| codex | weekly | 0% | 50% | {station.usage._iso(reset)} | behind |", body)
         self.assertIn("| claude | weekly | no reading |", body)
@@ -16769,7 +16992,7 @@ class RunnerSlotClaimTest(Base):
     (loom#1917)."""
 
     MEDIUM = ("Difficulty: medium\n\n## Why\nBecause.\n\n## What\nDo it.\n\n"
-              "## Acceptance criteria\n- [ ] A test shows the thing is fixed.\n")
+              "## Acceptance criteria\n- [ ] A test fails without the fix and passes with it.\n")
 
     def claim(self):
         with mock.patch.dict(os.environ, {"LOOM_RUNNER_SLOTS": "free-gemma"}):

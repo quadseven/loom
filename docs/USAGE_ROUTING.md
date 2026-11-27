@@ -77,9 +77,14 @@ heartbeats), up to its most: the registry's slots of that provider, or
 reading that is stale or from a window that has reset gives no verdict.
 The plan is written to `state/usage/pace.json`. The lane status comment
 shows each subscription's longest window, used and elapsed percentages,
-UTC reset, pace, and running and allowed slots. It shows no reading when
-the meter is missing, stale, or reset. A current slot request appears
-beside the slot counts. The plan itself is data only: a lane container runs
+UTC reset, pace, and running and allowed slots. Each Claude subscription
+has its own read-only row from its slot's meter. The lane status and Usage
+count slots with a fresh heartbeat or runner keepalive, including runners
+that are held or limited, and exclude jobs the station knows are absent.
+Usage shows the running count as unknown once its runner evidence expires.
+The meter shows no reading when it is missing, stale, or reset. A current
+slot request appears when its plan agrees with the displayed counts. The
+plan itself is data only: a lane container runs
 the slots its deployment names, so the request is what a pod that can
 start slots at runtime would read.
 
