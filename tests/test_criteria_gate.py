@@ -10,6 +10,7 @@ trip was never run, a service that must survive a reboot.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import sys
@@ -149,7 +150,7 @@ class Checks(unittest.TestCase):
             302, "", "https://new.example.com/"))[0])
 
         def garbled(url, timeout):
-            raise criteria_gate.http.client.BadStatusLine("x")
+            raise http.client.BadStatusLine("x")
         self.assertEqual(criteria_gate.run(check, None, fetch=garbled),
                          (False, "the check could not run (BadStatusLine)"))
         gh = SimpleNamespace(rest=lambda m, p: SimpleNamespace(data={"value": "false"}))
