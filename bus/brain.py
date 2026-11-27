@@ -9939,6 +9939,9 @@ def _cmd_brief(gh: GitHub, args: argparse.Namespace) -> None:
     refused = anthropic_floor_refusal(gh, args.lane, getattr(args, "lanes_repo", ""))
     if refused:
         raise ValueError(refused)
+    # The rule was applied here: the ticket says so, and the claim-time hold
+    # for a ticket filed by hand passes it over.
+    body = brief_check.with_test_marker(body)
     print(brief(gh, _repo(args.repo), args.epic, args.title, body,
                 args.lane, args.difficulty, args.model, args.base, args.not_before, args.refs,
                 args.regresses, args.after, args.priority, args.holder,
