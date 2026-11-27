@@ -781,9 +781,7 @@ compose_pr_body() {
   PLAN_GAPS=""
   if [ -f "$BRIEF" ]; then
     compose_pr_body_from "$BRIEF"
-    return
-  fi
-  if [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]] && recovered="$(mktemp "$TMPDIR/pr-brief.XXXXXX")" &&
+  elif [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]] && recovered="$(mktemp "$TMPDIR/pr-brief.XXXXXX")" &&
      timeout "$NET_TIMEOUT" gh api "repos/$REPO/issues/$ISSUE_NUMBER" 2>> "$LOG" |
        PYTHONPATH="$REPO_ROOT" python3 -B -c '
 import json, sys
@@ -799,6 +797,7 @@ print(render_brief(sys.argv[1], issue, sys.argv[2]))
     PR_BODY="$(pr_body /dev/null "$TICKET")"
   fi
   [ -z "${recovered:-}" ] || rm -f "$recovered"
+  [ -z "${DECISION_AUDIT:-}" ] || PR_BODY="$PR_BODY"$'\n\n## Lane decision\n\n'"$DECISION_AUDIT"
 }
 
 # Repair a failing body from the same source used to compose it. PLAN_GAPS
@@ -1401,13 +1400,17 @@ LOG_TAIL_OK=0
 post_park_note() {  # failure class, reason
   [ "${LOOM_LOG_TAIL:-on}" != off ] && [ "$LOG_TAIL_OK" = 1 ] || return 0
   [ -n "${GH_TOKEN:-}" ] || return 0
-  local class="${1:-work}" reason file scan=() rc=0 text
+  local class="${1:-work}" reason file scan=() rc=0 text limit=200 outcome=()
   case "$class" in limit|size|auth) return 0 ;; esac
+  if [ "$class" = operator ]; then
+    limit=1000
+    outcome=(--operator-ask)
+  fi
   [ -n "${ISSUE_NUMBER:-}" ] && [ -n "${REPO:-}" ] || return 0
   fresh_app_token || true
   file="$(mktemp "${TMPDIR:-/tmp}/loom-park-note.XXXXXX")" || return 0
   printf '%s\n' "${2:-}" | tr -d '\r' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' |
-    grep -m1 -v '^[[:space:]]*$' | cut -c1-200 |
+    grep -m1 -v '^[[:space:]]*$' | cut -c1-"$limit" |
     sed -E "s#(^|[[:space:]\"'(=])(~|\\\$HOME)?/[^[:space:]\"'():,]*#\\1<path>#g" > "$file"
   if [ "${REPO_PRIVATE:-}" = true ]; then
     scan=(--personal-data)
@@ -1419,13 +1422,17 @@ post_park_note() {  # failure class, reason
   [ "$rc" -eq 0 ] || echo "[$(date -u +%FT%TZ)] $TICKET: the leak scan refused the park reason or could not run (exit $rc)" >> "$LOG"
   reason="$(cat "$file")"; rm -f "$file"
   if [ "$rc" -eq 0 ] && [ -n "$reason" ]; then
-    text="The $LANE lane parked this ticket after a $class failure: $reason"
+    if [ "$class" = operator ]; then
+      text="$reason"
+    else
+      text="The $LANE lane parked this ticket after a $class failure: $reason"
+    fi
   else
     text="The $LANE lane parked this ticket after a $class failure; the reason was withheld by the leak scan."
   fi
   printf '%s\n' "$text" |
     upsert_sticky_comment "$REPO" "$ISSUE_NUMBER" "$LOG_TAIL_MARKER" outcome \
-      --headline "Outcome of the $LANE lane run for $TICKET" ||
+      --headline "Outcome of the $LANE lane run for $TICKET" ${outcome[@]+"${outcome[@]}"} ||
     echo "[$(date -u +%FT%TZ)] $TICKET: could not post the park note" >> "$LOG"
   return 0
 }
@@ -1447,6 +1454,7 @@ park() {
 # lanes/rewrite_agent.sh.
 # shellcheck source=lanes/agent_sandbox.sh
 . "$LOOM_ROOT/lanes/agent_sandbox.sh"
+. "$LOOM_ROOT/lanes/lane_decision.sh"
 
 # The agy lane's agent runs as the lane user, so that user's home is its real
 # home, not a scratch one. It may write only its tree, its TMPDIR, agy's state
@@ -4926,7 +4934,7 @@ run_agent() {
       workersai_request verify "$1" "$MODEL" "$WORKDIR/$TICKET.verify-response" "$LOOM_HOME"
     return $?
   fi
-  brief_text="$(cat "$1")$(work_note)$(validation_note)$(summary_note)"
+  brief_text="$(cat "$1")$(work_note)$(validation_note)$(summary_note)$(decision_note)${2:-}"
   if [ "$LANE" = spark ]; then
     brief_text="$brief_text
 
@@ -5323,6 +5331,7 @@ for BRIEF in "$INBOX"/*.md; do
   drop_run_scratch
   AGENT_GH_CALLS=""
   PR_BODY=""
+  DECISION_AUDIT=""
   PLAN_GAPS=""
   DROPPED_SCRATCH_FILES=""
   TICKET="$(basename "$BRIEF" .md)"
@@ -5633,6 +5642,19 @@ for BRIEF in "$INBOX"/*.md; do
   # runner is killed (a reinstall's bootout), the agent survives in its group,
   # and the next pass's stale-lock recovery above kills exactly that group.
   LOG_START="$(log_size)"
+  DECISION_FILE=""
+  if ! rm -f "$LOCK/decision-result"; then
+    release_heavy_repo
+    park "$BRIEF" "could not clear the decision result file" transient; continue
+  fi
+  case "$REPO_PRIVATE:$DELIVERABLE:$FIX_PR:$LANE:$MODEL:${LOOM_CLUSTER_RUNNER:-0}" in
+    false:::codex:gpt-*:0|false:::claude:claude-*:0)
+      DECISION_FILE="$TMPDIR/$TICKET.operator.json"
+      if ! rm -f "$DECISION_FILE"; then
+        release_heavy_repo
+        park "$BRIEF" "could not clear the decision scratch file" transient; continue
+      fi ;;
+  esac
   if ! agent_gh_config; then
     release_heavy_repo
     park "$BRIEF" "$AGENT_GH_WHY" transient; continue
@@ -5651,7 +5673,7 @@ for BRIEF in "$INBOX"/*.md; do
      build_jobs_export &&
      cd "$TREE" && unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN "${!LOOM_GITHUB_APP_@}" "${!GIT_CONFIG_@}" &&
       export GH_CONFIG_DIR="$AGENT_GH_CONFIG" && github_auth_agent_path &&
-      run_agent "$RUN_BRIEF") >> "$LOG" 2>&1 &
+      run_agent_with_decision "$RUN_BRIEF") >> "$LOG" 2>&1 &
     agent_pid=$!
     echo $agent_pid > "$LOCK/pgid"
     ( agent_watchdog "$agent_pid" "$LOG_START" "$LOG" ) &
@@ -5718,6 +5740,15 @@ for BRIEF in "$INBOX"/*.md; do
   # pod rather than fail it (keep_drained_run). The loop's next turn sees the
   # drain and ends the pass.
   if [ "$STATUS" -ne 0 ] && pod_draining; then keep_drained_run; continue; fi
+  if [ "$STATUS" -eq 0 ] && [ -s "$LOCK/decision-result" ]; then
+    { IFS= read -r DECISION_STATE; IFS= read -r DECISION_AUDIT; } < "$LOCK/decision-result"
+    case "$DECISION_STATE" in
+      agreed) ;;
+      operator) park "$BRIEF" "$DECISION_AUDIT" operator; continue ;;
+      retry) park "$BRIEF" "$DECISION_AUDIT" transient; continue ;;
+      *) park "$BRIEF" "could not read the lane decision outcome" transient; continue ;;
+    esac
+  fi
   # A spark run that ended because the box went hot is a limit, not a failure.
   if [ "$STATUS" -ne 0 ] && { [ "$LANE" = spark ] || [ "$LANE" = free ]; } && { spark_probe; [ $? -eq 1 ]; }; then
     mark_limit

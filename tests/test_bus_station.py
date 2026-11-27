@@ -7368,8 +7368,8 @@ class RetryTest(Base):
             dict({"body": claim % "codex"}, **who)]
         self.run_pass()
         self.assertIn("loom:runaway", self.fake.names(12))
-        self.assertIn("Not counted as work attempts: 1 that ended [transient], [limit], [auth] or "
-                      "[factory].", self.bodies()[-1])
+        self.assertIn("Not counted as work attempts: 1 that ended [transient], [limit], [auth], "
+                      "[factory] or [operator].", self.bodies()[-1])
         # Each row says whether it counted: a brain read a limit row in the
         # one table as a counted attempt and filed a factory ticket for a
         # detector that was right (2026-10-21).
@@ -10324,6 +10324,18 @@ class OutcomeTest(Base):
         self.assertIn("could not open <path> (in <path> now", body)
         self.assertNotIn("example", body)
         self.assertNotIn("agent exited 1", body)
+
+    def test_an_operator_park_ends_the_claim_and_holds_the_ticket(self):
+        name = self.finished("failed")
+        self.fake.issues[12]["labels"].append({"name": "claim:" + AUTHORS[0]})
+        self.write(os.path.join(self.home, "logs", "codex", name + ".log"),
+                   "[t] %s failed: [operator] Models disagreed. Ask: How should ties be ordered?\n" % name)
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual(set(self.fake.names(12)), {"loom:ticket", "loom:queued", "needs:human"})
+        events = [line for comment in self.fake.comments[12] if status.is_status(comment["body"])
+                  for _, line in status.parse(comment["body"])]
+        self.assertEqual(events, ["Lane codex stopped: [operator] decision needs an operator"])
 
     def limited(self, lane="spark", fix_body=None):
         self.fake.add(12, state="running", lane=lane,
