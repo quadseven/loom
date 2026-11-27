@@ -1222,6 +1222,25 @@ def _ticket_prs(repo: str, prs: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any
     return found
 
 
+def _claimed_pr_lines(repo: str, issues: List[Dict[str, Any]],
+                      prs: List[Dict[str, Any]]) -> List[str]:
+    claimants = {int(issue["number"]): claims for issue in issues
+                 if (claims := tickets.claimed_by(issue))}
+    if not claimants:
+        return []
+    rows = []
+    for pr in prs:
+        try:
+            association = _ticket_association(repo, pr)
+        except ValueError:
+            continue
+        if association and association[1] in claimants:
+            number = association[1]
+            rows.append("- PR #%s - ticket #%d - claimed by %s" % (
+                pr["number"], number, ", ".join(claimants[number])))
+    return ["", "### Claimed ticket pull requests", *rows] if rows else []
+
+
 def _refs_ticket_pull(repo: str, pr: Dict[str, Any], tickets: Sequence[Dict[str, Any]]) -> bool:
     """Whether a pull request names one of this repo's open Loom tickets."""
     try:
@@ -1661,6 +1680,7 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     lines += [""] + _sensitive_pr_lines(prs, gh, repo)
     lines += [""] + _waiting_brain_lines(tickets, pr_of, data, now, bot)
     lines += [""] + _past_rung_lines(past, pr_of, data, bot)
+    lines += _claimed_pr_lines(repo, tickets, prs)
     lines += ["", ADOPT_HEADING]
     lines += [_status_pr_line(gh, repo, pr, data["prs"].get(int(pr["number"])), bot, check)
               for pr in adoptable]
