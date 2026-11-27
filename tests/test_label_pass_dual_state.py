@@ -47,8 +47,9 @@ class Fake:
         _, number, endpoint = rest.split("/", 2)
         issue = self.issues[repo][int(number)]
         if method == "GET" and endpoint == "events":
+            logins = ("station[bot]", "trusted-brain")
             events = [{"event": "labeled", "actor": {"login": login}, "label": label}
-                      for login, label in zip(("station[bot]", "trusted-brain"), issue["labels"])]
+                      for login, label in zip(logins, issue["labels"], strict=False)]
             return 200, {}, json.dumps(events).encode()
         if method == "DELETE" and endpoint.startswith("labels/"):
             name = unquote(endpoint[len("labels/"):])
