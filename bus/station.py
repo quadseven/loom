@@ -44,6 +44,7 @@ from . import brain_memory
 from . import brain_hold
 from . import claimed
 from . import human_claims
+from . import lane_feed
 from . import claim_referee
 from . import close_audit
 from . import closing
@@ -53,11 +54,13 @@ from . import journal
 from . import lane_markers
 from . import log_capture
 from . import operator_budget
+from . import pace
 from . import fabric, fabric_reviews
 from . import fixrounds
 from . import logrotate
 from . import flake
 from . import rebuttal
+from . import readiness
 from . import lane_state, remote_checks, runners
 from . import station_beat
 from . import scope_fit
@@ -128,6 +131,9 @@ HEARTBEAT_MAX_AGE = lane_state.HEARTBEAT_MAX_AGE
 BRIEFED = "loom:briefed"
 RUNNING = "loom:running"
 RUNAWAY = "loom:runaway"
+# Work attempts since a ticket's last brief after which it is held as a runaway
+# (LOOM_FAILED_RUN_CAP sets it; 0 turns it off).
+FAILED_RUN_CAP = 8
 # How often the station moves tickets under no epic or a closed epic into an
 # open intake epic, matching the closed-epic invariant's check interval.
 OUTSIDE_EPIC_EVERY = invariants.CHECK_EVERY
@@ -153,9 +159,6 @@ ISSUE_LINE_RE = re.compile(r"^Issue: ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+)[
 # planned and stopped holding it.
 AFTER_RELEASE_RE = re.compile(r"^<!-- loom:after-release ([0-9]+) -->")
 FAILED_RE = re.compile(r"\bfailed: (.*)$")
-# The line lanes/run_lane.sh park writes: "[time] <ticket> failed: [class] reason".
-# _failure_reason prefers it to any other line that merely holds "failed: ".
-LANE_FAILED_RE = re.compile(r"^\[[^\]]*\] \S+ failed: (\[[A-Za-z-]+\] .*)$")
 # The runner's reason when a lane run ends with nothing committed.
 NO_COMMIT = "agent made no commit"
 # Elder review check output parsing: individual markings like "removed-guarded-path"
@@ -581,7 +584,7 @@ REMOTE_RE = re.compile(r"[:/]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?$")
 # keeps its rung, and the brain re-queues it when the incident closes.
 # An [auth] one is the operator's key, which no lane can renew: it is not a
 # failure, not an attempt spent and never a runaway.
-CLASS_RE = re.compile(r"^\[(size|limit|transient|work|factory|auth|egress-opened)\] ")
+CLASS_RE = re.compile(r"^\[(size|limit|transient|work|factory|auth|operator|egress-opened)\] ")
 RETRY_CLASSES = ("limit", "transient")
 RETRY_MAX = 2
 # Whether this process has said the send-back comparison is off (unset target).
@@ -737,6 +740,13 @@ INVARIANT_WRITE_RESERVE = 100
 # filled their repos' open pull request caps (loom#3534). The factory is due
 # every factory.FACTORY_CHECK seconds, and the budget floor still skips it.
 FACTORY_REQUEST_RESERVE = 250
+# The share of the pass request target the step loop keeps however much the
+# steps before it spent: it runs until max(target, counted at its start +
+# this share of the target). On 2026-11-26 the claim pass kept to its share,
+# but reconcile, assign and the factory spent the rest of the target, the
+# loop broke at its first step, and check_invariants ran four hours overdue
+# (loom#3119). The budget floor still stops the loop.
+STEP_LOOP_SHARE = 1 / 2
 # A repo with no briefed, running or pr ticket is scanned this often at most.
 IDLE_SCAN = 600
 # Conditional-request answers unused this long are removed.
@@ -1802,6 +1812,35 @@ def _int_or_default(raw: str, default: int) -> int:
         return default
 
 
+def _is_work_attempt(reason: str) -> bool:
+    """Whether an attempt ending counts as a work attempt rather than a
+    non-work exit such as a limit or an operator decision."""
+    return not reason or failure_class(reason) not in NOT_WORK
+
+
+def _runaway_trigger(now: float, comments: list, work: list, reason: str) -> str:
+    """Return the runaway trigger description when a ticket should be held,
+    or empty string otherwise."""
+    failures = [a[3] for a in work[:-1] if a[3]]
+    same_reason = bool(failures) and (
+        failures[-1] == reason
+        or (factory.is_timeout(failures[-1]) and factory.is_timeout(reason))
+    )
+    if same_reason:
+        return "repeated failure reason"
+    recent = [a for a in work if a[0] >= now - 6 * 3600]
+    if len(recent) >= 3:
+        return "three attempts within six hours"
+    # Failures that differ and spread over days trip neither test above: a
+    # ticket reached its fiftieth run that way. Work attempts since the
+    # last brief past the cap hold it; a new brief starts the count again.
+    cap = _int_or_default(os.environ.get("LOOM_FAILED_RUN_CAP", ""), FAILED_RUN_CAP)
+    since_brief = [a for a in history.attempts_since_brief(comments) if _is_work_attempt(a[3])]
+    if 0 < cap <= len(since_brief):
+        return "%d failed runs since the last brief" % len(since_brief)
+    return ""
+
+
 DECISION_DEFAULT_CHECK_EVERY = 3600
 
 
@@ -2169,7 +2208,7 @@ def provider(lane: str) -> str:
 
 
 # Failure classes that did no work on the ticket (loom#572).
-NOT_WORK = ("size", "factory", "transient", "limit", "auth")
+NOT_WORK = ("size", "factory", "transient", "limit", "auth", "operator")
 
 
 def failure_class(reason: str) -> str:
@@ -3567,7 +3606,8 @@ class Station:
                 if len(cols := line.split()) == 3}
         if jobs.get("com.loom.station") != str(os.getpid()):
             return
-        nonlocal_lanes = set(runners.runner_slots()) | set(REMOTE_LANES)
+        nonlocal_lanes = (set(runners.runner_slots()) | set(REMOTE_LANES)
+                          | {lane for lane in LANES if lane_feed.is_fed(lane)})
         self._missing_lane_jobs = {lane for lane in LANES if lane not in nonlocal_lanes
                                    and "com.loom." + lane not in jobs}
         for lane in sorted(self._missing_lane_jobs):
@@ -4042,8 +4082,10 @@ class Station:
         """True while the host is too loaded for a local lane to take a
         ticket. Only a station whose settings came from the environment
         asks (Settings.host_load_gate); runner slots and remote lanes do
-        their work elsewhere and are never held."""
-        if not self.s.host_load_gate or lane in runners.runner_slots() or lane in REMOTE_LANES:
+        their work elsewhere and are never held, nor are slots fed to lane
+        pods on other nodes (bus/lane_feed.py)."""
+        if (not self.s.host_load_gate or lane in runners.runner_slots() or lane in REMOTE_LANES
+                or lane_feed.is_fed(lane)):
             return False
         script = os.path.join(os.path.dirname(__file__), "..", "lanes", "host_load.sh")
         note = subprocess.check_output(["/bin/bash", script], text=True).strip()
@@ -7153,16 +7195,30 @@ class Station:
         """The pass's main step loop, given PASS_STEP_BUDGET seconds of its
         own: counted from the pass's start, the steps before it (reconcile,
         hand back, claim, assign, about six minutes on 2026-10-24) left one
-        loop step a pass and a full turn of the loop took hours."""
-        loop_started = time.monotonic()
+        loop step a pass and a full turn of the loop took hours. It also
+        keeps STEP_LOOP_SHARE of the request target past what those steps
+        spent (loom#3119)."""
+        target = getattr(self.gh, "target", None)
+        has_target = isinstance(target, int) and not isinstance(target, bool)
+        if has_target:
+            self.gh.target = max(target, self._pass_counted() + int(target * STEP_LOOP_SHARE))
+        try:
+            self._run_rotation()
+        finally:
+            if has_target:
+                self.gh.target = target
+
+    def _loop_steps(self) -> Tuple[Any, ...]:
+        """The step rotation, in order."""
         # Below the budget floor these wait for the reset; trees are local.
-        steps = (self.roll_source_pins, self.ship_deployed, self.ship_pins, self.ship_rolls,
+        return (self.roll_source_pins, self.ship_deployed, self.ship_pins, self.ship_rolls,
                      self.ship_merged,
                      self.ship_workflows, self.ship_path_workflows, self.unwind_reverts,
                      self.adopt_untracked_pulls, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
                      self.close_done_tickets, self.audit_closes, self.settle_orphan_sources,
-                     self.settle_claimed_tickets, self.release_stale_claims,
+                     self.settle_claimed_tickets, self.refresh_ticket_readiness,
+                     self.release_stale_claims,
                      self.referee_claims,
                      self.withdraw_held_pr_waits, self.clean_labels,
                      self.queue_stateless_tickets, self.intake_ready_for_agent,
@@ -7178,18 +7234,26 @@ class Station:
                      # tickets sit under an epic.
                      self.move_outside_tickets, self.check_invariants,
                      self.release_factory_held, self.apply_decision_defaults)
+
+    def _run_rotation(self) -> None:
+        """Run the step rotation from where the last pass stopped, until the
+        pass's time budget or request target, and record where it stopped."""
+        loop_started = time.monotonic()
+        steps = self._loop_steps()
         self._note_every_pass()
         paused = self._paused_steps((*steps, self.post_metrics))
         self._run_due_steps(paused)
         rotation_path = os.path.join(self.state, STEP_ROTATION_FILE)
         rotation = _read_json(rotation_path, {}, strict=False)
-        start = rotation.get("next") if isinstance(rotation, dict) else 0
-        carried = rotation.get("carried") if isinstance(rotation, dict) else None
+        rotation = rotation if isinstance(rotation, dict) else {}
+        start = rotation.get("next")
+        carried = rotation.get("carried")
         start = start if isinstance(start, int) and 0 <= start < len(steps) else 0
         # Where the next pass starts, kept current so the write below records
         # it however the loop ends.
         next_step = start
         next_carried = None
+        full = False
         try:
             for offset in range(len(steps)):
                 next_step = (start + offset) % len(steps)
@@ -7229,11 +7293,26 @@ class Station:
                     _say("%s failed: %s" % (step.__name__, err))
             else:
                 next_step = 0
+                full = True
         finally:
+            turn_started = self._rotation_turn(rotation.get("turn_started"), len(steps),
+                                               full or next_step < start)
             try:
-                _write_json(rotation_path, {"next": next_step, "carried": next_carried})
+                _write_json(rotation_path, {"next": next_step, "carried": next_carried,
+                                            "turn_started": turn_started})
             except OSError as err:
                 _say("could not record the step rotation: %s" % err)
+
+    def _rotation_turn(self, started: Any, count: int, wrapped: bool) -> float:
+        """When the rotation's current turn began. A pass that carried the
+        rotation past its last step logs how long that turn took, so the log
+        shows whether every step comes round within its bound (loom#3119)."""
+        if not self._num(started):
+            return self.now
+        if not wrapped:
+            return started
+        _say("step rotation: a full turn of %d steps took %ds" % (count, self.now - started))
+        return self.now
 
     def _paused_steps(self, steps: Sequence[Any]) -> Set[str]:
         """The step names LOOM_PAUSED_STEPS and PAUSED_STEPS_FILE hold this
@@ -10001,6 +10080,9 @@ class Station:
         reason = self._failure_reason(lane, name)
         fix_pr = self._field(text, "Fix-PR")
         klass, bare = failure_class(reason), CLASS_RE.sub("", reason)
+        if klass == "operator" and not fix_pr:
+            self._report_operator_park(repo, number, lane)
+            return True
         if lane == "workersai" and klass == "size":
             names = _label_names(self._issue(repo, number))
             if RUNNING in names and "lane:workersai" in names:
@@ -10107,6 +10189,16 @@ class Station:
         _say("reported %s#%d failed: %s" % (repo, number, reason))
         return True
 
+    def _report_operator_park(self, repo: str, number: int, lane: str) -> None:
+        names = _label_names(self._issue(repo, number))
+        if RUNNING not in names or "lane:" + lane not in names:
+            return
+        if not needs_human(names):
+            names.append(NEEDS_HUMAN)
+        self._end_run(repo, number, names, "loom:queued")
+        # The runner already scanned and posted the question and answers.
+        self._stopped(repo, number, lane, "operator", "decision needs an operator")
+
     def _retry_factory_check(self, repo: str, number: int, lane: str, reason: str) -> None:
         note = self._retry(repo, number, lane, "transient", reason)
         if note:
@@ -10172,8 +10264,9 @@ class Station:
         return factory.timeouts_in_a_row(earlier) + 1 >= factory.TIMEOUT_STRIKES
 
     def _flag_repeated_failure(self, repo: str, number: int, lane: str, reason: str) -> bool:
-        """Hold a ticket after the same consecutive failure or three attempts in
-        six hours, and record its attempt table."""
+        """Hold a ticket after the same consecutive failure, three attempts in
+        six hours, or the failed-run cap since its last brief, and record its
+        attempt table."""
         if ending_class(reason) in NOT_WORK:
             # An incident is the factory's problem repeating, a transient or
             # limit exit is the lane's, and an expired key is the operator's:
@@ -10192,27 +10285,19 @@ class Station:
         comments = [c for c in self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
                     if isinstance(c, dict) and tickets._login(c.get("user")).lower() in authors]
         attempts = factory.attempts(comments, reason)
-        def is_work(reason: str) -> bool:
-            return not reason or failure_class(reason) not in NOT_WORK
-        work = [a for a in attempts if is_work(a[3])]
-        failures = [a[3] for a in work[:-1] if a[3]]
-        # Timeouts name their kept branch, which differs each run: one reason.
-        def same(a: str, b: str) -> bool:
-            return a == b or (factory.is_timeout(a) and factory.is_timeout(b))
-        reason_repeat = bool(failures) and same(failures[-1], reason)
-        recent = [a for a in work if a[0] >= self.now - 6 * 3600]
-        if not reason_repeat and len(recent) < 3:
+        work = [a for a in attempts if _is_work_attempt(a[3])]
+        trigger = _runaway_trigger(self.now, comments, work, reason)
+        if not trigger:
             return False
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                      {"labels": sorted(set(_label_names(issue)) | {RUNAWAY})})
-        trigger = "repeated failure reason" if reason_repeat else "three attempts within six hours"
         body = factory.runaway_comment(
             trigger, attempts, factory.issue_model(issue), factory.attempt_models(issue, comments),
-            counted=is_work)
+            counted=_is_work_attempt)
         skipped = len(attempts) - len(work)
         if skipped:
             body += ("\n\nNot counted as work attempts: %d that ended [transient], [limit], "
-                     "[auth] or [factory]." % skipped)
+                     "[auth], [factory] or [operator]." % skipped)
         self._comment(repo, number, body, notify.RUNAWAY)
         return True
 
@@ -11191,9 +11276,9 @@ class Station:
         try:
             with open(log, encoding="utf-8", errors="replace") as fh:
                 for line in fh:
-                    m = LANE_FAILED_RE.match(line.rstrip("\r\n"))
-                    if m:
-                        own = m.group(1)
+                    m = scorecard.LANE_FAILED_RE.match(line.rstrip("\r\n"))
+                    if m and m[1] == name:
+                        own = m[2]
                     m = FAILED_RE.search(line)
                     if m:
                         reason = m.group(1)
@@ -11402,6 +11487,7 @@ class Station:
                for row in rows]
             + ["", "Remote claims: muse %d/%d" % (
                 self._remote_claim_count("muse"), REMOTE_LANES["muse"]["slots"])]
+            + pace.lines(pace.read(self.s.home))
             + (pr_lines or [])
             + self._scorecard_lines()
             + (["", summary.line()] if summary is not None else []))
@@ -11504,6 +11590,8 @@ class Station:
         # Claims paused or resumed for disk republishes (loom#1808).
         values["disk"] = "paused" if self._disk_status_line() else "ok"
         values["disk watchdog"] = self._watchdog_notice() or ""
+        # A new pace verdict or slot request republishes (loom#3630).
+        values["pace"] = pace.summary(pace.read(self.s.home))
         if refresh_pr_counts:
             read_lines, read_at = self._repo_pr_lines(), self.now
             pr_lines = read_lines
@@ -14159,6 +14247,141 @@ class Station:
                 return
             page += 1
 
+    def refresh_ticket_readiness(self) -> None:
+        """Refresh an hourly batch per repo, resuming from the last ticket read."""
+        path = os.path.join(self.state, readiness.STATE_FILE)
+        saved = _read_json(path, {}, strict=False)
+        saved = saved if isinstance(saved, dict) else {}
+        repos = self._verify_repos()
+        rows = {repo: saved.get(repo) if isinstance(saved.get(repo), dict) else {}
+                for repo in repos}
+        ordered = sorted(repos, key=lambda repo: self._readiness_stamp(rows[repo]))
+        for repo in ordered:
+            if self._deferred():
+                break
+            row = rows[repo]
+            if 0 <= self.now - self._readiness_stamp(row) < readiness.EVERY:
+                continue
+            tally = readiness.Tally()
+            mark = self._requests_sent()
+            try:
+                self._refresh_repo_readiness(repo, row, tally)
+            except RateLimited:
+                raise
+            except GitHubError as err:
+                _say("readiness could not read %s: %s" % (repo, err))
+            finally:
+                self._stamp_every(row, mark)
+                _write_json(path, rows)
+                _say("readiness: " + tally.line(repo))
+
+    def _readiness_stamp(self, row: Dict[str, Any]) -> float:
+        stamp = row.get("_at")
+        return stamp if self._num(stamp) else float("-inf")
+
+    def _refresh_repo_readiness(self, repo: str, row: Dict[str, Any],
+                                tally: readiness.Tally) -> None:
+        after = row.get("after", 0)
+        after = after if type(after) is int else 0
+        issues = self._paginate("/repos/%s/issues?labels=loom:ticket&state=open&per_page=100" % repo)
+        due = sorted((issue for issue in issues if isinstance(issue, dict)
+                      and "pull_request" not in issue and type(issue.get("number")) is int
+                      and issue["number"] > after), key=lambda issue: issue["number"])
+        if due:
+            pulls = self.gh.paginate("/repos/%s/pulls?state=open&per_page=100" % repo)
+            opened = [pr for pr in pulls if isinstance(pr, dict) and pr.get("state", "open") == "open"]
+            merged = self._closed_pulls(repo)
+            apps = self._own_apps()
+            for issue in due[:readiness.PER_REPO]:
+                if self._deferred():
+                    return
+                try:
+                    self._refresh_ticket_readiness(repo, issue, opened, merged, apps, tally)
+                except RateLimited:
+                    raise
+                except GitHubError as err:
+                    _say("readiness could not check %s#%d: %s" % (repo, issue["number"], err))
+                row["after"] = issue["number"]
+        if len(due) <= readiness.PER_REPO:
+            row["after"] = 0
+
+    def _refresh_ticket_readiness(self, repo: str, issue: Dict[str, Any],
+                                  opened: Sequence[Dict[str, Any]], merged: Sequence[Dict[str, Any]],
+                                  apps: Set[str], tally: readiness.Tally) -> None:
+        number = issue["number"]
+        timeline = ([] if any(n in readiness.DONE_STATES for n in _label_names(issue))
+                    else self._paginate("/repos/%s/issues/%d/timeline?per_page=100" % (repo, number)))
+        references = self._readiness_references(timeline)
+        updates = [pr.get("updated_at") for pr in opened if _covers_pr(issue, repo, pr)]
+        updates.extend(pr.get("updated_at") for pr in references if pr.get("state") == "open")
+        delivered = self._readiness_merged(repo, issue, timeline, merged, references)
+        verdict = readiness.classify(issue, timeline, updates, self.now,
+                                     self.s.claim_idle_hours * 3600, self.s.authors, delivered, apps)
+        self._apply_readiness(repo, issue, verdict, tally)
+
+    @staticmethod
+    def _readiness_references(timeline: List[Any]) -> List[Dict[str, Any]]:
+        pulls = []
+        for event in timeline:
+            if not isinstance(event, dict) or event.get("event") != "cross-referenced":
+                continue
+            source = event.get("source")
+            pull = source.get("issue") if isinstance(source, dict) else None
+            if isinstance(pull, dict) and isinstance(pull.get("pull_request"), dict):
+                pulls.append(pull)
+        return pulls
+
+    def _readiness_merged(self, repo: str, issue: Dict[str, Any], timeline: List[Any],
+                          merged: Sequence[Dict[str, Any]],
+                          references: Sequence[Dict[str, Any]]) -> bool:
+        linked = [pr for pr in merged if _covers_pr(issue, repo, pr)]
+        known = {pr.get("number") for pr in merged}
+        linked.extend(self._readiness_older_merges(repo, issue, references, known))
+        if not linked:
+            return False
+        branch = self._default_branch(repo)
+        rejected = set(tickets.rejected_pulls(self._status_texts(repo, issue["number"])))
+        return any((pr.get("base") or {}).get("ref", branch) == branch
+                   and not _rejected_pull(pr, repo, rejected)
+                   and not tickets.merged_before_requeue(pr["merged_at"], timeline)
+                   for pr in linked)
+
+    def _readiness_older_merges(self, repo: str, issue: Dict[str, Any],
+                                references: Sequence[Dict[str, Any]],
+                                known: Set[Any]) -> Iterator[Dict[str, Any]]:
+        """Read older linked merges in full because timeline references lack the base."""
+        home = "/repos/" + repo.lower()
+        for pull in references:
+            number = pull.get("number")
+            here = str(pull.get("repository_url") or "").lower().endswith(home)
+            if (type(number) is not int or number in known or not here
+                    or not pull["pull_request"].get("merged_at") or not _covers_pr(issue, repo, pull)):
+                continue
+            known.add(number)
+            pr = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data
+            if isinstance(pr, dict) and pr.get("merged_at") and _covers_pr(issue, repo, pr):
+                yield pr
+
+    def _apply_readiness(self, repo: str, issue: Dict[str, Any], verdict: readiness.Verdict,
+                         tally: readiness.Tally) -> None:
+        number = issue["number"]
+        ready = readiness.marker_change(verdict, issue)
+        done = verdict.kind == readiness.DONE
+        had_done = readiness.DONE_MARKER in _label_names(issue)
+        path = "/repos/%s/issues/%d/labels" % (repo, number)
+        for marker, remove in ((readiness.READY_MARKER, ready == "remove"),
+                               (readiness.DONE_MARKER, had_done and not done)):
+            if remove:
+                self.gh.rest("DELETE", path + "/" + quote(marker, safe=""), ok=(404,))
+        if verdict.kind == readiness.CLEAR_CLAIM:
+            login, label = next(iter(stale_claims.own_claims(issue, self.s.authors).items()))
+            self._drop_own_claim(repo, issue, {login: label})
+            tally.add(repo, verdict)
+        elif ready == "add" or (done and not had_done):
+            marker = readiness.READY_MARKER if ready == "add" else readiness.DONE_MARKER
+            self.gh.rest("POST", path, {"labels": [marker]})
+            tally.add(repo, verdict)
+
     def release_stale_claims(self) -> None:
         """Take back another operator's claims their claimer left alone for
         claim_idle_hours (bus/stale_claims.py): remove the claim label and
@@ -14584,8 +14807,8 @@ class Station:
                 break
             timeline = self._paginate("/repos/%s/issues/%d/timeline?per_page=100" % (repo, number))
             due = {login: label for login, label in stale_claims.own_claims(issue, ours).items()
-                   if stale_claims.lapsed(issue, timeline, pulls.get(number, []), label,
-                                          self.now, idle, apps)}
+                   if readiness.claim_lapsed(issue, timeline, pulls.get(number, []), login,
+                                             label, self.now, idle, apps)}
             if due:
                 self._drop_own_claim(repo, issue, due)
                 lapsed += 1
@@ -19191,6 +19414,10 @@ class Station:
             except (GitHubError, OSError, runners.ReportError) as err:
                 _say("tend_runners failed: %s" % err)
             try:
+                self._timed(self.tend_lane_feed)
+            except (OSError, runners.ReportError) as err:
+                _say("tend_lane_feed failed: %s" % err)
+            try:
                 self._timed(self.tend_remote_checks)
             except RateLimited:
                 raise
@@ -19347,6 +19574,9 @@ class Station:
             records = usage.collect(self.s.home, now=self.now)
             usage.write(self.s.home, records)
             self.upload_usage_limits(records)
+            waits = _read_json(os.path.join(self.state, "ticket-waits.json"), {}, strict=False)
+            pace.write(self.s.home, pace.plan(self.s.home, records, pace.queued(waits),
+                                              os.environ, self.now))
         except OSError as err:
             _say("could not write usage limits: %s" % err)
         try:
@@ -19389,6 +19619,37 @@ class Station:
             actor = None
         runners.Runners(self.gh, self.s.home, repo, slots, dict(os.environ), self._public, _say,
                         actor=actor, now=self.now).tend()
+
+    def tend_lane_feed(self) -> None:
+        """The slots in LOOM_POD_FEED_SLOTS: offer their briefs to lane pods
+        on other nodes through the lane_feed table and mirror back each
+        pod's heartbeat and outcome (bus/lane_feed.py). On the shared
+        backend the pods' grants are reconciled every pass: an empty setting
+        revokes them all, and so does a bad one (fail closed). An unreadable
+        row is logged and feeds nothing this pass; a lost lease still stops
+        the pass."""
+        env = dict(os.environ)
+        store = state_store.active()
+        rows = None
+        try:
+            try:
+                slots = lane_feed.feed_slots(env)
+            except ValueError as err:
+                _say("lane feed: %s; no lane pod keeps a grant" % err)
+                env.pop(lane_feed.SLOTS_SETTING, None)
+                slots = {}
+            if not slots and state_store.backend_name(env) != "postgres":
+                return
+            rows = lane_feed.station_rows(env, self.s.home)
+            lane_feed.Feed(self.s.home, env, rows, _say, now=self.now,
+                           lease=getattr(store, "lease", None)).tend()
+        except station_lease.LeaseLost:
+            raise
+        except (ValueError, state_store.StateError) as err:
+            _say("lane feed: %s" % err)
+        finally:
+            if rows is not None:
+                rows.close()
 
     def tend_remote_checks(self) -> None:
         """Dispatch the check requests lanes filed under LOOM_REMOTE_CHECKS and

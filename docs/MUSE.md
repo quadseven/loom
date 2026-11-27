@@ -522,6 +522,48 @@ this tick"; a step with no note shows nothing there. Each step call records
 when that step started and when the previous one ended, and prints the
 tick's elapsed line first (Rules, 11): read it before deciding what fits.
 
+### Report budget turn
+
+After status and resume, before merge work, run
+`python3 -m bus.brain report-plan --state REPORT_STATE.json --holder muse
+--owed OWNER/NAME#N OWNER/NAME#M` with the goal refs listed as owing reports.
+Use one durable local queue file across ticks, outside a checkout that is
+cleaned; the lane machine wrapper supplies and preserves its own file.
+Pass `--owed` once for each fresh status result, never repeat an old list
+after acknowledging its reports. A partial read adds the reports it found
+without removing any already queued.
+
+The JSON offers one `report` at a time, its `seconds_left` and absolute
+`report_until` deadline. Before drafting, check that goal's current report
+state. Use `--done OWNER/NAME#N` only after the report was posted or edited
+successfully, or a fresh read proves it no longer owes one (another brain
+posted it, it became quiet, or it closed). A `not posted:` response alone
+is not proof. A failed post, timeout, or unread goal stays queued. Follow
+the report format in step 10 and keep the minimum report gap unchanged.
+
+Call the same command without `--owed` before each report and after each
+successful post with `--done`. Drafting, reads and posting all count toward
+the deadline; bound each command timeout by `seconds_left`. Stop reports
+at `report_until`, even mid-draft. The helper caps this turn at half the
+tick's total time and at half the time left before its existing work cutoff,
+whichever is shorter. Calling it again never resets that deadline.
+
+When `report` is null, or the report deadline arrives, take the returned
+`work` turns in order: verify, brief, triage, sweep. Each has a `seconds`
+allowance and an absolute `until` deadline. Attempt each step using its
+instructions below, record it with `step NAME`, and stop each turn at its
+deadline so the next gets a chance. Record nothing-to-do or missing-evidence
+notes honestly. These turns take priority over other work; do not spend
+their allowance finishing reports or merges. Then continue the remaining
+steps without repeating those already attempted. The tick's stop is unchanged.
+
+Before journaling, read the plan again without `--owed` and copy its
+`journal_line`, `- Reports deferred: N`, into the tick journal. Do not start
+more reports during journaling. Unacknowledged reports remain in the queue,
+oldest first, for the following tick, even if its status read is partial.
+
+### Steps
+
 1. Run `python3 -m bus lock quadseven/loom --holder muse --minutes 30 --wait 5`.
    Run it in the foreground and wait for it to finish. Read the exit code
    and stdout line together from that invocation. Ignore holder strings in
@@ -567,8 +609,9 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    for the named repos alone. Read the lane status and,
    for each goal, its latest journal, report, measurement and completed
    action, and its report deadline. Every goal under "Reports owed before
-   unlock" gets its report in the report step this tick, in every scope,
-   including live. Reports go out twice a day, for the operator's reading
+   unlock" enters the report budget turn in every scope, including live;
+   reports the cap does not reach remain queued for the next tick. Reports
+   go out twice a day, for the operator's reading
    times, 10:00 and 21:00 New York: a report is owed from 2 hours 15
    minutes before the next reading time after the last one. If the brain
    has not written it, the station posts the data-only report 15 minutes
@@ -924,7 +967,8 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    brain's two ticks in a row carry such a line (docs/LANES.md, Invariants).
    Twice a day per goal (when status lists the goal under "Reports owed
    before unlock" as due, overdue or heartbeat; a quiet goal and a backlog
-   goal are not listed and get no report), also post the report: a separate comment on the goal
+   goal are not listed and get no report), the report budget turn posts a
+   separate comment on the goal
    home, written with the same command, whose file starts with the line
    `<!-- loom:report v1 -->` followed by the report itself, written as a
    standup the operator can read in thirty seconds on a phone. It is the
@@ -996,9 +1040,10 @@ nothing, and a ticket without one gets a lane like any other. The factory
 gives each ticket the first free lane of one list, cheapest first (the
 tuple `LANE_ORDER` in bus/factory.py):
 
-- Every ticket: `spark` to `spark-4` first (own hardware, the operator's
-  priority since 2026-10-17: two slots per Spark box, `LOOM_SPARK_URL` and
-  `LOOM_SPARK_2_URL` to `LOOM_SPARK_4_URL`, Nemotron 3.5 Super VL on vLLM,
+- Every ticket: `spark` to `spark-8` first (own hardware, the operator's
+  priority since 2026-10-17: eight slots shared by both Spark boxes through
+  the spark-gateway, `LOOM_SPARK_URL`, and `LOOM_SPARK_2_URL` to
+  `LOOM_SPARK_8_URL` each falling back to it, Nemotron 3.5 Super VL on vLLM,
   model `spark/...`, any repo, private ones included); then the free lanes
   (the operator wants every free tier used up, 2026-10-19): one slot per
   free provider (`free-ollama`, `free-gemma`, `free-nvidia`, `free-kilo`,
@@ -1018,14 +1063,16 @@ lane. Quotas and lane limits still apply.
 
 Codex runs gpt-6-luna only and agy the gemini-3.8-flash family only (the
 operator, 2026-10-21). A ticket with no `Model:` line runs its lane's
-default; the table `HARD_MODELS` in bus/factory.py is empty,
-and so is `EQUIVALENTS`: a ticket pinned to claude-opus-5-5 waits for an
-Anthropic lane and never goes to agy on an equivalent. A queued ticket whose
-pin is a default, not a hard pin, takes the first free lane with that
-lane's own model once its model had no free lane for
-`LOOM_PIN_FALLBACK_MINUTES` (docs/BRAIN.md, Tickets no lane takes). A `Model:` line naming gpt-6-sol or a
-gemini-4-argon model reads as gpt-6-luna or gemini-3.8-flash-high, and the
-brain writes the same stand-in (`FORBIDDEN_MODELS` in bus/tickets.py).
+default. The `HARD_MODELS` and `EQUIVALENTS` tables in bus/factory.py are
+empty. The factory tries the pinned model first. A queued ticket with a
+default pin takes the first eligible free local lane by cost, using that
+lane's own model, after `LOOM_PIN_FALLBACK_MINUTES` without a free lane for
+the pinned model. Fallback applies regardless of who opened the ticket. It
+skips tickets labeled `class:sensitive` or `tier:security` and pins set by
+the model ladder (docs/BRAIN.md, Tickets no lane takes).
+A `Model:` line naming gpt-6-sol or a gemini-4-argon model reads as
+gpt-6-luna or gemini-3.8-flash-high, and the brain writes the same stand-in
+(`FORBIDDEN_MODELS` in bus/tickets.py).
 
 A ticket off a lane at a limit or down takes the first free other lane of
 the list, keeping private repos off the public-only lanes. With every other

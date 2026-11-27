@@ -64,6 +64,15 @@ class ReadHistory(unittest.TestCase):
         comments = [comment(history.rung_marker(1)), CLAIM, comment(history.rung_marker(2))]
         self.assertEqual(history.read_history(comments, TRUSTED).tried_rungs, {1})
 
+    def test_an_operator_park_ends_the_claim_without_spending_its_rung(self):
+        comments = [comment(history.rung_marker(2)), CLAIM,
+                    comment("Lane codex stopped: [operator] decision needs an operator", at=LATER)]
+        found = history.read_history(comments, TRUSTED)
+        self.assertEqual(found.rung, 2)
+        self.assertEqual(found.tried_rungs, set())
+        self.assertEqual([attempt[3] for attempt in found.attempts],
+                         ["[operator] decision needs an operator"])
+
     def test_attempts_carry_the_ending_that_followed_each_claim(self):
         comments = [
             comment("Claimed for lane codex (body sha256 0123456789ab)"),

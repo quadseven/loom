@@ -181,6 +181,8 @@ class FakeGitHub:
             if number not in self.issues:
                 return Response(404, {"message": "Not Found"})
             return Response(200, self.issues[number])
+        if re.search(r"/pulls\?state=closed&sort=updated&direction=desc&per_page=100$", path):
+            return Response(200, [p for p in self.pulls.values() if p.get("state") == "closed"])
         m = re.search(r"/pulls/(\d+)$", path)
         if m:
             return Response(200, self.pulls[int(m.group(1))])
@@ -2729,7 +2731,7 @@ class ReviewBotThreads(Base):
         self.assertNotIn(("RESOLVE", "PRRT_1", None), self.gh.writes)
         self.assertEqual(self.merged, [])
 
-    def stuck_case(self, author, lane="codex", model=None):
+    def stuck_case(self, author, lane="codex", model=None, new_marking=None):
         """Ticket 5's last round asked about a finding at a.py:3; the open
         thread, under a new id, holds the same rule at a.py:5."""
         self.gh.ticket(5, "pr", lane=lane)
@@ -2741,10 +2743,19 @@ class ReviewBotThreads(Base):
         })
         if author is None:
             self.gh.pull(50, 5, green=False)
+            title = "Elder markings - 1 blocking, 1 total"
+            row = "| high | - | `a.py` | 24 | `%s` | %s |"
+            old_marking = row % ("missing-return", "The empty-input branch returns None.")
+            current = row % ("dropped-result", new_marking) if new_marking else old_marking
             self.gh.runs["sha50"][1].update(conclusion="failure", output={
-                "title": "Elder markings - 1 blocking, 1 total",
+                "title": title,
+                "summary": "## Markings Board\n\n" + current,
             })
-            finding = "### Check: %s\n\n    A blocking finding" % factory.DEFAULT_REVIEW_CHECK
+            finding = ("### Check: %s\n\n    %s\n    ## Markings Board\n\n    %s"
+                       % (factory.DEFAULT_REVIEW_CHECK, title, old_marking))
+            if new_marking is not None:
+                self.gh.runs["sha50"][0].update(name="lint", conclusion="success")
+                finding += "\n\n### Check: lint\n\n    Missing return type."
         else:
             self.gh.pull(50, 5, resolved=False)
             self.thread((author, "high | `rule-x` | quick win"))
@@ -2802,6 +2813,12 @@ class ReviewBotThreads(Base):
         self.run_second_review_rung(author=None)
         self.assertEqual(self.fixed, [])
         self.assertIn("needs-brain", [label["name"] for label in self.gh.issues[5]["labels"]])
+
+    def test_a_new_check_only_review_finding_does_not_climb_the_ladder(self):
+        self.stuck_case(None, new_marking="The new retry branch drops the result.")
+        self.assertEqual(factory.rung_of(self.gh.comments[5]), 0)
+        self.assertEqual(self.lane(5), "codex")
+        self.assertEqual([item[0] for item in self.fixed], [50])
 
     def test_a_stuck_send_back_past_the_last_rung_goes_to_the_hand_off_pool(self):
         self.stuck_case(BOT, lane="claude", model="claude-opus-5-5")
@@ -3739,7 +3756,7 @@ class EveryLaneTriesEveryTicket(Base):
     def test_one_lane_list_ordered_by_cost(self):
         kinds = [factory.KINDS.index(factory.lane_kind(x)) for x in factory.LANE_ORDER]
         self.assertEqual(kinds, sorted(kinds))
-        self.assertEqual(factory.LANE_ORDER[:4], factory.SPARKS)
+        self.assertEqual(factory.LANE_ORDER[:len(factory.SPARKS)], factory.SPARKS)
         self.assertEqual(factory.LANE_ORDER[-len(factory.ANTHROPIC):], factory.ANTHROPIC)
         self.assertEqual(len(set(factory.LANE_ORDER)), len(factory.LANE_ORDER))
         paid = [x for x in factory.LANE_ORDER if factory.lane_kind(x) == "subscription"]
@@ -4441,7 +4458,7 @@ class Tickets(Base):
         self.assertNotIn("opencode-go-4", factory.lanes_for(True))
 
     def test_a_private_easy_ticket_goes_to_spark_2_when_spark_is_busy(self):
-        self.assertEqual(factory.lanes_for(True)[:4], factory.SPARKS)
+        self.assertEqual(factory.lanes_for(True)[:len(factory.SPARKS)], factory.SPARKS)
         self.gh.private = True
         self.limited_easy(limited=("spark",))
         self.assertEqual(self.lane(7), "spark-2")
@@ -4451,9 +4468,10 @@ class Tickets(Base):
         # free provider slots: on a private repo only the two allowed private
         # code, then opencode-go: the free lanes openrouter and workersai take
         # public repos only (loom#2358).
-        self.assertEqual(factory.LANE_ORDER[:4], factory.SPARKS)
-        self.assertEqual(factory.LANE_ORDER[4:10], factory.FREE_POOL)
-        self.assertEqual(factory.lanes_for(True)[4:7],
+        self.assertEqual(factory.LANE_ORDER[:len(factory.SPARKS)], factory.SPARKS)
+        n = len(factory.SPARKS)
+        self.assertEqual(factory.LANE_ORDER[n:n + 6], factory.FREE_POOL)
+        self.assertEqual(factory.lanes_for(True)[n:n + 3],
                          ("free-ollama", "free-gemma", "opencode-go"))
 
     def test_a_slot_on_cluster_runners_never_takes_a_private_repos_ticket(self):
@@ -4997,6 +5015,31 @@ class Helpers(unittest.TestCase):
         with mock.patch("bus.factory._say") as say:
             self.assertIsNone(f._association(REPO, other))
         say.assert_not_called()
+
+    def test_ticket_references_to_multiple_repos_have_no_association_or_log(self):
+        f = factory.Factory(FakeGitHub(), [REPO], NOW)
+        for repos in ((REPO, "example-org/other-repo"),
+                      ("example-org/other-repo", "example-org/third-repo")):
+            for branch in ("pin-image", "loom/7-update"):
+                with self.subTest(repos=repos, branch=branch):
+                    pr = {"number": 50, "body": "Refs %s#5\nRefs %s#6\n" % repos,
+                          "head": {"ref": branch}}
+                    with mock.patch("bus.factory._say") as say:
+                        self.assertIsNone(f._association(REPO, pr))
+                    say.assert_not_called()
+
+    def test_a_merged_pull_request_has_no_association_or_log(self):
+        f = factory.Factory(FakeGitHub(), [REPO], NOW)
+        bodies = ("Refs #5", "Refs #5\nRefs #6", "Refs %s#5" % REPO,
+                  "Refs %s#5\nRefs %s#6" % (REPO, REPO))
+        for merged in ({"merged_at": iso(0)}, {"merged": True}):
+            for body in bodies:
+                with self.subTest(merged=merged, body=body):
+                    pr = dict(merged, number=50, state="closed", body=body,
+                              head={"ref": "pin-image"})
+                    with mock.patch("bus.factory._say") as say:
+                        self.assertIsNone(f._association(REPO, pr))
+                    say.assert_not_called()
 
     def test_conflicting_ticket_references_still_log_their_line(self):
         f = factory.Factory(FakeGitHub(), [REPO], NOW)

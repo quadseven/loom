@@ -26,6 +26,8 @@ class PausedStepsTest(unittest.TestCase):
         self.addCleanup(folder.cleanup)
         self.st = station.Station.__new__(station.Station)
         self.st.state = folder.name
+        self.st.gh = mock.Mock(target=None)
+        self.st.now = 1000.0
         self.ran = []
         env = mock.patch.dict(os.environ, {}, clear=False)
         env.start()
@@ -88,7 +90,7 @@ class PausedStepsTest(unittest.TestCase):
         os.environ["LOOM_PAUSED_STEPS"] = "triage_backlogs"
         self.run_steps()
         rotation = station._read_json(os.path.join(self.st.state, station.STEP_ROTATION_FILE), {})
-        self.assertEqual(rotation, {"next": 0, "carried": None})
+        self.assertEqual((rotation["next"], rotation["carried"]), (0, None))
 
 
 if __name__ == "__main__":

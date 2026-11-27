@@ -22,9 +22,11 @@ never merges. Heartbeats usage + model catalog to `state/usage/<lane>.json`.
   list. Unpinned briefs use the first model not currently limited. A provider
   quota records a reset for that model; the lane remains available while
   another model is ready. A brief with a Model: line always keeps that model.
-  (Before a brief is written, the factory may take a default pin off a
-  queued ticket whose model had no free lane for `LOOM_PIN_FALLBACK_MINUTES`;
-  docs/BRIEF_FORMAT.md says which pins are hard.)
+  Before it writes a brief, the factory can drop a queued ticket's default
+  model pin after `LOOM_PIN_FALLBACK_MINUTES` without a free lane for that
+  model. Fallback applies regardless of who opened the ticket. It skips
+  tickets labeled `class:sensitive` or `tier:security` and pins set by the
+  model ladder (see docs/BRIEF_FORMAT.md).
   Account-wide out-of-credit limits still hold the lane. The heartbeat names
   each limited model and the epoch it lifts (`limited_models`); the station
   claims no ticket for that model on the lane until then, and the factory
@@ -36,7 +38,9 @@ never merges. Heartbeats usage + model catalog to `state/usage/<lane>.json`.
 ## How a lane is told to work
 
 After its brief, every agent gets a "How to work" note (lanes/run_lane.sh
-`work_note`): work test-first (write the failing test, see it fail, fix,
+`work_note`): read the ticket, check its premise in the current code, and
+cite what it read in the Intent summary if there is no change to make.
+Then work test-first (write the failing test, see it fail, fix,
 see it pass), run the full suite or the validation check before finishing,
 follow the review bot's checklist (new functions under cyclomatic
 complexity 15, no swallowed errors, no dead code, docs in step, ASCII
@@ -82,6 +86,31 @@ use the documentation ranges `192.0.2.0/24`, `198.51.100.0/24`, or
 `203.0.113.0/24`; add `leak-guard-allow` on a line only when a deliberate
 range bound must appear.
 
+### Blocked build decisions
+
+For a new public-repo build, a local Codex or Claude subscription lane can
+ask its runner to resolve a reversible code ambiguity. The runner adds the
+scratch file path and JSON format to the work prompt. The agent supplies one
+question, the public context, two concrete options, and the number of its
+preferred option. Money, hardware, host changes, account access, credentials,
+physical work, and policy decisions take the operator path directly.
+
+The runner scans the packet with the public leak guard before sending the
+same question, context, and options to the other subscription model through
+`lanes/rewrite_agent.sh`. The second model receives those three fields and
+returns its own selection. The peer uses `LOOM_CLAUDE_MODEL` for Codex builds
+and `LOOM_CODEX_MODEL` for Claude builds. It uses the rewriter's existing
+sign-in configuration, including `LOOM_REWRITE_CLAUDE_TOKEN_SSM` for Claude.
+The model call has a 90-second cap. A missing, unreachable, or invalid second
+answer is a transient stop.
+
+When the selections match, the lane continues once in the same checkout.
+The run log and the pull request's `Lane decision` section name both models
+and their answers. Disagreement and operator-only requests park the run. The
+sticky park comment gives the question and any answers that passed the scan.
+The station releases the claim and queues the ticket with `needs:human` until
+an operator answers.
+
 ## Validation contract
 
 A repo opts in with `.loom/validation.conf`, the same steps its CI runs:
@@ -112,6 +141,20 @@ parks the brief as `validation failed: the affected check exited N` and
 pushes nothing, and its record is the `affected` phase. A lane pull request
 in the deploy repo passed its check and went red in CI on two such suites
 (loom#1773).
+
+`autoformat` is optional too: a formatter command, such as
+`autoformat: uvx ruff@0.15.10 format`. After the agent's commit passes the
+scope and contract checks, and before the final check on the host or the
+remote check, the runner runs it once in the check sandbox with the files
+the lane's own commits changed (and that still exist) appended, shell-quoted.
+What it changes in those files becomes one `format:` commit; anything else it
+touches is restored. A formatter that fails, is missing or times out is
+logged as `autoformat: ...`, the files are restored and the run goes on to
+the check unchanged; it never parks a run. The command is the base's, and a
+run that changes `.loom/validation.conf` skips the step, so a run never names
+its own formatter. A remote check keeps no log a lane can format from, so
+before this a run whose only defect was formatting was thrown away there
+(loom#3577).
 
 A successful contract command proves its exit status, not coverage of the
 changed paths. The contract has no path-to-check mapping. PR bodies and
@@ -150,7 +193,8 @@ The runner's reader (`bus/contract.py`) also accepts a list of
 `<kind> | <command>` lines, or `[kind]`, `[kind.name]` and `[[kind]]` tables
 with a `command = "..."` key, for the kinds lint, format, type and test. It
 joins the commands, in that order, into one `check`. The kind `affected`
-(`affected | <command>`, `[affected]`) becomes the `affected` command instead.
+(`affected | <command>`, `[affected]`) becomes the `affected` command instead,
+and the kind `autoformat` the `autoformat` command.
 List only commands that run on a lane machine with no secrets, simulators or
 unset variables.
 
@@ -286,6 +330,18 @@ unset variables.
     none gets uv's default Python when its contract runs `uv` or `uvx` and
     none is installed yet. Every check and agent reads them; none may write
     them.
+  - `LOOM_CHECK_PYTHONS` (default `3.12 3.13 3.14`, space separated) is a
+    baseline the runner installs beside the tree's versions, in the same
+    install under `locks/python.lock` (loom#3602). A tree may declare no
+    Python and still run `uv run --python 3.12` in its check scripts; with
+    downloads off, that failed every base check. Each entry must be a plain
+    version (`3`, `3.12`, `3.12.7`); any other entry is logged and ignored.
+    A version already under `python/` (a `cpython-<version>.*` or
+    `cpython-<version>-*` directory, not a `+freethreaded` or other `+`
+    variant) is not asked for again, so a warm directory runs no install.
+    An empty value turns the baseline off. `python/` lives on the pod's
+    `run/` volume, so a restarted pod installs the baseline again on its
+    first check.
   - `locks/<owner>_<name>.lock`: a check holds its repo's lock shared while
     it runs.
   The check home keeps the per-slot HOME and TMPDIR and holds no uv cache or
@@ -442,11 +498,15 @@ result artifact: the exit code and up to twenty failing test names.
   `remote-check.yml` on `main` as a `workflow_dispatch` triggered by the
   station's own App, and its conclusion agrees with the artifact. Any other
   run is ignored, and the lane runs the check on the host.
-- **Base check.** When the base commit's GitHub checks already passed (those
-  repos do run CI on a push to their default branch; the test
-  `github_checks_green` gives a host-only red), the base check is not run and
-  takes no slot. Any other state runs it on the host as before. The `setup`
-  step still runs on the host, since the agent works in that tree.
+- **Base check.** When the base commit's GitHub checks already passed, the
+  base check is not run and takes no slot. Public-repo fix rounds also read
+  completed GitHub checks for the pull request head saved before merging the
+  default branch, including on cluster runners. A red fix-head verdict still
+  goes through the default-branch check before the agent can start.
+  Missing, pending or unreadable checks
+  fall back to the host check. The validation record names GitHub or the
+  host as the verdict source. The `setup` step still runs on the host, since
+  the agent works in that tree. The fix round's final check stays on the host.
 - **Final check.** A new run does the pre-push gates, pushes its work branch
   (fast-forward only, never the default branch, after the leak scans), then
   asks for the remote check and waits, bounded: `LOOM_REMOTE_CHECK_WAIT`
@@ -1881,8 +1941,15 @@ with no reload. A bulk cleanup uses it so its relabels and moves draw no bot
 comments. Each paused step logs `step <name> paused (LOOM_PAUSED_STEPS)` once a
 pass and counts as done, so the rotation moves on and nothing carries over. A
 name that is not a pass step logs `unknown paused step <name>, ignored` and
-pauses nothing. The rotating steps and the scheduled metrics step can be
-paused through `Station._run_steps`.
+pauses nothing. The rotating steps (`Station._loop_steps`) and the scheduled
+metrics step can be paused.
+
+The step loop keeps `STEP_LOOP_SHARE` (half) of the pass request target past
+whatever the steps before it spent (loom#3119): it runs until the larger of the
+target and the count at its start plus that share. The budget floor still stops
+it. Each time the rotation passes its last step the station logs
+`step rotation: a full turn of <n> steps took <s>s`, and
+`state/station/step-rotation.json` keeps the turn's start as `turn_started`.
 
 ## Log watch
 
@@ -2327,6 +2394,11 @@ cannot query the viewer or any other local service.
   endpoint. zai and zen have no meter: Z.ai documents no usage endpoint for
   API keys (its quota monitor covers the GLM Coding Plan only) and Zen's free
   models take no key, so Usage says "no meter: provider exposes no usage".
+  A codex lane reads no provider: on the same heartbeat, and after each run,
+  it copies the newest 5-hour and weekly readings from `CODEX_HOME/sessions`
+  into `state/usage/<slot>.meter.json` (`python3 -m bus.meter
+  --codex-sessions`), so a station that cannot see that Codex home still
+  records Codex usage (loom#3630).
 
 ### One slot on opencode 2.0
 
@@ -2939,8 +3011,70 @@ low, medium, high, xhigh or max) sets a codex lane run's reasoning effort with
 `-c model_reasoning_effort=...` over the Codex home's `config.toml`; unset, the
 config's own setting applies. A brain run ignores it.
 
-A long-lived lane pod takes no work from the station. Lane runs on the
-cluster go through ephemeral runners instead (next section).
+A lane pod on the station's own disk takes work from that disk. A lane pod
+on another node takes it from the station's database (next section).
+Ephemeral lane runs go through cluster runners ("Lanes on cluster runners").
+
+### Lane pods fed by the station
+
+A slot named in `LOOM_POD_FEED_SLOTS` on the station runs in a lane pod on
+any node that reaches the station's database, not on the station's disk
+(`bus/lane_feed.py`, loom#3621). The setting is `slot=role` pairs, space- or
+comma-separated, empty by default: each slot with the database role of the
+one pod that runs it. The one station stays the only claimer. With the
+setting empty nothing is offered, written or read, and every lane works as
+before.
+
+- The station claims the ticket and writes its brief to the slot's inbox as
+  for any lane. Each pass it offers the slot's next brief, one at a time, as
+  the slot's `offer` row in the `lane_feed` table, addressed to the slot's
+  role.
+- The pod runs `pod.sh` with `LOOM_POD_FEED=1`. Each round first runs
+  `python3 -m bus.lane_feed sync <slots>`: it writes each slot's heartbeat,
+  side files and keepalive stamp (`beat`), writes a finished run's files
+  (`report`: the brief's move to done/ or failed/, its logs and answers, as
+  a cluster runner's report carries them), and takes the next brief offered
+  to it into its own inbox (`claim`). Then `run_lane.sh` runs it as usual.
+  Its output goes to `logs/lane-feed.log`.
+- Lane pods run agent code, so they are trusted less than the station. A
+  pod connects as a role of its own (`LOOM_LANE_DB_HOST`, `LOOM_LANE_DB_NAME`,
+  `LOOM_LANE_DB_USER`, `LOOM_LANE_DB_PASSWORD`), never the station's, and
+  that role is granted `SELECT, INSERT, UPDATE` on `lane_feed` and `SELECT`
+  on `lane_feed_grant` only, never `loom_state` or `station_lease`. The
+  station owns both tables and makes them on first use, with row-level
+  security on `lane_feed`: a role reads only the rows of the slots
+  `lane_feed_grant` gives it, and writes only their `claim`, `beat` and
+  `report` rows, as itself. Each row records its writer as the database
+  sets it (`current_user`). On the shared backend the station keeps
+  `lane_feed_grant` equal to its setting every pass, so a pod dropped from
+  it loses its rows at once; an empty setting revokes every grant, and so
+  does one it cannot read (fail closed, with a log line).
+- The station believes a pod's row only when the slot's role wrote it, and
+  applies a report only when that role also wrote the claim of the offer
+  the report answers. A pod takes only an offer addressed to it. Moving a
+  slot to another role withdraws its open offer.
+- The station mirrors the pod's heartbeat and keepalive stamp into its own
+  `state/usage/`, so the slot is free, busy, limited or silent exactly as a
+  local slot is. It applies a report with the cluster runner's own checks
+  (`Runners.apply`): a file outside the run refuses the whole report and
+  parks the brief `[transient]`, as does a run that ended without moving
+  its brief.
+- A pod that stops pushing lets its heartbeat and stamp age. After
+  `SILENT_MAX` the factory moves its running ticket as it moves a silent
+  local lane's, the station returns the brief, and its next pass withdraws
+  the offer. A revived pod moves an unstarted withdrawn brief to
+  `returned/`, and the station ignores a late report.
+- The station uses the table when `LOOM_STATE_BACKEND=postgres`, through
+  its own `LOOM_DB_*`. On the file backend the rows are files below the
+  station's loom home, a pod shares that home (`LOOM_POD_FEED_HOME`) and
+  names itself with `LOOM_POD_NAME`; nothing is authorized there, so it
+  serves one host and the tests only.
+- The station's lease fences its offer writes: on Postgres each is one
+  statement that needs the lease row at the station's epoch. A fed slot is
+  never held by the station host's load, and is not a cluster runner slot
+  (a slot in both settings is refused). Pod clocks are trusted as runner
+  clocks are.
+- Needs the operator: a database role per lane pod with the grants above.
 
 ## Lanes on cluster runners
 

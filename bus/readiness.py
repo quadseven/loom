@@ -21,8 +21,8 @@ classify() is a pure read of one ticket and returns one Verdict:
                  operator's claim, a run in progress, a wait label, a
                  non-ticket
 
-The station step that applies a Verdict and tallies it per repo is a later
-slice. To inspect a ticket offline, run `python3 -m bus.readiness < ticket.json`.
+The station applies the verdicts periodically and reports changes per repo.
+To inspect a ticket offline, run `python3 -m bus.readiness < ticket.json`.
 The file holds one JSON object with the keyword arguments to classify(). The
 command prints one JSON object with the verdict's kind and reason.
 """
@@ -33,10 +33,14 @@ import json
 import sys
 from typing import Any, Dict, Iterable, List, NamedTuple, Optional
 
-from . import human_claims, stale_claims
+from . import claim_referee, criteria_gate, human_claims, proof, stale_claims
 
 # loom:ready is taken: it marks a pull request ready to merge (bus/labels.py).
 READY_MARKER = "loom:pickable"
+DONE_MARKER = "loom:readiness-done"
+EVERY = 3600
+PER_REPO = 40
+STATE_FILE = "ticket-readiness.json"
 
 READY = "ready"
 CLEAR_CLAIM = "clear-claim"
@@ -49,9 +53,13 @@ KINDS = (READY, CLEAR_CLAIM, HAS_PR, NEEDS_PERSON, DONE, HELD)
 # State labels that mean the work was built (docs/SDLC.md life cycle).
 DONE_STATES = ("loom:merged", "loom:shipped", "loom:verified")
 # Labels that mean a person owes the next move.
-PERSON_LABELS = ("loom:human", "needs:human")
+PERSON_LABELS = ("loom:human", "needs:human", "needs-operator")
 RUNNING_STATES = ("loom:briefed", "loom:running", "loom:pr", "loom:answered",
                   "loom:answer-pending", "loom:landing")
+HOLD_LABELS = ("blocked", "needs-brain", "loom:held", "loom:triage",
+               "loom:failed", "loom:closed-unmerged", "loom:runaway",
+               "loom:awaiting-evidence", "awaiting-live-check", "loom:verify-handoff",
+               "handoff:claude")
 
 
 class Verdict(NamedTuple):
@@ -68,7 +76,8 @@ def _early(issue: Dict[str, Any], names: List[str], events: List[Dict[str, Any]]
            merged_pull: bool) -> Optional[Verdict]:
     """The verdicts that need no claim read: not a ticket, done, held for
     outside work, or waiting on a person."""
-    if "pull_request" in issue or "loom:ticket" not in names:
+    if ("pull_request" in issue or "loom:ticket" not in names
+            or any(n in names for n in ("epic", "loom:goal", "wayfinder:map"))):
         return Verdict(HELD, "not a ticket")
     if merged_pull or any(n in DONE_STATES for n in names):
         return Verdict(DONE, "the work is already merged or shipped")
@@ -80,6 +89,17 @@ def _early(issue: Dict[str, Any], names: List[str], events: List[Dict[str, Any]]
     return None
 
 
+def claim_lapsed(issue: Dict[str, Any], timeline: Iterable[Any], pulls: Iterable[Any],
+                 login: str, label: str, now: float, idle_seconds: float,
+                 own_apps: Iterable[str]) -> bool:
+    """Apply the idle policy while honoring a person's hold or a stated wait."""
+    events = [event for event in timeline if isinstance(event, dict)]
+    until = claim_referee.wait_until(events, (login,))
+    return (idle_seconds > 0 and not human_claims.holder(issue, events)
+            and (until is None or now >= until + claim_referee.GRACE)
+            and stale_claims.lapsed(issue, events, pulls, label, now, idle_seconds, own_apps))
+
+
 def _claimed(issue: Dict[str, Any], names: List[str], events: List[Dict[str, Any]],
              pulls: List[Any], now: float, idle_seconds: float,
              own_logins: Iterable[str], own_apps: Iterable[str]) -> Optional[Verdict]:
@@ -87,11 +107,12 @@ def _claimed(issue: Dict[str, Any], names: List[str], events: List[Dict[str, Any
     another operator's."""
     own = stale_claims.own_claims(issue, own_logins)
     if own:
-        label = next(iter(own.values()))
-        if stale_claims.lapsed(issue, events, pulls, label, now, idle_seconds, own_apps):
+        login, label = next(iter(own.items()))
+        if claim_lapsed(issue, events, pulls, login, label, now, idle_seconds, own_apps):
             return Verdict(CLEAR_CLAIM, "its claim saw no activity within the idle limit")
         return Verdict(HELD, "claimed and active")
-    if stale_claims.claim_labels_not_ours(names, own_logins) or issue.get("assignees"):
+    if (stale_claims.claim_labels_not_ours(names, own_logins)
+            or issue.get("assignees") or issue.get("assignee")):
         return Verdict(HELD, "another operator holds it")
     return None
 
@@ -113,8 +134,14 @@ def classify(issue: Dict[str, Any], timeline: Iterable[Any], pull_updates: Itera
     claimed = _claimed(issue, names, events, pulls, now, idle_seconds, own_logins, own_apps)
     if claimed:
         return claimed
-    if any(n in RUNNING_STATES or n.startswith("wait:") for n in names):
+    if any(n in RUNNING_STATES or n in HOLD_LABELS or n.startswith("wait:") for n in names):
         return Verdict(HELD, "a lane or a wait holds it")
+    open_kinds = {criteria_gate.kind(text) for checked, text in proof.criteria(issue.get("body"))
+                  if not checked}
+    if criteria_gate.OPERATOR in open_kinds and criteria_gate.CODE not in open_kinds:
+        return Verdict(NEEDS_PERSON, "the remaining criteria need a person")
+    if open_kinds == {criteria_gate.LIVE}:
+        return Verdict(HELD, "only live checks remain")
     return Verdict(READY, "no claim, pull request, ask or merged work")
 
 

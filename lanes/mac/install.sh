@@ -394,6 +394,8 @@ done
 # its merged tickets move to loom:shipped once a deploy carries them), and
 # LOOM_PIN_TARGETS (private JSON array of deployment pin targets), and
 # LOOM_ROLL_SHIP_DOCS (goal ship documents for module source pins), and
+# LOOM_ROLL_PIN_EXEMPT (space separated goal homes the roll-pin-off invariant
+# leaves out, docs/ROLL_PINS.md), and
 # LOOM_PIN_SHIP_REPOS (deployment repos whose merged pin pull requests ship
 # the tickets they deploy, docs/BRAIN.md), and
 # LOOM_SHIP_ON_MERGE and LOOM_SHIP_WORKFLOWS (repos whose merged tickets ship
@@ -476,6 +478,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_SELF_REPO</key><string>$(xml "${LOOM_SELF_REPO:-}")</string>
     <key>LOOM_PIN_TARGETS</key><string>$(xml "${LOOM_PIN_TARGETS:-}")</string>
     <key>LOOM_ROLL_SHIP_DOCS</key><string>$(xml "${LOOM_ROLL_SHIP_DOCS:-}")</string>
+    <key>LOOM_ROLL_PIN_EXEMPT</key><string>$(xml "${LOOM_ROLL_PIN_EXEMPT:-}")</string>
     <key>LOOM_PIN_SHIP_REPOS</key><string>$(xml "${LOOM_PIN_SHIP_REPOS:-}")</string>
     <key>LOOM_SHIP_ON_MERGE</key><string>$(xml "${LOOM_SHIP_ON_MERGE:-}")</string>
     <key>LOOM_SHIP_WORKFLOWS</key><string>$(xml "${LOOM_SHIP_WORKFLOWS:-}")</string>

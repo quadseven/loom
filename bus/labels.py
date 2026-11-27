@@ -8,6 +8,7 @@ from typing import Collection, Dict, Iterable, List
 from urllib.parse import quote
 
 from .github import GitHub
+from .readiness import DONE_MARKER, READY_MARKER
 from .stale_claims import OVERFLOW_CLAIM
 from .tickets import VERIFY_HANDOFF_LABEL
 
@@ -45,6 +46,10 @@ SLOTS = ["anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5", "anthropic-
          # 2026-10-16, so a second slot runs beside the first instead of
          # queueing (operator: use the Sparks much more).
          "spark-3", "spark-4",
+         # Four more, spark-5 to spark-8 (loom#3605): both boxes run vLLM at
+         # several engine slots each and the spark-gateway sends a request to
+         # a box with a free one, so eight slots keep both Sparks full.
+         "spark-5", "spark-6", "spark-7", "spark-8",
          # One slot per free provider in the spark-gateway's pool (infra#5617),
          # each a spark-type slot at the gateway's pinned free route, waiting
          # out its own provider's reset. Not Sparks. free-ollama Ollama Cloud and
@@ -82,6 +87,8 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:goal": {"color": "5319e7", "description": "The goal's home issue"},
     "loom:backlog": {"color": "5319e7", "description": "The goal home that holds the repo's whole backlog"},
     "loom:ticket": {"color": "0e8a16", "description": "A ticket issue"},
+    READY_MARKER: {"color": "0e8a16", "description": "Candidate for a worker to check in the code"},
+    DONE_MARKER: {"color": "ededed", "description": "Readiness found merged work for this ticket"},
     "loom:queued": {"color": "c5def5", "description": "Written by the brain, no lane chosen yet"},
     "loom:briefed": {"color": "1d76db", "description": "Assigned to a lane, waiting for the station"},
     "loom:running": {"color": "fbca04", "description": "Handed to the lane's runner"},

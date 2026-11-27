@@ -70,7 +70,7 @@ from functools import cache
 from typing import Any, Callable, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import answer, decision_claim, proof, status, tickets
+from . import answer, criteria_gate, decision_claim, proof, status, tickets
 from .github import GitHubError
 
 STALE = "stale"
@@ -251,6 +251,24 @@ def criteria_verdict(body: str) -> Optional[Verdict]:
                    "restated as the check that proves it")
 
 
+def live_only_hold(body: str) -> str:
+    """Why a build brief whose acceptance criteria are all live waits in the
+    queue, or empty. The hold lifts once the brief gains a criterion a lane
+    can meet in code (the fix's regression test that the briefing adds,
+    docs/BRIEF_FORMAT.md), or when the brief is an answer brief."""
+    body = brief_text(body)
+    live = criteria_gate.live_criteria(body)
+    if not live or len(live) != len(tickets._criteria_texts(body)):
+        return ""
+    try:
+        headers, _ = tickets.parse(body)
+    except ValueError:
+        headers = {}
+    if headers.get("Deliverable") == "answer":
+        return ""
+    return "all acceptance criteria require live evidence"
+
+
 # -- the test that proves the ticket ------------------------------------------
 # A test file by its path, in the layouts the fleet's repos use.
 _TEST_FILE_RE = re.compile(
@@ -302,6 +320,8 @@ def test_verdict(body: str) -> Optional[Verdict]:
     boxes = [text for text, _ in tickets.proof_checks(body)]
     if not boxes or any(names_test(box) for box in boxes):
         return None
+    if tickets.has_proof_request(body) and tickets.needs_buildable_deliverable(body):
+        return None  # The rendered brief requires a regression test.
     stamp = hashlib.sha256(body.encode("utf-8")).hexdigest()[:12]
     return Verdict(CRITERIA, "test-" + stamp,
                    "none of its acceptance boxes names the test that proves it: write one box "
