@@ -804,8 +804,6 @@ print(render_brief(sys.argv[1], issue, sys.argv[2]))
     PR_BODY="$(pr_body /dev/null "$TICKET")" || return 1
   fi
   [ -z "${recovered:-}" ] || rm -f "$recovered"
-  [ -z "${DECISION_AUDIT:-}" ] || PR_BODY="$PR_BODY"$'\n\n## Lane decision\n\n'"$DECISION_AUDIT"
-  return "$status"
 }
 
 # Repair a failing body from the same source used to compose it. PLAN_GAPS
