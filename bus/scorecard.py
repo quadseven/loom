@@ -236,7 +236,8 @@ def _brief_failure(log_file: str, ticket: str) -> Tuple[str, bool]:
                 match = LANE_FAILED_RE.fullmatch(line.rstrip("\r\n"))
                 if match is not None and match[1] == ticket:
                     reason = match[2]
-    except OSError:
+    except OSError as err:
+        _say("runner log for %s could not be read (%s): %s" % (ticket, log_file, err))
         return "unknown", False
     klass, _, detail = reason.partition("] ")
     # Older runners sometimes used the default work class for setup failures.
