@@ -67,9 +67,9 @@ codex-4 to codex-16 and spark-2 to spark-4 are installed but not loaded.
   read. The design below is for CLI sign-in.
 - agy. It signs in as a separate user and needs that user's keychain. No
   design moves it.
-- Any private repo. A run's inputs and logs live in this public repository's
-  Actions, so runner slots take public repos only. Private repos stay with
-  Mac lanes until the workflow moves to a private repository.
+- Any private repo. A run's inputs and logs would live in this public
+  repository's Actions, so runner slots take public repos only. Private repos
+  stay on Mac lanes under `docs/decisions/0004-private-repos-on-cluster-lanes.md`.
 - A repo whose check needs a tool the image lacks. The record now names the
   tool (`missing make`), and the runner image is where it is added.
 - Exported-key lanes, for "no credential visible to the agent", until each has

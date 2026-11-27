@@ -125,9 +125,11 @@ class SnapshotTest(unittest.TestCase):
         def transport(method, url, headers, body):
             path = urlsplit(url)
             calls.append(path.path)
-            if path.path == issue_path and parse_qs(path.query).get("labels") == ["loom:ticket"]:
+            query = parse_qs(path.query)
+            if path.path == issue_path and query.get("state") == ["all"]:
                 issue = {"number": 1, "labels": [{"name": "loom:ticket"}],
-                         "body": "Difficulty: " + difficulty}
+                         "body": "Difficulty: " + difficulty,
+                         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
                 rate = {"x-ratelimit-remaining": str(remaining), "x-ratelimit-limit": "1000",
                         "x-ratelimit-reset": str(int(time.time()) + 3600)}
                 return 200, rate, json.dumps([issue]).encode()
