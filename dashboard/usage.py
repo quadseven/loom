@@ -419,7 +419,8 @@ def _subscription_slots(pace: dict[str, Any], collected: datetime | None, now: d
     if collected is None or collected > now or _staleness(None, None, collected, now):
         return "Slot counts unknown"
     running, allowed = (pace.get(key) for key in ("running", "allowed"))
-    running_known = type(running) is int and running >= 0
+    running_until = parse_time(pace.get("running_until"))
+    running_known = type(running) is int and running >= 0 and running_until is not None and now <= running_until
     allowed_known = type(allowed) is int and allowed >= 0
     if running_known and allowed_known:
         return "%d of %d slots running" % (running, allowed)

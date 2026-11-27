@@ -34,7 +34,8 @@ def subscription_reading(**changes):
     pace = {"provider": "example-subscription", "window": "weekly", "used_pct": 41,
             "elapsed_pct": 43, "resets_at": reset,
             "observed_at": (NOW - timedelta(minutes=8)).isoformat(),
-            "verdict": "on", "running": 2, "allowed": 5}
+            "verdict": "on", "running": 2, "allowed": 5,
+            "running_until": (NOW + timedelta(minutes=1)).isoformat()}
     pace.update(changes)
     return reading("example-subscription", ["example-slot"], "weekly", 41, reset,
                    subscription_pace=pace)
@@ -104,6 +105,13 @@ class UsageDashboardTests(unittest.TestCase):
         self.assertIn("No reading", summary)
         self.assertIn("Slot counts unknown", summary)
         self.assertNotIn("2 of 5", summary)
+
+    def test_runner_evidence_expires_before_the_subscription_meter(self):
+        view = usage.build([subscription_reading()], NOW + timedelta(seconds=61))
+        summary = section(usage.render(view), "usage-subscriptions")
+        self.assertIn("41% used", summary)
+        self.assertIn("5 slots allowed, running unknown", summary)
+        self.assertNotIn("2 of 5 slots running", summary)
 
     def test_unknown_slot_counts_are_independent_of_a_valid_meter(self):
         cases = (
