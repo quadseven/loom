@@ -81,9 +81,9 @@ USAGE = [
      "resets_at": None, "source": "fixture", "as_of": (NOW - timedelta(minutes=5)).isoformat(), "note": "",
      "holds": {slot: "limit: out of credit; lane waits until 2026-10-19T15:00:00Z" for slot in factory.ANTHROPIC}},
     # claude: held with no end time: benched with its reason.
-    {"provider": "claude", "lanes": ["claude"], "window": "5-hour", "used_pct": None, "resets_at": None,
+    {"provider": "claude", "lanes": list(factory.CLAUDE), "window": "5-hour", "used_pct": None, "resets_at": None,
      "source": "fixture", "as_of": (NOW - timedelta(minutes=5)).isoformat(), "note": "",
-     "holds": {"claude": "auth: token expired"}},
+     "holds": {slot: "auth: token expired" for slot in factory.CLAUDE}},
 ]
 STATE = {"inflight": [{"id": 7, "ts": T - 42, "target": "spark-a", "path": "/v1/chat/completions",
                        "model": "coder-120b", "resolved_model": "coder-120b", "source": "grug",
