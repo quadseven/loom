@@ -36,8 +36,8 @@ A held pull request is never merged by Loom. Its ticket goes to needs:human
 with one exact ask, and the operator merges it by hand after the steps.
 
 A ticket whose every acceptance criterion is a check on a live host or
-network (host_only) is never given a lane: no pull request can meet it, and
-a lane given one writes something else to have a diff.
+network (host_only) needs a buildable deliverable backed by a proof request
+to go to a lane.
 """
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ import re
 from typing import Any, Callable, Dict, List, Optional, Sequence
 from urllib.parse import quote
 
-from . import brief_check, proof, ship_paths
+from . import brief_check, proof, ship_paths, tickets
 from .github import GitHubError
 
 SECTION = "Operator steps before merge"
@@ -300,6 +300,8 @@ def host_only(body: str) -> List[str]:
     """The ticket's criteria when every one is a host check; [] when any is
     something a pull request can meet, or it has none."""
     found = [text for _, text in proof.criteria(_prose(body))]
+    if tickets.has_proof_request(body) and tickets.needs_buildable_deliverable(body):
+        return []
     return found if found and all(host_check(t) for t in found) else []
 
 

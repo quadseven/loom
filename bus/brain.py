@@ -2295,9 +2295,8 @@ def _check_brief_args(title: str, body: str, lane: Optional[str],
                          "bot's plan checks: " + "; ".join(found))
 
 
-def _check_live_criterion(body: str) -> None:
-    """A Live criterion names a check Loom can run by itself, or the brief
-    writes no Live box at all.
+def _check_live_criterion(body: str, *, allow_proof_request: bool = False) -> None:
+    """A Live criterion names a check Loom can run, or a proof request answers it.
 
     Owner ruling of 2026-11-19 (#3277): proof belongs in a test that runs in
     CI or a throwaway environment at build time, not in a live observation
@@ -2308,6 +2307,8 @@ def _check_live_criterion(body: str) -> None:
     bus/live_proof.py runnable_form reads. The one templated box of a health
     or friction intake ticket passes as written: the station's own absence
     tracking proves it."""
+    if allow_proof_request and tickets.has_proof_request(body):
+        return
     found = _LIVE_LINE.search(body or "")
     if not found:
         return
@@ -2318,11 +2319,12 @@ def _check_live_criterion(body: str) -> None:
     if " ".join(line.split(":", 1)[-1].split()) in templated:
         return
     if not live_proof.runnable_form(line):
+        alternative = ". A Proof: request under What can also answer the Live box" if allow_proof_request else ""
         raise ValueError(
-            "the Live criterion names no check Loom can run by itself. Write a Live box only "
-            "with one of: %s. Otherwise leave the Live box out and write a box that names the "
-            "test that proves the ticket: a test file path, or a command that runs in CI or a "
-            "throwaway environment" % "; ".join(live_proof.RUNNABLE_FORMS))
+            "the Live criterion names no check Loom can run by itself. Use one of: %s. "
+            "Otherwise write a box that names the test that proves the ticket: a test file path, "
+            "or a command that runs in CI or a throwaway environment%s"
+            % ("; ".join(live_proof.RUNNABLE_FORMS), alternative))
 
 
 def _check_test_named(body: str) -> None:
@@ -9921,7 +9923,7 @@ def _cmd_brief(gh: GitHub, args: argparse.Namespace) -> None:
     _check_brief_difficulty(body, args.lane, args.difficulty)
     # Hand-written briefs only: health and friction intake are verified by
     # the station's own absence tracking, not by a log string.
-    _check_live_criterion(body)
+    _check_live_criterion(body, allow_proof_request=True)
     _check_test_named(body)
     refused = anthropic_floor_refusal(gh, args.lane, getattr(args, "lanes_repo", ""))
     if refused:

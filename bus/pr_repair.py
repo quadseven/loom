@@ -22,7 +22,7 @@ import sys
 import tempfile
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from . import bug_refs, hunt_plan, signature, text
+from . import bug_refs, criteria_gate, hunt_plan, signature, text, tickets
 
 # Headings the runner injects into the PR body, in order.
 GENERATED_HEADINGS = ("## Why", "## Summary", "## Acceptance criteria",
@@ -125,7 +125,7 @@ def _brief_title(brief: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
-_CRITERION = re.compile(r"^- \[([ xX])\] (.*?)(?:; not built: (.*))?$")
+_CRITERION = re.compile(r"^[-*] \[([ xX])\]\s+(.*?)(?:; not built: (.*))?$")
 # A lane's "not built" reason goes into a public pull request body that no
 # leak scan reads on a fix round, so only plain words and punctuation pass:
 # no digits, so no address, version, token or issue number (security review).
@@ -183,6 +183,20 @@ def _checklist(brief: str, current_body: str, summary: str) -> str:
     if current and _criteria_text(current) == _criteria_text(ticket):
         return _lane_ticks(ticket, current)
     return ticket
+
+
+def build_checklist(brief: str, checklist: str) -> str:
+    """Carry each deferred live criterion into the PR using the ticket's wording."""
+    if not tickets.needs_buildable_deliverable(brief):
+        return checklist
+    live = set(criteria_gate.live_criteria(brief))
+    out = []
+    for line in _lane_ticks(_brief_criteria(brief), checklist).splitlines():
+        match = _CRITERION.match(line.strip())
+        if match and match.group(2) in live:
+            line = "- [ ] %s; not built: checked after merge" % match.group(2)
+        out.append(line)
+    return "\n".join(out)
 
 
 def _operator_steps(brief: str, current_body: str, summary: str) -> str:
@@ -251,6 +265,7 @@ def _render_generated(brief: str, lane: str, model: str, ticket: str,
         why = summary if summary.strip() else (_brief_title(brief) or "")
     if acceptance is None:
         acceptance = _brief_criteria(brief)
+    acceptance = build_checklist(brief, acceptance)
     # The gate wants three bullets under Acceptance criteria; a ticket may
     # state fewer, and a body it refuses holds the pull request.
     acceptance = hunt_plan.pad_criteria(acceptance)
