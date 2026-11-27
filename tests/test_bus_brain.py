@@ -5001,6 +5001,26 @@ class PastLastRungTests(unittest.TestCase):
         self.assertEqual(lines[0], "- #9 Past - PR #4 - mergeable mergeable - 0 unresolved threads")
         self.assertNotIn("no open pull request", section)
 
+    def test_status_lists_pull_requests_held_open_by_a_claim(self):
+        claimed = stuck_ticket("failed")
+        claimed["labels"].append({"name": "claim:example-maintainer"})
+        routes = {
+            ("GET", "/repos/%s/issues" % REPO): reply(200, [claimed]),
+            ("GET", "/repos/%s/pulls" % REPO): reply(200, [
+                {"number": 4, "title": "PR", "head": {"ref": "loom/9-work"}},
+                {"number": 5, "title": "PR2", "head": {"ref": "loom/9-second"}},
+            ]),
+            ("POST", "/graphql"): reply(200, {"data": {"repository": {
+                "p4": ready_node(threads=[]), "p5": ready_node(threads=[]),
+            }}}),
+        }
+        routes.update(lanes_routes(()))
+        report = brain.status(GitHub("t", transport=Routed(routes)), [REPO], REPO,
+                              env={"LOOM_BRIEF_AUTHORS": "example-brain"})
+        self.assertIn("### Claimed ticket pull requests\n"
+                      "- PR #4 - ticket #9 - claimed by example-maintainer\n"
+                      "- PR #5 - ticket #9 - claimed by example-maintainer", report)
+
     def test_status_lists_a_ticket_past_rung_3_with_its_answered_high_thread(self):
         answered = {"isResolved": False, "comments": {"nodes": [
             {"databaseId": 71, "author": self.BOT, "body": "high | correctness | the cache is never cleared\nmore"},

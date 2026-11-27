@@ -12,13 +12,14 @@ slots (the registry's slots of that provider, or LOOM_PACE_MAX_<PROVIDER>),
 and the slots it asks for: one more than running when it is behind and a
 ticket waits for a free lane, never more than the most; the running count
 otherwise, so a provider on or ahead of pace opens none. The plan is data in
-state/usage/pace.json and a line in the lane status comment. Opening a slot
+state/usage/pace.json. The lane status reports subscription usage. Opening a slot
 is the pod's to do: the lane container starts the slots its deployment
 names, so nothing here starts or stops a runner.
 """
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
@@ -53,10 +54,12 @@ def verdict(used_pct: float, elapsed: float, points: float) -> str:
 def elapsed_pct(resets_at: Optional[float], window_minutes: Any, now: float) -> Optional[float]:
     """The share of the window that ends at RESETS_AT already elapsed at NOW,
     in percent; None when the window length is unknown or NOW is outside it."""
-    if (resets_at is None or isinstance(window_minutes, bool)
-            or not isinstance(window_minutes, (int, float)) or window_minutes <= 0):
+    minutes = _number(window_minutes)
+    if resets_at is None or minutes is None or minutes <= 0:
         return None
-    length = float(window_minutes) * 60
+    length = minutes * 60
+    if not math.isfinite(length):
+        return None
     start = resets_at - length
     if not start <= now < resets_at:
         return None
@@ -83,7 +86,11 @@ def queued(waits: Any) -> int:
 def _number(value: Any) -> Optional[float]:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value)
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _reading(row: Dict[str, Any], now: float) -> Optional[Dict[str, Any]]:
@@ -186,26 +193,3 @@ def _providers(record: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     if not isinstance(providers, dict):
         return {}
     return {name: info for name, info in sorted(providers.items()) if isinstance(info, dict)}
-
-
-def lines(record: Dict[str, Any]) -> List[str]:
-    """The lane status comment's pace line, or none without a plan."""
-    providers = _providers(record)
-    if not providers:
-        return []
-    parts = []
-    for name, info in providers.items():
-        part = "%s %s %g%% used, %g%% elapsed, %s; slots %s of %s" % (
-            name, info.get("window"), round(float(info.get("used") or 0)),
-            round(float(info.get("elapsed") or 0)), info.get("verdict"), info.get("open"), info.get("max"))
-        if info.get("want") != info.get("open"):
-            part += ", asks for %s" % info.get("want")
-        parts.append(part)
-    return ["Pace (slack %g points): %s" % (float(record.get("slack") or SLACK_DEFAULT), " / ".join(parts))]
-
-
-def summary(record: Dict[str, Any]) -> str:
-    """Verdicts and requests only: what republishes the lane status when it
-    changes, while the elapsed share moves every pass."""
-    return " ".join("%s=%s:%s" % (name, info.get("verdict"), info.get("want"))
-                    for name, info in _providers(record).items())
