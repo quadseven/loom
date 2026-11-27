@@ -29,6 +29,17 @@ def reading(provider, lanes, window, used=None, resets_at=None, age=timedelta(mi
     return row
 
 
+def subscription_reading(**changes):
+    reset = (NOW + timedelta(days=4)).isoformat()
+    pace = {"provider": "example-subscription", "window": "weekly", "used_pct": 41,
+            "elapsed_pct": 43, "resets_at": reset,
+            "observed_at": (NOW - timedelta(minutes=8)).isoformat(),
+            "verdict": "on", "running": 2, "allowed": 5}
+    pace.update(changes)
+    return reading("example-subscription", ["example-slot"], "weekly", 41, reset,
+                   subscription_pace=pace)
+
+
 def section(body, heading_id):
     """The markup of one section of the Usage view, by its heading id."""
     start = body.index('aria-labelledby="%s"' % heading_id)
@@ -49,6 +60,63 @@ class UsageDashboardTests(unittest.TestCase):
         patcher = patch.dict(os.environ, {"LOOM_DASHBOARD_TZ": "UTC"})
         patcher.start()
         self.addCleanup(patcher.stop)
+
+    def test_subscription_summary_uses_the_station_verdict(self):
+        for verdict in ("behind", "on", "ahead"):
+            with self.subTest(verdict=verdict):
+                page = usage.render(usage.build([subscription_reading(verdict=verdict)], NOW))
+                summary = section(page, "usage-subscriptions")
+                self.assertIn(f"41% used, 43% elapsed, {verdict} pace", summary)
+
+    def test_subscription_meter_can_be_unreadable_while_slot_counts_are_fresh(self):
+        cases = {
+            "missing": dict(window=None, used_pct=None, elapsed_pct=None, resets_at=None,
+                            observed_at=None, verdict=None),
+            "stale": {"observed_at": (NOW - timedelta(hours=3)).isoformat()},
+            "reset": {"resets_at": NOW.isoformat()},
+            "future": {"observed_at": (NOW + timedelta(minutes=1)).isoformat()},
+            "malformed": {"used_pct": True},
+            "out-of-range timestamp": {"observed_at": "0001-01-01T00:00:00+01:00"},
+        }
+        for reason, changes in cases.items():
+            with self.subTest(reason=reason):
+                page = usage.render(usage.build([subscription_reading(**changes)], NOW))
+                summary = section(page, "usage-subscriptions")
+                self.assertIn("No reading", summary)
+                self.assertIn("2 of 5 slots running", summary)
+                self.assertNotIn("% used", summary)
+                self.assertNotIn("% elapsed", summary)
+
+    def test_subscription_summary_ages_with_the_uploaded_snapshot(self):
+        row = subscription_reading()
+        store = Store()
+        store.upload([row], now=NOW)
+        summary = section(usage.render(usage.build(store.snapshot()["readings"],
+                                                   NOW + timedelta(hours=3))),
+                          "usage-subscriptions")
+        self.assertIn("No reading", summary)
+        self.assertIn("Slot counts unknown", summary)
+        self.assertNotIn("2 of 5", summary)
+
+    def test_unknown_slot_counts_are_independent_of_a_valid_meter(self):
+        cases = (
+            (None, None, "Slot counts unknown"),
+            (0, None, "0 slots running, allowed unknown"),
+            (True, 5, "5 slots allowed, running unknown"),
+        )
+        for running, allowed, expected in cases:
+            with self.subTest(running=running, allowed=allowed):
+                row = subscription_reading(running=running, allowed=allowed)
+                summary = section(usage.render(usage.build([row], NOW)), "usage-subscriptions")
+                self.assertIn("41% used", summary)
+                self.assertIn(expected, summary)
+
+    def test_legacy_or_mismatched_metadata_does_not_add_a_subscription(self):
+        rows = [reading("example-service", [], "weekly", 15),
+                subscription_reading(provider="another-subscription")]
+        page = usage.render(usage.build(rows, NOW))
+        self.assertNotIn('aria-labelledby="usage-subscriptions"', page)
+        self.assertIn("15% used", provider_row(page, "example-service"))
 
     def test_unknown_usage_with_an_old_observation_is_labeled_stale(self):
         row = reading("claude", ["claude"], "all", age=timedelta(minutes=5),
@@ -178,8 +246,9 @@ class UsageDashboardTests(unittest.TestCase):
         self.assertNotIn("Snapshot read", body)
         codex = provider_row(body, "codex")
         self.assertIn(">stale<", codex)
-        self.assertIn("um-bar um-stale", codex)
-        self.assertIn('aria-label="50% used, 50% left, stale"', codex)
+        self.assertIn("um-bar um-unknown", codex)
+        self.assertIn('<p class="um-fig">No reading</p>', codex)
+        self.assertNotIn("50%", codex)
         self.assertIn("Stale: read 19h 0m ago.", codex)
         self.assertNotIn("Pace", codex)
         asks = section(body, "usage-asks")
@@ -208,6 +277,8 @@ class UsageDashboardTests(unittest.TestCase):
         body = usage.render(usage.build(rows, NOW))
         codex = provider_row(body, "codex")
         self.assertIn("Stale: the window reset 20m ago, after this reading.", codex)
+        self.assertIn('<p class="um-fig">No reading</p>', codex)
+        self.assertNotIn("97%", codex)
         self.assertNotIn("near limit", codex)
         self.assertNotIn("is 97% used", body)
 

@@ -9,7 +9,7 @@ import json
 import os
 import sys
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.message import Message
 from pathlib import Path
 from unittest.mock import patch
@@ -54,6 +54,7 @@ def call(state, method, path, body=None):
     result = []
     handler.send_json = lambda code, value: result.append((code, value))
     handler.send_text = lambda code, value: result.append((code, value))
+    handler.send_page = lambda value, code=200: result.append((code, value))
     (handler.do_POST if method == "POST" else handler.do_GET)()
     return result[0]
 
@@ -83,6 +84,39 @@ class TwoReplicasTest(SharedBase):
         self.assertEqual(call(self.second, "POST", "/api/usage", [other])[0], 201)
         _, body = call(self.first, "GET", "/api/usage")
         self.assertEqual(sorted(r["provider"] for r in body["readings"]), ["anthropic", "codex"])
+
+    def test_subscription_pace_upload_renders_after_dashboard_restart(self):
+        now = datetime.now(timezone.utc)
+        reset = now + timedelta(days=6)
+        subscription = {
+            "provider": "example-subscription", "window": "weekly", "used_pct": 0,
+            "elapsed_pct": 14.3, "resets_at": reset.isoformat(),
+            "observed_at": now.isoformat(), "verdict": "behind", "running": 2, "allowed": 5,
+        }
+        row = dict(READING, provider="example-subscription", lanes=["example-slot"],
+                   as_of=now.isoformat(), resets_at=reset.isoformat(), used_pct=0,
+                   subscription_pace=subscription)
+        shorter = dict(row, window="5-hour", used_pct=55)
+        del shorter["subscription_pace"]
+        self.assertEqual(call(self.first, "POST", "/api/usage", [row, shorter])[0], 201)
+        restarted = State(station_state.Store(self.db))
+        code, snapshot = call(restarted, "GET", "/api/usage")
+        self.assertEqual(code, 200)
+        self.assertEqual(snapshot["readings"][0]["subscription_pace"], subscription)
+
+        with patch.dict(os.environ, {"LOOM_DASHBOARD_TZ": "UTC"}):
+            code, page = call(restarted, "GET", "/usage")
+        self.assertEqual(code, 200)
+        start = page.index('aria-labelledby="usage-subscriptions"')
+        summary = page[start:page.index("</section>", start)]
+        self.assertEqual(summary.count("example-subscription"), 1)
+        self.assertIn("Weekly", summary)
+        self.assertIn("0% used", summary)
+        self.assertIn("14.3% elapsed", summary)
+        self.assertIn("behind", summary)
+        self.assertIn(reset.strftime("%Y-%m-%d %H:%M UTC"), summary)
+        self.assertIn("2 of 5 slots running", summary)
+        self.assertIn("55% used", page)
 
     def test_a_chain_post_on_one_process_is_the_heartbeat_on_the_others_fleet(self):
         self.assertEqual(call(self.first, "POST", "/api/chain", CHAIN), (201, {"repos": 1}))

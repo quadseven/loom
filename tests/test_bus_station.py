@@ -16562,6 +16562,30 @@ class PaceTest(Base):
     """loom#3630: each pass the station paces every windowed subscription and
     the lane status shows used, elapsed and verdict per subscription."""
 
+    def test_usage_upload_carries_one_summary_per_subscription(self):
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        now = runner.now
+        base = {"provider": "codex", "lanes": ["codex"], "source": "lane meter",
+                "resets_at": station.usage._iso(now + 1000),
+                "as_of": station.usage._iso(now), "used_pct": 0}
+        records = [
+            dict(base, window="5-hour", window_minutes=300),
+            dict(base, window="weekly", window_minutes=10080),
+        ]
+        with mock.patch.object(station.usage, "collect", return_value=records), \
+                mock.patch.object(runner, "_refresh_model_catalogue"), \
+                mock.patch.object(runner, "post_chain"), \
+                mock.patch.object(runner, "upload_usage_limits") as upload:
+            runner._tend_usage()
+        payload = upload.call_args.args[0]
+        summaries = [row["subscription_pace"] for row in payload if "subscription_pace" in row]
+        codex = [row for row in summaries if row["provider"] == "codex"]
+        self.assertEqual(len(codex), 1, payload)
+        self.assertEqual((codex[0]["window"], codex[0]["used_pct"]), ("weekly", 0))
+        (missing,) = [row for row in summaries if row["provider"] == "claude"]
+        self.assertIsNone(missing["used_pct"])
+        self.assertEqual(station.usage.read_snapshot(self.home), records)
+
     def test_a_pass_writes_the_pace_plan_and_the_status_shows_it(self):
         from bus import pace
         now = time.time()
@@ -16581,8 +16605,54 @@ class PaceTest(Base):
         plan = pace.read(self.home)["providers"]["codex"]
         self.assertEqual((plan["verdict"], plan["open"], plan["max"], plan["want"]),
                          (pace.BEHIND, 1, 2, 2))
-        self.assertIn("Pace (slack 10 points): codex weekly 2% used, 50% elapsed, behind; "
-                      "slots 1 of 2, asks for 2", body)
+        self.assertIn(f"| codex | weekly | 2% | 50% | {reset} | behind | "
+                      "1 of 2 (asks for 2) |", body)
+
+    def test_subscription_status_preserves_zero_and_refuses_old_windows(self):
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        now = runner.now
+
+        def row(provider, window, minutes, used, end, age=10):
+            return {"provider": provider, "lanes": [provider], "window": window,
+                    "window_minutes": minutes, "used_pct": used,
+                    "resets_at": station.usage._iso(end),
+                    "observed_at": station.usage._iso(now - age)}
+
+        reset = now + 50 * 60
+        station.usage.write(self.home, [
+            row("codex", "weekly", 100, 0, reset),
+            row("claude", "weekly", 10080, 23, reset, age=7201),
+            row("claude", "five-hour", 300, 30, reset),
+            row("agy", "weekly", 10080, 8, now - 1),
+        ])
+        body = runner._lanes_body([])
+        self.assertIn(f"| codex | weekly | 0% | 50% | {station.usage._iso(reset)} | behind |", body)
+        self.assertIn("| claude | weekly | no reading |", body)
+        self.assertEqual(sum(line.startswith("| claude | weekly |")
+                             for line in body.splitlines()), 1, body)
+        self.assertIn("| agy | weekly | no reading |", body)
+        self.assertIn("| copilot | - | no reading |", body)
+
+    def test_changed_usage_republishes_inside_the_same_pace_band(self):
+        self.settings.status_repo = REPO
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        now = runner.now
+        row = {"provider": "codex", "lanes": ["codex"], "window": "weekly",
+               "window_minutes": 10080, "used_pct": 1,
+               "resets_at": station.usage._iso(now + 50 * 60),
+               "observed_at": station.usage._iso(now - 60)}
+        with mock.patch.object(runner, "_lane_rows", return_value=[]), \
+                mock.patch.object(runner, "_lanes_issue", return_value=1), \
+                mock.patch.object(runner, "_remote_claim_count", return_value=0), \
+                mock.patch.object(runner, "_upsert_lanes_comment", return_value=2) as post:
+            station.usage.write(self.home, [row])
+            runner.publish_lanes(refresh_pr_counts=False)
+            row["used_pct"] = 2
+            station.usage.write(self.home, [row])
+            runner.publish_lanes(refresh_pr_counts=False)
+            runner.publish_lanes(refresh_pr_counts=False)
+        self.assertEqual(post.call_count, 2)
+        self.assertIn("| codex | weekly | 2% |", post.call_args.args[2])
 
 
 class RunnerSlotClaimTest(Base):

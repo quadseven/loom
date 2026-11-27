@@ -117,9 +117,9 @@ def parse_time(value: Any) -> datetime | None:
         return None
     try:
         moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
+        return moment.astimezone(timezone.utc) if moment.tzinfo else None
+    except (ValueError, OverflowError):
         return None
-    return moment.astimezone(timezone.utc) if moment.tzinfo else None
 
 
 def _zone():
@@ -397,6 +397,51 @@ def all_holds(rows: list[dict[str, Any]]) -> dict[str, str]:
     return holds
 
 
+def _subscription_meter(pace: dict[str, Any], now: datetime) -> str:
+    window = pace.get("window")
+    used, elapsed = pace.get("used_pct"), pace.get("elapsed_pct")
+    reset, observed = parse_time(pace.get("resets_at")), parse_time(pace.get("observed_at"))
+    verdict = pace.get("verdict")
+    if (not isinstance(window, str) or not 0 < len(window) <= 200
+            or not all(type(value) in (int, float) and 0 <= value <= 100
+                       for value in (used, elapsed))
+            or verdict not in ("behind", "on", "ahead")
+            or observed is None or reset is None or not observed <= now < reset
+            or _staleness(used, reset, observed, now)):
+        return "No reading"
+    return "%s, %s used, %s elapsed, %s pace. Resets %s" % (
+        WINDOW_NAMES.get(window, window), percent(used), percent(elapsed), verdict, clock(reset))
+
+
+def _subscription_slots(pace: dict[str, Any], collected: datetime | None, now: datetime) -> str:
+    if collected is None or collected > now or _staleness(None, None, collected, now):
+        return "Slot counts unknown"
+    running, allowed = (pace.get(key) for key in ("running", "allowed"))
+    running_known = type(running) is int and running >= 0
+    allowed_known = type(allowed) is int and allowed >= 0
+    if running_known and allowed_known:
+        return "%d of %d slots running" % (running, allowed)
+    if running_known:
+        return "%d slots running, allowed unknown" % running
+    if allowed_known:
+        return "%d slots allowed, running unknown" % allowed
+    return "Slot counts unknown"
+
+
+def _subscription_rows(by_name: dict[str, list[dict[str, Any]]], now: datetime) -> list[tuple[str, str]]:
+    """Use the station's verdict and shares, rechecking their age for this page."""
+    out = []
+    for name, rows in sorted(by_name.items()):
+        for row in rows:
+            pace = row.get("subscription_pace")
+            if isinstance(pace, dict) and pace.get("provider") == name == row.get("provider"):
+                meter = _subscription_meter(pace, now)
+                slots = _subscription_slots(pace, parse_time(row.get("as_of")), now)
+                out.append((name, "%s. %s." % (meter, slots)))
+                break
+    return out
+
+
 def build(rows: list[dict[str, Any]], now: datetime, prs: list[dict[str, Any]] | None = None,
           models: dict[str, str] | None = None,
           lane_rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -414,6 +459,7 @@ def build(rows: list[dict[str, Any]], now: datetime, prs: list[dict[str, Any]] |
                        key=lambda p: (p["rank"], -p["top"], p["name"]))
     newest = max((p["read"] for p in providers if p["read"]), default=None)
     return {"providers": providers, "asks": _asks(providers, newest, now), "now": now, "newest": newest,
+            "subscriptions": _subscription_rows(by_name, now),
             **_lane_totals(providers)}
 
 
@@ -494,10 +540,13 @@ def _resource_meter(w: dict[str, Any], now: datetime) -> str:
 def _unknown_meter(w: dict[str, Any], now: datetime) -> str:
     if w["kind"] == "run" and w.get("peak_mem_mib") is not None:
         return _resource_meter(w, now)
+    figure, detail = "Unknown", _unknown_note(w, now)
+    if w["used"] is not None and w["stale"]:
+        figure, detail = "No reading", _meter_detail(w, now)
     return ('<div class="um um-none"><span class="um-name">%s</span>'
             '<div class="um-bar um-unknown" aria-hidden="true"></div>'
-            '<p class="um-fig">Unknown</p><p class="um-detail">%s</p></div>'
-            % (html.escape(w["name"]), html.escape(_unknown_note(w, now))))
+            '<p class="um-fig">%s</p><p class="um-detail">%s</p></div>'
+            % (html.escape(w["name"]), figure, html.escape(detail)))
 
 
 def _meter_detail(w: dict[str, Any], now: datetime) -> str:
@@ -524,24 +573,23 @@ def _meter_detail(w: dict[str, Any], now: datetime) -> str:
 def _meter(w: dict[str, Any], now: datetime) -> str:
     """One window: a used/left bar with the projected use at reset, its
     figures with units, and the reset and pace in words."""
-    if w["used"] is None:
+    if w["used"] is None or w["stale"]:
         return _unknown_meter(w, now)
     esc = html.escape
-    used, stale = w["used"], bool(w["stale"])
-    tone = "" if stale else " um-bad" if used >= NEAR_LIMIT_PCT else " um-warn" if w["runs_out"] else ""
+    used = w["used"]
+    tone = " um-bad" if used >= NEAR_LIMIT_PCT else " um-warn" if w["runs_out"] else ""
     marker = ""
     if w["at_reset"] is not None and w["at_reset"] > used:
         marker = '<i class="um-proj" style="left:%.1f%%"></i>' % w["at_reset"]
-    label = "%s used, %s left%s" % (percent(used), percent(100 - used), ", stale" if stale else "")
+    label = "%s used, %s left" % (percent(used), percent(100 - used))
     figure = '<strong>%s</strong> used <span class="um-sep">/</span> <strong>%s</strong> left' % (
         percent(used), percent(100 - used))
     if "usd_left" in w:
         figure += ' <span class="um-usd">(USD %.2f left)</span>' % w["usd_left"]
-    return ('<div class="um%s%s"><span class="um-name">%s</span>'
-            '<div class="um-bar%s" role="img" aria-label="%s"><span style="width:%.1f%%"></span>%s</div>'
+    return ('<div class="um%s"><span class="um-name">%s</span>'
+            '<div class="um-bar" role="img" aria-label="%s"><span style="width:%.1f%%"></span>%s</div>'
             '<p class="um-fig">%s</p><p class="um-detail">%s</p></div>'
-            % (tone, " um-is-stale" if stale else "", esc(w["name"]), " um-stale" if stale else "",
-               esc(label), used, marker, figure, esc(_meter_detail(w, now))))
+            % (tone, esc(w["name"]), esc(label), used, marker, figure, esc(_meter_detail(w, now))))
 
 
 def _holds(windows: list[dict[str, Any]], now: datetime) -> str:
@@ -662,6 +710,19 @@ def _asks_html(asks: list[tuple[str, str]]) -> str:
     return head + '<ul class="ua-list">%s</ul></section>' % items
 
 
+def _subscriptions_html(rows: list[tuple[str, str]]) -> str:
+    if not rows:
+        return ""
+    esc = html.escape
+    items = "".join(
+        '<li class="uq"><div class="uq-head"><h3 class="up-name">%s</h3></div>'
+        '<div class="uq-body"><span class="up-lanes">%s</span></div></li>'
+        % (esc(name), esc(detail)) for name, detail in rows)
+    return ('<section class="usage-section" aria-labelledby="usage-subscriptions">'
+            '<h2 class="label" id="usage-subscriptions">Subscriptions</h2>'
+            '<ul class="uq-list">%s</ul></section>' % items)
+
+
 def render(data: dict[str, Any]) -> str:
     """The Usage view body."""
     now, newest, providers = data["now"], data["newest"], data["providers"]
@@ -671,7 +732,8 @@ def render(data: dict[str, Any]) -> str:
                 '<p class="empty-state">No usage snapshot has arrived since the dashboard started. '
                 'The station uploads one on each pass (POST /api/usage); this page fills in after '
                 'its next pass. If it stays empty, the station is not running or its upload fails.</p>')
-    parts = [_freshness_html(newest, now), _summary(data), _asks_html(data["asks"])]
+    parts = [_freshness_html(newest, now), _summary(data),
+             _subscriptions_html(data["subscriptions"]), _asks_html(data["asks"])]
     loud = [p for p in providers if p["status"] != "no meter"]
     quiet = [p for p in providers if p["status"] == "no meter"]
     if loud:
