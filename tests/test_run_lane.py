@@ -6139,8 +6139,22 @@ fi
         self.assertTrue((inbox / "failed" / "T043-next.md").exists())
         self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
 
+    def pin_gateway_limit_clock(self):
+        # The shell computes the deadline before Python stamps the heartbeat.
+        # Keep those times apart so a delayed heartbeat cannot hide a bad test.
+        origin = int(time.time()) - 5
+        self.write_tool(self.bin / "date", f"""#!/bin/sh
+if [ "$#" -eq 1 ] && [ "$1" = +%s ]; then
+    printf '%s\\n' {origin}
+else
+    exec /bin/date "$@"
+fi
+""")
+        return origin
+
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_free_gateway_retry_after_sets_the_cluster_slot_hold(self):
+        origin = self.pin_gateway_limit_clock()
         inbox, result = self.api_lane(
             "free-openrouter", FAKE_CURL="503", FAKE_CURL_RETRY_AFTER="43200",
             LOOM_FREE_GATEWAY_URL="http://gateway.example.invalid")
@@ -6148,7 +6162,7 @@ fi
         self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
         beat = json.loads((self.loom / "state" / "usage" / "free-openrouter.json").read_text())
         self.assertFalse(beat["available"])
-        self.assertAlmostEqual(beat["retry_at"] - beat["at"], 43200, delta=2)
+        self.assertEqual(beat["retry_at"], origin + 43200)
         limit = (self.loom / "state" / "usage" / "free-openrouter.limit").read_text().split()
         self.assertEqual(int(limit[0]), beat["retry_at"])
         probes = sum(c.startswith("curl ") for c in self.calls())
@@ -6165,16 +6179,18 @@ fi
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_free_gateway_503_without_retry_after_uses_the_fallback(self):
+        origin = self.pin_gateway_limit_clock()
         _, result = self.api_lane(
             "free-openrouter", FAKE_CURL="503",
             LOOM_FREE_GATEWAY_URL="http://gateway.example.invalid")
         self.assertEqual(result.returncode, 0, result.stderr)
         beat = json.loads((self.loom / "state" / "usage" / "free-openrouter.json").read_text())
         self.assertFalse(beat["available"])
-        self.assertAlmostEqual(beat["retry_at"] - beat["at"], 900, delta=2)
+        self.assertEqual(beat["retry_at"], origin + 900)
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_free_gateway_retry_after_is_capped_at_one_day(self):
+        origin = self.pin_gateway_limit_clock()
         _, result = self.api_lane(
             "free-openrouter",
             FAKE_CURL="503",
@@ -6184,7 +6200,7 @@ fi
         self.assertEqual(result.returncode, 0, result.stderr)
         beat = json.loads((self.loom / "state" / "usage" / "free-openrouter.json").read_text())
         self.assertFalse(beat["available"])
-        self.assertAlmostEqual(beat["retry_at"] - beat["at"], 86400, delta=2)
+        self.assertEqual(beat["retry_at"], origin + 86400)
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_spark_run_cut_off_by_a_503_is_a_limit_not_a_failure(self):
@@ -7592,6 +7608,74 @@ exit %d
         self.assertFalse(self.beat()["available"])
         self.assertTrue((self.inbox / "T049-next.md").exists())
 
+    # A slot the operator holds (LOOM_<SLOT>_HELD): deployed and beating, it
+    # takes no ticket until the setting is cleared.
+    HELD_WHY = "held: LOOM_CODEX_2_HELD is set; the slot takes no tickets until it is cleared"
+
+    def slot_brief(self, slot, name="T042-fix-the-thing"):
+        inbox = self.loom / "briefs" / slot
+        inbox.mkdir(parents=True, exist_ok=True)
+        (inbox / (name + ".md")).write_text(BRIEF.replace("T042-fix-the-thing", name))
+        return inbox
+
+    def assert_ran(self, slot, inbox, name="T042-fix-the-thing"):
+        self.assertTrue(any(c.startswith("codex ") for c in self.calls()), (slot, self.calls()))
+        self.assertTrue((inbox / "done" / (name + ".md")).exists(), slot)
+        self.assertNotEqual(self.beat(slot).get("state"), "parked", self.beat(slot))
+
+    def test_a_held_slot_beats_held_every_pass_and_runs_nothing(self):
+        inbox = self.slot_brief("codex-2")
+        for _ in range(2):
+            (self.loom / "state" / "usage" / "codex-2.json").unlink(missing_ok=True)
+            result = self.run_lane("codex-2", LOOM_CODEX_2_HELD="1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            beat = self.beat("codex-2")
+            self.assertIs(beat["available"], False)
+            self.assertEqual(beat["reason"], self.HELD_WHY)
+            self.assertNotIn("retry_at", beat)
+            self.assertEqual((beat["state"], beat["state_reason"]),
+                             ("parked", "Held by the operator (LOOM_<SLOT>_HELD)"))
+        self.assertEqual(self.calls(), [])
+        # The brief waits where it is: neither run nor parked.
+        self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
+        self.assertEqual(list((inbox / "done").iterdir()), [])
+        self.assertEqual(list((inbox / "failed").iterdir()), [])
+
+    def test_a_cleared_hold_runs_the_slot_as_before(self):
+        for n, value in enumerate(("", "0", "false", "No", "OFF")):
+            with self.subTest(value=value):
+                name = "T04%d-run" % n
+                inbox = self.slot_brief("codex-2", name)
+                self.log.write_text("")
+                self.run_lane("codex-2", LOOM_CODEX_2_HELD=value)
+                self.assert_ran("codex-2", inbox, name)
+
+    def test_a_mistyped_hold_value_holds_rather_than_releases(self):
+        self.slot_brief("codex-2")
+        for value in ("1", "true", "yes", "flase", " 0", "of", "0 "):
+            with self.subTest(value=value):
+                self.run_lane("codex-2", LOOM_CODEX_2_HELD=value)
+                self.assertEqual(self.beat("codex-2")["reason"], self.HELD_WHY)
+        self.assertEqual(self.calls(), [])
+
+    def test_a_hold_binds_only_its_own_slot(self):
+        # One slot's hold holds no other slot of the lane (as claude-2's must
+        # not hold claude), and the lane-wide name is the first slot's own
+        # setting, never a fallback for the others.
+        inbox = self.slot_brief("codex")
+        self.run_lane("codex", LOOM_CODEX_2_HELD="1")
+        self.assert_ran("codex", inbox)
+        self.log.write_text("")
+        inbox = self.slot_brief("codex-2", "T044-other")
+        self.run_lane("codex-2", LOOM_CODEX_HELD="1")
+        self.assert_ran("codex-2", inbox, "T044-other")
+        self.log.write_text("")
+        self.slot_brief("codex", "T043-next")
+        self.run_lane("codex", LOOM_CODEX_HELD="1")
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.beat("codex")["reason"],
+                         "held: LOOM_CODEX_HELD is set; the slot takes no tickets until it is cleared")
+
     def test_the_agy_sign_in_ask_names_the_lane_user_and_the_command(self):
         # 2026-10-24: the ask said only "sign in the agy lane CLI again"; the
         # operator signed in as themselves, which never reaches the lane user's
@@ -8383,6 +8467,57 @@ exit %d
     def test_a_pass_does_not_look_up_a_private_repo_incident_by_title(self):
         calls = self.resolve_without_state_file(repo_public=False)
         self.assertNotIn("gh issue", calls)
+
+    def run_ask_lookup(self, call):
+        """Run settle_ask or open_issue with a factory repo holding an open
+        issue #5 that carries the ask's exact title. Only when OUTSIDER is 1
+        does #5 lack the needs:human label, as an issue anyone can file on a
+        public repo would. Returns the gh calls and the script's stdout."""
+        text = RUNNER.read_text()
+        funcs = "".join(re.search(r"^%s\(\) \{\n.*?^\}\n" % name, text, re.S | re.M).group(0)
+                        for name in ("settle_ask", "open_issue"))
+        tmp = Path(self._tmp.name)
+        calls = tmp / "calls"
+        calls.touch()
+        script = (funcs +
+                  'sign_tail() { :; }\nupsert_sticky_comment() { printf "sticky %s\\n" "$2" >> "$CALLS"; }\n'
+                  'python3() { return 0; }\n'
+                  'gh() { printf "gh %s\\n" "$*" >> "$CALLS"; case "$1 $2" in\n'
+                  '  "issue list"|"search issues")\n'
+                  '    case " $* " in *" --label needs:human "*) [ "$OUTSIDER" = 1 ] || printf "5\\n" ;;\n'
+                  '      *) printf "5\\n" ;; esac ;;\n'
+                  'esac; return 0; }\n' + call + '\n')
+        result = subprocess.run(
+            ["bash", "-c", script],
+            env={"PATH": "/usr/bin:/bin", "FACTORY_REPO": "quadseven/loom", "LOOM_ROOT": str(tmp),
+                 "PWD": str(tmp), "CALLS": str(calls), "LOG": str(self.log),
+                 "KEY_REPEAT_MARKER": "<!-- loom:key-repeat v1 -->", "SLOT": "codex-1",
+                 "OUTSIDER": self._outsider},
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return calls.read_text(), result.stdout
+
+    def test_an_outsider_issue_with_the_ask_title_does_not_close_the_lane_ask(self):
+        self._outsider = "1"
+        calls, _ = self.run_ask_lookup('settle_ask "Lane codex sign-in lapsed" 9 "Sign-in failed again"')
+        self.assertNotIn("gh issue close", calls)
+        self.assertNotIn("sticky 5", calls)
+
+    def test_a_lane_ask_filed_first_still_absorbs_a_later_duplicate(self):
+        self._outsider = "0"
+        calls, _ = self.run_ask_lookup('settle_ask "Lane codex sign-in lapsed" 9 "Sign-in failed again"')
+        self.assertIn("gh issue close --repo quadseven/loom 9", calls)
+        self.assertIn("sticky 5", calls)
+
+    def test_an_outsider_issue_with_the_ask_title_is_not_taken_as_the_open_ask(self):
+        self._outsider = "1"
+        _, out = self.run_ask_lookup('open_issue "Lane codex sign-in lapsed" needs:human')
+        self.assertEqual(out.strip(), "")
+
+    def test_an_open_lane_ask_is_found_by_its_title(self):
+        self._outsider = "0"
+        _, out = self.run_ask_lookup('open_issue "Lane codex sign-in lapsed" needs:human')
+        self.assertEqual(out.strip(), "5")
 
     def contract_repo(self, contract=CONTRACT):
         """Give the remote a submodule pinned behind its tip, the contract
@@ -9380,7 +9515,7 @@ echo fixed > fix.txt
         self.assertTrue(any(c.startswith("codex") for c in self.calls()))
         self.assertFalse(list((self.loom / "state" / "incidents").glob("*base-check")))
 
-    def slot_script(self, body, **env):
+    def slot_script(self, body, *, setup="", **env):
         """Run the runner's check-slot functions, as written in run_lane.sh,
         in a bash of their own with LOG and LOOM_HOME set. The load limits
         are off unless a test sets them, so the load of the machine running
@@ -9389,7 +9524,7 @@ echo fixed > fix.txt
         funcs = re.search(r"^CHECK_SLOTS=.*?^release_check_slot\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
         tmp = Path(self._tmp.name)
         return subprocess.Popen(
-            ["bash", "-c", "LOG=\"$SLOT_LOG\"\n" + funcs + body],
+            ["bash", "-c", "LOG=\"$SLOT_LOG\"\n" + funcs + setup + body],
             env={"PATH": "/usr/bin:/bin", "LOOM_ROOT": str(RUNNER.parent.parent), "LOOM_HOME": str(self.loom), "SLOT_LOG": str(tmp / "slots.log"),
                  "LOOM_CHECK_LOAD_1M": "0", "LOOM_CHECK_LOAD_5M": "0", **env},
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -9699,20 +9834,65 @@ echo fixed > fix.txt
     def test_two_checks_at_once_run_one_at_a_time_with_one_slot(self):
         # Fifteen lanes each started a full suite at once and drove the host
         # to load 130 (2026-11-07). One slot makes two checks take turns.
+        # A clean acquisition on macOS must also work without Python.
+        setup = "python3() { return 1; }\n" if sys.platform == "darwin" else ""
+        self.assert_check_slots_serialize(setup=setup)
+
+    def test_check_slots_serialize_when_mkdir_reports_a_false_success(self):
+        # Affected uutils mkdir: both callers see an absent slot, then the
+        # loser of mkdir(2) reports success because the directory now exists.
+        race = Path(self._tmp.name) / "mkdir-race"
+        race.mkdir()
+        self.assert_check_slots_serialize(
+            setup=r"""
+CHECK_SLOT_SYSTEM=Linux
+OSTYPE=darwin
+mkdir() {
+    if [ "$#" -ne 1 ] || [ "$1" != "$CHECK_SLOT_DIR/slot-1" ]; then
+        command mkdir "$@"
+        return
+    fi
+    [ ! -d "$1" ] || return 1
+    touch "$MKDIR_RACE/$$"
+    while [ "$(find "$MKDIR_RACE" -type f | wc -l)" -lt 2 ]; do sleep 0.01; done
+    command mkdir "$1" 2>/dev/null || [ -d "$1" ]
+}
+""",
+            MKDIR_RACE=str(race),
+        )
+
+    def assert_check_slots_serialize(self, *, setup="", **extra_env):
         tmp = Path(self._tmp.name)
         marks = tmp / "marks"
         body = ('acquire_check_slot || exit 3\n'
-                'echo "start" >> "$MARKS"\nsleep 1\n'
+                'echo "start" >> "$MARKS"\n'
+                'deadline=$((SECONDS + 10))\n'
+                'while [ "$SECONDS" -lt "$deadline" ] && '
+                '! grep -q "waiting for a check slot" "$LOG" 2>/dev/null && '
+                '[ "$(wc -l < "$MARKS")" -lt 2 ]; do sleep 0.02; done\n'
                 'echo "end" >> "$MARKS"\nrelease_check_slot\n')
-        env = {"LOOM_CHECK_SLOTS": "1", "LOOM_CHECK_SLOT_POLL": "0.1", "MARKS": str(marks)}
-        procs = [self.slot_script(body, **env) for _ in range(2)]
-        for proc in procs:
-            out, err = proc.communicate(timeout=60)
-            self.assertEqual(proc.returncode, 0, err)
+        env = {"LOOM_CHECK_SLOTS": "1", "LOOM_CHECK_SLOT_POLL": "0.1",
+               "LOOM_CHECK_SLOT_WAIT": "15", "MARKS": str(marks)}
+        procs = [self.slot_script(body, setup=setup, **env, **extra_env) for _ in range(2)]
+        outcomes = []
+        try:
+            for proc in procs:
+                _, err = proc.communicate(timeout=30)
+                outcomes.append((proc.pid, proc.returncode, err))
+        finally:
+            for proc in procs:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.communicate()
+        log_path = tmp / "slots.log"
+        slot_log = log_path.read_text() if log_path.exists() else ""
+        detail = f"Processes (PID, exit, stderr): {outcomes!r}\nSlot log:\n{slot_log}"
+        for _, returncode, _ in outcomes:
+            self.assertEqual(returncode, 0, detail)
         events = marks.read_text().split()
-        self.assertEqual(events, ["start", "end", "start", "end"])
-        self.assertIn("waiting for a check slot", (tmp / "slots.log").read_text())
-        self.assertEqual(list((self.loom / "run" / "check-slots").iterdir()), [])
+        self.assertEqual(events, ["start", "end", "start", "end"], detail)
+        self.assertIn("waiting for a check slot", slot_log, detail)
+        self.assertEqual(list((self.loom / "run" / "check-slots").iterdir()), [], detail)
 
     def test_slots_default_to_three(self):
         body = ('echo "$CHECK_SLOTS"\n')

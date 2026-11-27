@@ -12,6 +12,12 @@ from . import labels, spend, state_store
 
 HEARTBEAT_MAX_AGE = 600
 LIMIT = "limit:"
+# A slot the operator holds (lanes/run_lane.sh slot_held, LOOM_<SLOT>_HELD)
+# beats unavailable with a reason that starts with HELD. It is no limit: a
+# limit has a retry time and a long one raises the lane-held invariant, while
+# a hold lasts until the operator clears it.
+HELD = "held:"
+HELD_REASON = "Held by the operator (LOOM_<SLOT>_HELD)"
 STATES = ("serving", "limited", "parked", "off", "busy")
 RUNNER_UNAVAILABLE = "Runner reported unavailable"
 STALE = "Heartbeat is stale"
@@ -65,6 +71,8 @@ def evaluate(beat: Any, now: float, *, window: float = HEARTBEAT_MAX_AGE,
     reason = str(beat.get("reason") or "")
     if reason.startswith(LIMIT):
         return _limit_state(reason, at, epoch(beat.get("retry_at")), now)
+    if reason.startswith(HELD):
+        return State("parked", HELD_REASON, at)
     return State("off", RUNNER_UNAVAILABLE, at)
 
 

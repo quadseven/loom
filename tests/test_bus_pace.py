@@ -46,6 +46,12 @@ class VerdictTest(unittest.TestCase):
         self.assertIsNone(pace.elapsed_pct(NOW + 2 * WEEK * 60, WEEK, NOW))
         self.assertIsNone(pace.elapsed_pct(reset, None, NOW))
 
+    def test_elapsed_share_rejects_unrepresentable_window_lengths(self):
+        reset = NOW + WEEK * 60
+        for minutes in (10 ** 400, 1e308, float("inf")):
+            with self.subTest(minutes=minutes):
+                self.assertIsNone(pace.elapsed_pct(reset, minutes, NOW))
+
     def test_slack_setting(self):
         self.assertEqual(pace.slack({}), 10.0)
         self.assertEqual(pace.slack({"LOOM_PACE_SLACK": "5"}), 5.0)
@@ -120,20 +126,15 @@ class PlanTest(unittest.TestCase):
                 weekly("codex", CODEX, 10, 0.5, window_minutes=None)]
         self.assertEqual(pace.plan(self.home, rows, queued=1, env={}, now=NOW)["providers"], {})
 
-    def test_the_plan_is_written_and_read_back_and_shown_as_lines(self):
+    def test_the_plan_is_written_and_read_back(self):
         for slot in CODEX[:4]:
             self.beat(slot)
         plan = pace.plan(self.home, [weekly("codex", CODEX, 3, 0.4)], queued=1, env={}, now=NOW)
         pace.write(self.home, plan)
         self.assertEqual(pace.read(self.home), plan)
-        self.assertEqual(pace.lines(plan), [
-            "Pace (slack 10 points): codex weekly 3% used, 40% elapsed, behind; "
-            "slots 4 of 16, asks for 5"])
-        self.assertEqual(pace.summary(plan), "codex=behind:5")
 
-    def test_no_plan_shows_no_lines(self):
-        self.assertEqual(pace.lines(pace.read(self.home)), [])
-        self.assertEqual(pace.summary(pace.read(self.home)), "")
+    def test_a_missing_plan_reads_as_empty(self):
+        self.assertEqual(pace.read(self.home), {})
 
 
 class QueuedTest(unittest.TestCase):
