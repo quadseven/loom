@@ -512,6 +512,28 @@ class PullRequests(Base):
         self.assertEqual(self.merged, [])
         self.assertIn("_MonitorMap.__getitem__", f.notes)
 
+    def test_vacuous_finding_repeated_on_two_rungs_holds_for_brain(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5)
+        self.gh.contents["bus/a.py"] = (
+            "class _MonitorMap(dict):\n"
+            "    def __getitem__(self, key):\n"
+            "        return next(iter(self.values()))\n")
+        self.gh.contents["tests/test_a.py"] = "def test_map():\n    assert True\n"
+        # A prior rung already recorded this fixture finding.
+        self.gh.comments[5].append(
+            {"body": "<!-- loom:vacuous rung 1 -->\ndefines _MonitorMap.__getitem__",
+             "user": ME})
+        f = self.go()
+        self.assertEqual(self.merged, [])
+        self.assertEqual(self.fixed, [])
+        names = [x["name"] for x in self.gh.issues[5]["labels"]]
+        self.assertIn("needs-brain", names)
+        held = [str(c.get("body") or "") for c in self.gh.comments[5]]
+        self.assertTrue(any("two rungs" in body and "defines _MonitorMap.__getitem__" in body
+                            for body in held),
+                        "no hold comment naming the repeated finding: %r" % held)
+
     def test_a_pull_request_with_unbuilt_non_live_criteria_goes_back(self):
         criteria = ["A%d" % n for n in range(1, 6)] + ["Live: observed after deploy"]
         ticket_body = ("Difficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n" +

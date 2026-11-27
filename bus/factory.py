@@ -727,6 +727,8 @@ NO_AREA_NOTE = (
 
 REVIEW_FAILED_RUNG = "<!-- loom:review-failed-rung %d -->"
 REVIEW_FAILED_RUNG_RE = re.compile(r"<!-- loom:review-failed-rung (\d+) -->")
+# Posted once per head commit when a vacuum finding repeats on two rungs.
+VACUOUS_HOLD_MARKER = "<!-- loom:vacuous-hold %s -->"
 REVIEW_SPLIT_NOTE = (
     "Held for the brain: review findings survived fix rounds on two model rungs. "
     "Split this ticket into smaller tickets with After: lines between dependent slices "
@@ -2747,6 +2749,40 @@ class Factory:
         self.actions += 1
         _say("closed %s#%d: its ticket is past the model ladder" % (repo, number))
 
+    def _hold_vacuous(self, repo: str, number: int, issue: Dict[str, Any],
+                      comments: List[Dict[str, Any]], finding: str) -> None:
+        """Hold the ticket for the brain: a vacuum finding repeated on two rungs.
+
+        Quotes the finding and marks needs-brain. No fix round is sent and no
+        further model rung is tried. Once per head commit.
+        """
+        sha = str((issue.get("head") or {}).get("sha") or "")
+        marker = VACUOUS_HOLD_MARKER % sha
+        if any(marker in str(c.get("body") or "") for c in comments):
+            return
+        if "needs-brain" not in _labels(issue):
+            self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, int(issue["number"])),
+                         {"labels": ["needs-brain"]})
+            issue["labels"] = list(issue.get("labels") or []) + [{"name": "needs-brain"}]
+        notify.post(self.gh, repo, int(issue["number"]),
+                    "%s\nThe vacuous-test gate found the same fixture finding on two rungs, so "
+                    "the factory stopped climbing the model ladder and holds the ticket for "
+                    "the brain; no fix round was sent.\n\nFactory finding: %s"
+                    % (marker, finding), notify.HELD)
+        self.actions += 1
+        _say("held %s#%d for the brain: vacuum finding repeated on two rungs: %s"
+             % (repo, number, finding))
+
+    def _record_vacuous_finding(self, repo: str, number: int, issue: Dict[str, Any],
+                                comments: List[Dict[str, Any]], findings: Sequence[str]) -> None:
+        """Record each vacuum finding at the current rung so a later repeat is
+        caught by repeated_finding and the ticket is held instead of climbing."""
+        rung = current_rung(issue) or rung_of(comments)
+        body = "".join(
+            "<!-- loom:vacuous rung %d -->\n%s\n" % (rung, finding) for finding in findings)
+        notify.post(self.gh, repo, int(issue["number"]), body, notify.RECORD)
+        self.actions += 1
+
     def _send_back(self, repo: str, pr: Dict[str, Any], issue: Dict[str, Any],
                    comments: List[Dict[str, Any]], why: str,
                    open_threads: Sequence[str] = (), checks_failing: bool = False,
@@ -3344,6 +3380,14 @@ class Factory:
         vacuity = self._vacuous_findings(repo, number, full, issue)
         if vacuity:
             finding = "; ".join(vacuity)
+            repeat = vacuous.repeated_finding(vacuity, comments)
+            if repeat is not None:
+                # The same fixture finding failed on two rungs: hold for the
+                # brain with the finding quoted, and do not spend another
+                # model rung on it.
+                self._hold_vacuous(repo, number, issue, comments, repeat)
+                return
+            self._record_vacuous_finding(repo, number, issue, comments, vacuity)
             self._send_back(repo, full, issue, comments,
                             "vacuous-test gate: " + finding, finding=finding)
             return

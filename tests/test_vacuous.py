@@ -119,3 +119,20 @@ class VacuousTests(unittest.TestCase):
             self.assertEqual(result.passed_on_base, ["tests.test_new.TestNew.test_passes_on_base"])
             self.assertEqual(result.failed_on_base, ["tests.test_new.TestNew.test_fails_on_base"])
 
+    def test_same_vacuous_finding_on_two_rungs_is_held(self):
+        comments = [{"body": "<!-- loom:vacuous rung 1 -->\nchanges a fixture used by test test_x",
+                     "user": {"login": "alice-example"}}]
+        self.assertEqual(vacuous.repeated_finding(
+            ["changes a fixture used by test test_x"], comments),
+            "changes a fixture used by test test_x")
+
+    def test_differing_vacuous_finding_still_climbs(self):
+        comments = [{"body": "<!-- loom:vacuous rung 1 -->\nchanges a fixture used by test test_a",
+                     "user": {"login": "alice-example"}}]
+        self.assertIsNone(vacuous.repeated_finding(
+            ["changes a fixture used by test test_b"], comments))
+
+    def test_vacuous_finding_not_recorded_yet_climbs(self):
+        self.assertIsNone(vacuous.repeated_finding(
+            ["changes a fixture used by test test_x"], []))
+

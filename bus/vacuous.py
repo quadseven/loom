@@ -194,6 +194,29 @@ def diff_findings(code_sources: Dict[str, str], test_sources: Dict[str, str],
     return findings
 
 
+# A vacuum finding recorded on a ticket, with the rung it was seen on.
+_VACUOUS_RE = re.compile(
+    r"<!--\s*loom:vacuous\s+rung\s+\d+\s*-->(.*?)(?=<!--\s*loom:vacuous|\Z)", re.S)
+
+
+def repeated_finding(findings: Sequence[str], comments: Sequence[Dict[str, Any]]) -> Optional[str]:
+    """The finding already seen on a prior rung, else None.
+
+    The factory records each vacuum finding as a comment whose first line is
+    ``<!-- loom:vacuous rung N -->`` and whose body is the finding. When the
+    same finding is found again on a later rung, return it so the factory
+    holds the ticket for the brain instead of climbing another rung. A finding
+    that differs from every prior one returns None, so the ticket climbs.
+    """
+    for comment in comments or ():
+        body = str(comment.get("body") or "")
+        for match in _VACUOUS_RE.finditer(body):
+            block = match.group(1).strip()
+            if block and block in findings:
+                return block
+    return None
+
+
 def _filename(item: Dict[str, object]) -> str:
     return str(item.get("filename") or "")
 
