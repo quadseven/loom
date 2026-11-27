@@ -458,7 +458,7 @@ def _daily_rows(by_name: dict[str, list[dict[str, Any]]], now: datetime) -> list
                 reset_text = datetime.fromisoformat(reset).strftime("%Y-%m-%d %H:%M UTC")
                 detail = "%s used. Resets %s." % (amount, reset_text)
                 if pacing is not None:
-                    detail += " " + pacing + "."
+                    detail += " " + _sentence(pacing)
             out.append((label, detail))
             break
     return out

@@ -64,6 +64,11 @@ class DailyAllowanceTest(unittest.TestCase):
                 self.assertEqual(actual["expected_pct"], expected)
                 self.assertEqual(actual["verdict"], "ahead" if hour == 12 else "on")
 
+    def test_a_same_tick_reading_remains_current_after_iso_rounding(self):
+        now = NOON + 0.000_000_8
+        [actual, _] = daily_allowance.rows([reading(observed=now, used=0)], now, TARGET)
+        self.assertEqual(actual["used"], 0)
+
     def test_verdict_respects_the_existing_slack_setting(self):
         rows = [reading(used=500), reading("workersai", used=9500, limit=10000)]
         defaults = daily_allowance.rows(rows, NOON, TARGET)

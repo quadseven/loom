@@ -24,6 +24,8 @@ def _target(hour_value: object, share_value: object) -> tuple[int, float] | None
 
 def _row(provider: str, unit: str, source: Mapping[str, Any], now: float,
          target: tuple[int, float] | None, points: float) -> dict[str, Any]:
+    # Meter timestamps are stored as ISO datetimes with microsecond precision.
+    now = round(now, 6)
     result: dict[str, Any] = {
         "provider": provider, "used": None, "limit": None, "unit": unit,
         "resets_at": None, "observed_at": None, "verdict": None, "expected_pct": None,

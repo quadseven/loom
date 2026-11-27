@@ -135,7 +135,7 @@ class UsageDashboardTests(unittest.TestCase):
         self.assertIn("OpenRouter", summary)
         self.assertIn("0 of 1000 requests used", summary)
         self.assertIn("Resets 2026-10-19 00:00 UTC", summary)
-        self.assertIn("behind pace, target 90% by 18:00 UTC", summary)
+        self.assertIn("Behind pace, target 90% by 18:00 UTC", summary)
         self.assertIn("Workers AI", summary)
         self.assertIn("2999.50 of 10000 Neurons used", summary)
         self.assertEqual(summary.count("target 90%"), 1)
