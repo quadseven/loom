@@ -5196,6 +5196,31 @@ lane_extra_ready() {
   fi
 }
 
+# An operator's hold on one slot, LOOM_<SLOT>_HELD: a new slot can be deployed
+# and beat without taking a ticket until the operator clears it. Only the
+# slot's own name is read, never the lane-wide name lane_setting falls back
+# to: LOOM_CLAUDE_HELD is the claude slot's own setting, and read as a
+# fallback it would hold claude-2 too. Unset, empty, 0, false, no or off (any
+# case) leave the slot free; any other value holds it, so a mistyped value
+# holds rather than releases. Sets SLOT_HELD_WHY while it holds.
+SLOT_HELD_WHY=""
+slot_held() {
+  local name value
+  name="$(setting_var "$SLOT" HELD)"
+  value="$(printf '%s' "${!name:-}" | tr '[:upper:]' '[:lower:]')"
+  case "$value" in ''|0|false|no|off) return 1 ;; esac
+  SLOT_HELD_WHY="held: $name is set; the slot takes no tickets until it is cleared"
+}
+
+# A held slot beats unavailable on every pass and runs nothing: the station
+# shows it parked as held (bus/lane_state.py HELD), routes it no ticket and
+# moves a ticket already briefed to it on, as for a down lane. A brief in its
+# inbox stays where it is.
+if slot_held; then
+  heartbeat false "$SLOT_HELD_WHY"
+  exit 0
+fi
+
 # Timeouts must be positive integers: `timeout 0` means no limit at all, and a
 # wedged agent would then hold the lane lock forever.
 for t in "AGENT_TIMEOUT:$AGENT_TIMEOUT:60" "NET_TIMEOUT:$NET_TIMEOUT:1" "CHECK_TIMEOUT:$CHECK_TIMEOUT:60"; do
