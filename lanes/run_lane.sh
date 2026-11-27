@@ -2172,7 +2172,7 @@ ask_sign_in() {
 # keep one comment on it with a running count headed $3, never one per failure.
 file_ask() {
   local title="$1" body="$2" headline="$3" number existing
-  existing="$(open_issue "$title")"
+  existing="$(open_issue "$title" needs:human)"
   if [ -n "$existing" ]; then
     printf '' | upsert_sticky_comment "$FACTORY_REPO" "$existing" "$KEY_REPEAT_MARKER" repeat \
       --headline "$headline" --items-label "Lanes seen" --item "$SLOT" ||
@@ -2197,9 +2197,11 @@ file_ask() {
 # title is the one ask: a higher one closes itself and counts its lane on the
 # lowest. The earlier filer never closes, since every later ask has a higher
 # number and every later listing sees it. A failed listing keeps the ask.
+# Only needs:human issues count, for the reason open_issue gives.
 settle_ask() {
   local title="$1" number="$2" headline="$3" first
   first="$(TITLE="$title" gh issue list --repo "$FACTORY_REPO" --state open --limit 500 \
+             --label needs:human \
              --json number,title --jq '.[] | select(.title == env.TITLE) | .number' \
              2>>"$LOG" | tr -cd '0-9\n' | sort -n | head -1)" || return 0
   [ -n "$first" ] && [ "$first" -lt "$number" ] || return 0
@@ -2493,8 +2495,11 @@ safe_git() {
 
 # Every lane shares one GitHub App identity, so each lane signs what it writes
 # (bus/signature.py): a final "Signed: lane-<slot>, model <model>" line on each
-# pull request body and comment, and Loom-Lane and Loom-Model trailers on each
-# commit. The model is the run's own ($MODEL), else LOOM_<SLOT>_MODEL.
+# pull request body and comment, and Loom-Engine, Loom-Model, Loom-Lane and
+# Loom-Run trailers on each commit. The model is the run's own ($MODEL), else
+# LOOM_<SLOT>_MODEL. The engine is the agent program run_agent starts for the
+# lane (lane_engine). The run is LOOM_RUN_ID when set, else the brief's name
+# ($TICKET), the name the run's log and lane-log notes carry.
 # signed prints $1 with exactly one signature line; commit_msg prints $1 with
 # the trailers. Both fall back to the plain text when python is unavailable, so
 # a signing fault never costs the run its comment or commit.
@@ -2507,10 +2512,21 @@ signed() {
 # sign_tail prints the signature on its own paragraph, to end a message whose
 # leading words must stay literal (a close comment states its reason first).
 sign_tail() { printf '\n\n%s' "$(signed "")"; }
+# lane_engine prints the agent program run_agent starts for $LANE, and nothing
+# for a lane it does not know (the trailer then reads LOOM_<SLOT>_ENGINE, else
+# unknown). Keep it in step with run_agent.
+lane_engine() {
+  case "${LANE:-}" in
+    codex|claude|agy|copilot) printf '%s' "$LANE" ;;
+    anthropic) printf 'claude' ;;
+    openrouter|tinker|opencode-go|zen|spark|free|zai|workersai) printf 'opencode' ;;
+  esac
+}
 commit_msg() {
   local out
   out="$(PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.signature message \
-    --lane "$SLOT" --model "${MODEL:-}" "$1" 2>> "${LOG:-/dev/null}")" || out="$1"
+    --lane "$SLOT" --model "${MODEL:-}" --engine "$(lane_engine)" \
+    --run "${LOOM_RUN_ID:-${TICKET:-}}" "$1" 2>> "${LOG:-/dev/null}")" || out="$1"
   printf '%s' "$out"
 }
 
@@ -2900,8 +2916,12 @@ KEY_REPEAT_MARKER="<!-- loom:key-repeat v1 -->"
 INCIDENT_REPEAT_MARKER="<!-- loom:incident-repeat v1 -->"
 # The number of the open issue on the factory repo whose title is exactly $1,
 # empty when there is none: one open issue per incident kind, per expired key.
+# The open issue titled $1 that carries label $2 (needs:human for an ask,
+# loom:factory for an incident). The factory repo is public, so anyone can
+# open an issue with the exact title, but only a collaborator can label it:
+# an outsider's issue must never swallow the lane's ask or incident.
 open_issue() {
-  TITLE="$1" gh search issues --repo "$FACTORY_REPO" --state open \
+  TITLE="$1" gh search issues --repo "$FACTORY_REPO" --state open --label "$2" \
     --json number,title --jq '.[] | select(.title == env.TITLE) | .number' \
     -- "$1" 2>>"$LOG" | head -1
 }
@@ -3062,7 +3082,7 @@ file_factory_incident() {  # kind, detail
   title="Factory incident: $subject validation $kind"
   body="$(printf '%s\n\nRepo: %s\nKind: %s\nTicket: %s\n\n%s\n' \
     "$INCIDENT_MARKER" "$subject" "$kind" "$ticket" "$detail")"
-  existing="$(open_issue "$title")"
+  existing="$(open_issue "$title" loom:factory)"
   if [ -n "$existing" ]; then
     number="$existing"
     # One comment on the incident with a running count, never one per run.
@@ -3154,10 +3174,37 @@ CHECK_SLOT_WAIT="${LOOM_CHECK_SLOT_WAIT:-5400}"
 CHECK_SLOT_POLL="${LOOM_CHECK_SLOT_POLL:-5}"
 CHECK_SLOT_DIR="$LOOM_HOME/run/check-slots"
 CHECK_SLOT_HELD=""
+CHECK_SLOT_SYSTEM="$(/usr/bin/uname -s 2>/dev/null)" || CHECK_SLOT_SYSTEM=""
 [[ "$CHECK_SLOTS" =~ ^[1-9][0-9]*$ ]] || CHECK_SLOTS=3
 [[ "$CHECK_SLOT_WAIT" =~ ^[0-9]+$ ]] || CHECK_SLOT_WAIT=5400
 [[ "$CHECK_SLOT_POLL" =~ ^[0-9]+(\.[0-9]+)?$ ]] || CHECK_SLOT_POLL=5
 . "$LOOM_ROOT/lanes/host_load.sh" || exit 1
+
+# Keep the guard outside the slot directory and hold it through the rename.
+# The shell owns fd 9, so the flock survives the Python process taking it.
+reclaim_check_slot() (
+  local slot="$1" pid="$2"
+  python3 -IB -c '
+import fcntl
+try:
+    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    raise SystemExit(1)
+' 2>>"$LOG" || return 1
+  [ "$(cat "$slot/pid" 2>/dev/null)" = "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null && return 1
+  mv "$slot" "$slot.stale.$$" 2>/dev/null
+) 9>>"$CHECK_SLOT_DIR.guard"
+
+# Darwin's system mkdir avoids starting Python for each acquisition. On other
+# systems use the syscall directly: uutils mkdir can falsely report success.
+create_check_slot() {
+  if [ "$CHECK_SLOT_SYSTEM" = Darwin ]; then
+    /bin/mkdir "$1" 2>/dev/null
+  else
+    python3 -IB -c 'import os, sys; os.mkdir(sys.argv[1])' "$1" 2>/dev/null
+  fi
+}
 
 # Try each slot once; sets CHECK_SLOT_HELD and returns 0 on a take.
 try_check_slot() {
@@ -3165,7 +3212,7 @@ try_check_slot() {
   mkdir -p "$CHECK_SLOT_DIR" 2>/dev/null || return 1
   for n in $(seq 1 "$CHECK_SLOTS"); do
     slot="$CHECK_SLOT_DIR/slot-$n"
-    if mkdir "$slot" 2>/dev/null; then
+    if create_check_slot "$slot"; then
       echo $$ > "$slot/pid"
       CHECK_SLOT_HELD="$slot"
       return 0
@@ -3174,12 +3221,11 @@ try_check_slot() {
     # A slot with no pid yet is being taken this instant; leave it.
     [[ "$pid" =~ ^[0-9]+$ ]] || continue
     kill -0 "$pid" 2>/dev/null && continue
-    # Stale: move it aside first (atomic), so a slot another waiter has just
-    # re-made is never the directory removed.
-    if mv "$slot" "$slot.stale.$$" 2>/dev/null; then
+    # Recheck under the guard: another waiter may already have reclaimed it.
+    if reclaim_check_slot "$slot" "$pid"; then
       echo "check slot $n was held by pid $pid, which is gone; reclaimed" >> "$LOG"
       rm -rf "$slot.stale.$$"
-      if mkdir "$slot" 2>/dev/null; then
+      if create_check_slot "$slot"; then
         echo $$ > "$slot/pid"
         CHECK_SLOT_HELD="$slot"
         return 0
@@ -5149,6 +5195,31 @@ lane_extra_ready() {
     [[ "$LANE_ACCOUNT" =~ ^[A-Za-z0-9]+$ ]] || { READY_REASON="no account id readable at $(lane_var ACCOUNT_SSM)"; return 1; }
   fi
 }
+
+# An operator's hold on one slot, LOOM_<SLOT>_HELD: a new slot can be deployed
+# and beat without taking a ticket until the operator clears it. Only the
+# slot's own name is read, never the lane-wide name lane_setting falls back
+# to: LOOM_CLAUDE_HELD is the claude slot's own setting, and read as a
+# fallback it would hold claude-2 too. Unset, empty, 0, false, no or off (any
+# case) leave the slot free; any other value holds it, so a mistyped value
+# holds rather than releases. Sets SLOT_HELD_WHY while it holds.
+SLOT_HELD_WHY=""
+slot_held() {
+  local name value
+  name="$(setting_var "$SLOT" HELD)"
+  value="$(printf '%s' "${!name:-}" | tr '[:upper:]' '[:lower:]')"
+  case "$value" in ''|0|false|no|off) return 1 ;; esac
+  SLOT_HELD_WHY="held: $name is set; the slot takes no tickets until it is cleared"
+}
+
+# A held slot beats unavailable on every pass and runs nothing: the station
+# shows it parked as held (bus/lane_state.py HELD), routes it no ticket and
+# moves a ticket already briefed to it on, as for a down lane. A brief in its
+# inbox stays where it is.
+if slot_held; then
+  heartbeat false "$SLOT_HELD_WHY"
+  exit 0
+fi
 
 # Timeouts must be positive integers: `timeout 0` means no limit at all, and a
 # wedged agent would then hold the lane lock forever.

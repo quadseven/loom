@@ -55,6 +55,7 @@ from . import lane_markers
 from . import log_capture
 from . import operator_budget
 from . import pace
+from . import subscription_view
 from . import fabric, fabric_reviews
 from . import fixrounds
 from . import logrotate
@@ -120,7 +121,7 @@ from . import lock
 from .brain import HUMAN_MARKER, LANES_REPUBLISH, human as brain_human
 from . import home_repo
 from . import brain
-from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, TargetReached,
+from .github import (GitHub, GitHubError, GitHubOutage, RateLimited, ShadowHeld, TargetReached,
                      _OPENER, _next_link, read_ssm, rest_login, secret_read_reason,
                      unreadable)
 from .journal import REPLY_RE
@@ -3700,12 +3701,14 @@ class Station:
 
     def down_lanes(self) -> List[str]:
         """Lanes whose fresh heartbeat says unavailable for a reason other
-        than a limit (an expired key, a lane stopped on purpose). A stale or
-        missing heartbeat is not counted: a lane deep in a long run can go
-        quiet without being down."""
+        than a limit (an expired key, a lane stopped on purpose, a slot the
+        operator holds with LOOM_<SLOT>_HELD). A stale or missing heartbeat
+        is not counted: a lane deep in a long run can go quiet without being
+        down."""
         out: List[str] = []
+        down = (lane_state.RUNNER_UNAVAILABLE, lane_state.HELD_REASON)
         for lane in LANES:
-            if lane_state.evaluate(self._local_beat(lane), self.now).reason == lane_state.RUNNER_UNAVAILABLE:
+            if lane_state.evaluate(self._local_beat(lane), self.now).reason in down:
                 out.append(lane)
         return out
 
@@ -6735,6 +6738,9 @@ class Station:
             return
         if "loom:failed" in labels and target != "loom:merged":
             return
+        if target == "loom:merged" and pr.get("number") in tickets.rejected_pulls(
+                self._status_texts(repo, int(number))):
+            return
         if target == "loom:merged" and "loom:failed" in labels:
             states = {"loom:" + state for state in brain.STATES + tickets.TICKET_STATES}
             kept = self._drop_claim(name for name in labels
@@ -6748,9 +6754,6 @@ class Station:
                           % int(pr["number"]))
             _say("%s#%d: merged pull request #%d moved failed ticket to loom:merged"
                  % (repo, number, int(pr["number"])))
-            return
-        if target == "loom:merged" and pr.get("number") in tickets.rejected_pulls(
-                self._status_texts(repo, int(number))):
             return
         if target == "loom:merged" and "loom:regression" in labels:
             events = self._paginate("/repos/%s/issues/%d/events" % (repo, number))
@@ -9162,7 +9165,7 @@ class Station:
         slots = set(runners.runner_slots())
         eligible = [lane for lane in free if lane not in slots and self._inbox_empty(lane)
                     and (not needs_public_repo(lane, "") or self._public(repo))]
-        credit = ("claude",) + factory.ANTHROPIC
+        credit = factory.CLAUDE + factory.ANTHROPIC
         return next((lane for lane in eligible if lane not in credit),
                     eligible[0] if eligible else None)
 
@@ -9389,6 +9392,8 @@ class Station:
             done = flake.rerun_once(self.gh, repo, runs, flaky)
             if not done:
                 return False
+        except GitHubOutage:
+            raise
         except GitHubError as err:
             self._cannot_re_run(repo, err)
             return False
@@ -9492,10 +9497,9 @@ class Station:
 
     def _weakened_tests(self, repo: str, pr_number: int) -> List[str]:
         """The weakened-test lines in a lane pull request's diff
-        (bus/weakened.py), read from the files GitHub lists for it, page
-        by page while a page comes back full. A read that fails names
-        none: the evaluation goes as it did before the pre-check, and the
-        review remains the backstop."""
+        (bus/weakened.py), read from the files GitHub lists for it. Ordinary
+        read errors leave the review as the backstop. A GitHub outage
+        pauses evaluation."""
         try:
             entries = self.gh.rest("GET", "/repos/%s/pulls/%d/files?per_page=100"
                                    % (repo, pr_number)).data
@@ -9508,6 +9512,8 @@ class Station:
                     break
                 entries = entries + more
                 page += 1
+        except GitHubOutage:
+            raise
         except (GitHubError, ValueError, TypeError, AssertionError) as err:
             _say("weakened-test pre-check: could not read %s#%d files (%s)"
                  % (repo, pr_number, err))
@@ -9565,18 +9571,22 @@ class Station:
 
     def _trunk_for(self, repo: str, issue: Dict[str, Any]) -> str:
         """The goal home's Trunk branch, else the repo's default branch, else
-        "". An unreadable goal home or repo reads as no trunk, so a pull
-        request whose base cannot be compared is not blocked here."""
+        "". Ordinary read errors leave the trunk unknown. A GitHub outage
+        pauses evaluation."""
         trunk = ""
         try:
             goal = brain._goal_home_for_ticket(self.gh, repo, issue)
             if isinstance(goal, dict):
                 trunk = str(brain.goal_trunk(goal) or "")
+        except GitHubOutage:
+            raise
         except (GitHubError, ValueError, TypeError):
             trunk = ""
         if not trunk:
             try:
                 trunk = self._default_branch(repo)
+            except GitHubOutage:
+                raise
             except (GitHubError, ValueError, TypeError):
                 trunk = ""
         return trunk
@@ -9584,9 +9594,12 @@ class Station:
     def _has_pull_request_workflow(self, repo: str) -> bool:
         """Whether the repo has a workflow that runs on pull_request: only then
         does the repo's own CI need to have run on a lane pull request's head
-        for it to be ready. An unreadable workflow list reads as none."""
+        for it to be ready. Ordinary read errors fall back to no workflow
+        evidence. A GitHub outage pauses evaluation."""
         try:
             listing = self.gh.rest("GET", "/repos/%s/contents/.github/workflows" % repo).data
+        except GitHubOutage:
+            raise
         except (GitHubError, ValueError, TypeError, AssertionError):
             return False
         if not isinstance(listing, list):
@@ -9599,6 +9612,8 @@ class Station:
                 continue
             try:
                 workflow = self._contents_text(repo, path)
+            except GitHubOutage:
+                raise
             except (GitHubError, ValueError, TypeError, AssertionError):
                 continue
             if workflow is not None and _has_pull_request_trigger(workflow):
@@ -9612,6 +9627,8 @@ class Station:
         try:
             data = self.gh.rest("GET", "/repos/%s/commits/%s/check-runs?per_page=100"
                                 % (repo, sha)).data or {}
+        except GitHubOutage:
+            raise
         except (GitHubError, ValueError, TypeError, AssertionError):
             return False
         runs = data.get("check_runs") or []
@@ -11473,10 +11490,13 @@ class Station:
         return None
 
     def _lanes_body(self, rows: List[Tuple[str, str, str, str]],
-                    pr_lines: Optional[List[str]] = None) -> str:
+                    pr_lines: Optional[List[str]] = None,
+                    subscriptions: Optional[List[Dict[str, Any]]] = None) -> str:
         summary = self._spend_shown()
         disk = [line for line in (self._disk_status_line(), self._watchdog_notice()) if line]
         probes = signin.by_slot(signin.read(self.s.home))
+        if subscriptions is None:
+            subscriptions = subscription_view.read(self.s.home, self.now, os.environ)
         body = "\n".join(
             [LANES_MARKER, "Updated " + self._utc(self.now),
              station_beat.stamp_line(station_beat.station_settings(os.environ)[0]), ""]
@@ -11487,7 +11507,7 @@ class Station:
                for row in rows]
             + ["", "Remote claims: muse %d/%d" % (
                 self._remote_claim_count("muse"), REMOTE_LANES["muse"]["slots"])]
-            + pace.lines(pace.read(self.s.home))
+            + subscription_view.lines(subscriptions)
             + (pr_lines or [])
             + self._scorecard_lines()
             + (["", summary.line()] if summary is not None else []))
@@ -11590,8 +11610,8 @@ class Station:
         # Claims paused or resumed for disk republishes (loom#1808).
         values["disk"] = "paused" if self._disk_status_line() else "ok"
         values["disk watchdog"] = self._watchdog_notice() or ""
-        # A new pace verdict or slot request republishes (loom#3630).
-        values["pace"] = pace.summary(pace.read(self.s.home))
+        subscriptions = subscription_view.read(self.s.home, self.now, os.environ)
+        values["pace"] = subscription_view.signature(subscriptions)
         if refresh_pr_counts:
             read_lines, read_at = self._repo_pr_lines(), self.now
             pr_lines = read_lines
@@ -11601,7 +11621,8 @@ class Station:
         if self._lanes_unchanged(repo, values):
             return
         number = self._lanes_issue(repo)
-        comment_id = self._upsert_lanes_comment(repo, number, self._lanes_body(rows, pr_lines))
+        comment_id = self._upsert_lanes_comment(
+            repo, number, self._lanes_body(rows, pr_lines, subscriptions))
         record = {"repo": repo, "issue": number, "comment_id": comment_id,
                   "values": values, "at": self.now}
         if read_lines is not None:
@@ -14528,8 +14549,9 @@ class Station:
         contradict each other or describe a step that is over, on at most
         label_pass.PER_RUN issues a run, at most once every label_pass.EVERY
         seconds. A body Part of #N that disagrees with the sub-issue parent is
-        one health note in the state file, said once. In shadow each removal
-        is a ledger line and is not sent."""
+        one health note in the state file, said once. In shadow the pass
+        still reconciles the states of an open shipped-and-failed issue.
+        Other changes are ledger lines."""
         path = os.path.join(self.state, label_pass.STATE_FILE)
         state = _read_json(path, {}, strict=False)
         state = state if isinstance(state, dict) else {}
@@ -14592,42 +14614,50 @@ class Station:
                 notes.pop(key, None)
             if not (found.remove or found.add) or changed >= left:
                 continue
-            self._add_labels(repo, number, found.add)
-            for removal in found.remove:
-                self._unlabel(repo, number, removal)
-            # A shadow repo's removals are ledger lines that are never sent,
-            # so the same issues come first on every pass: they must not use
-            # up the budget of the repos after it.
-            if not shadow.active(repo):
+            if self._apply_label_plan(repo, issue, found):
                 changed += 1
         return changed
 
-    def _add_labels(self, repo: str, number: int, names: Sequence[str]) -> None:
+    def _apply_label_plan(self, repo: str, issue: Dict[str, Any],
+                          found: label_pass.Plan) -> bool:
+        """Apply the plan and report whether a write used the pass budget."""
+        number = int(issue["number"])
+        reconcile_states = (issue.get("state", "open") == "open"
+                            and {"loom:shipped", "loom:failed"}.issubset(_label_names(issue)))
+        changed = self._add_labels(repo, number, found.add)
+        for removal in found.remove:
+            reconcile = reconcile_states and removal.label in label_pass.STATE_LABELS
+            if self._unlabel(repo, number, removal, reconcile_state=reconcile):
+                changed = True
+        return changed
+
+    def _add_labels(self, repo: str, number: int, names: Sequence[str]) -> bool:
         """Add labels, or in shadow record that they would be added. Added
         before any removal, so a failed write never leaves a ticket with no
-        ask label."""
+        ask label. Return whether an addition was sent."""
         if not names:
-            return
+            return False
         if shadow.active(repo):
             shadow.record_held(shadow.LABEL, repo, number, "issue",
                                reason="add %s" % ", ".join(names), label=names[0],
                                source="station clean_labels")
-            return
+            return False
         self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": list(names)})
         _say("%s#%d: add %s" % (repo, number, ", ".join(names)))
+        return True
 
     def _unlabel(self, repo: str, number: int, removal: Any,
-                 source: str = "station clean_labels") -> None:
-        """Remove one label (a removal with .label and .why), or in shadow
-        record that it would be removed."""
+                 source: str = "station clean_labels", *, reconcile_state: bool = False) -> bool:
+        """Send a label removal, or record it in shadow and return False."""
         why = "remove %s: %s" % (removal.label, removal.why)
-        if shadow.active(repo):
+        if not reconcile_state and shadow.active(repo):
             shadow.record_held(shadow.UNLABEL, repo, number, "issue", reason=why,
                                label=removal.label, source=source)
-            return
+            return False
         self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s"
                      % (repo, number, quote(removal.label, safe="")), ok=(404,))
         _say("%s#%d: %s" % (repo, number, why))
+        return True
 
     def referee_claims(self) -> None:
         """One claim per ticket, idle engine claims expire (bus/claim_referee.py,
@@ -19402,6 +19432,7 @@ class Station:
         # still prunes lane trees, tends the disk and sends its snapshots.
         # From loom#1915 until this change every such pass skipped them, and
         # no lane tree was pruned for hours on 2026-10-26.
+        paused = False
         try:
             self.ask_operator_login()
             self._publish_lanes_when_old()
@@ -19490,8 +19521,14 @@ class Station:
             except (GitHubError, OSError) as err:
                 _say("watch_logs failed: %s" % err)
             self._refresh_shipped_priority_stamp()
+        except GitHubOutage:
+            paused = True
+            raise
         finally:
-            self._end_pass_locally()
+            if paused:
+                self._end_pass_locally(ask_about_disk=False)
+            else:
+                self._end_pass_locally()
 
     def compare_send_back_counts(self) -> None:
         """Run the one seven-day comparison of bus/send_back.py, at most
@@ -19554,19 +19591,18 @@ class Station:
                 self._comment(repo, send_back.TICKET, report, "report")
         _write_json(path, {"completed": True, "compared_at": self.now, "counts": found})
 
-    def _end_pass_locally(self) -> None:
-        """Local housekeeping that needs no GitHub request: finished lane
-        trees, old lane logs, the disk, the usage snapshot and the command
-        chain snapshot."""
+    def _end_pass_locally(self, *, ask_about_disk: bool = True) -> None:
+        """Tend local state, and report a disk warning when GitHub is available."""
         for local in (self.prune_trees, self.tend_watchdog, self.tend_disk):
             try:
                 local()
             except OSError as err:
                 _say("%s failed: %s" % (local.__name__, err))
-        try:
-            self._check_disk_guard_ask()
-        except (GitHubError, OSError) as err:
-            _say("disk guard ask failed: %s" % err)
+        if ask_about_disk:
+            try:
+                self._check_disk_guard_ask()
+            except (GitHubError, OSError) as err:
+                _say("disk guard ask failed: %s" % err)
         self._tend_usage()
 
     def _tend_usage(self) -> None:
@@ -19808,26 +19844,30 @@ def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
     if gh.cache_dir is None:
         # Every GET is conditional: a list re-read each pass costs a 304.
         gh.cache_dir = os.path.join(state, "station", "etags")
+    gh.outage_aware = True
     app = getattr(gh, "app", None)
     if app is not None and getattr(app, "state_file", None) is None:
         # GitHub's ETags differ per token: keep the App token across
         # passes (0600) so last pass's ETags still answer 304 (loom#1306).
         app.state_file = os.path.join(state, "station", "app-token.json")
     beat = None
-    if settings.status_repo and station_beat.enabled(os.environ):
-        # The cross-station guard (loom#3050): stand by while another
-        # station's beat is fresh, whatever backend either one uses.
-        station_id, leased = station_beat.station_settings(os.environ)
-        beat = station_beat.Guard(gh, settings.status_repo, station_id, leased,
-                                  LANES_MARKER, say=_say)
-        reason = beat.verdict()
-        if reason:
-            _say("another station is running: %s; standing by" % reason)
-            return 0
-        beat.stamp()
-    st = Station(gh, settings, **hooks)
-    st.priority_repos = list(priority)
+    st = None
+    paused = False
     try:
+        if getattr(gh, "outage", False) is True:
+            raise GitHubOutage("the outage flag is set", 0, "", int(time.time()))
+        if settings.status_repo and station_beat.enabled(os.environ):
+            # Stand by while another station has a fresh beat (loom#3050).
+            station_id, leased = station_beat.station_settings(os.environ)
+            beat = station_beat.Guard(gh, settings.status_repo, station_id, leased,
+                                      LANES_MARKER, say=_say)
+            reason = beat.verdict()
+            if reason:
+                _say("another station is running: %s; standing by" % reason)
+                return 0
+            beat.stamp()
+        st = Station(gh, settings, **hooks)
+        st.priority_repos = list(priority)
         if use_launchd:
             st._refresh_lane_jobs()
         st.sample_operator_budget()
@@ -19838,17 +19878,24 @@ def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
         st.run_pass()
         if outcome is not None:
             outcome["passed"] = True
+    except GitHubOutage as err:
+        paused = True
+        _say("GitHub outage: %s; the pass paused, nothing parked or failed" % err)
     except (RateLimited, TargetReached) as err:
         _say("%s; the pass stopped there" % err)
     except (StateError, station_lease.LeaseLost) as err:
         _say("stopping: %s" % err)
         return 1
     finally:
-        try:
-            st.end_pass()
-        finally:
-            # Even when end_pass raises, the beat is renewed, so a slow pass
-            # does not read as a stopped station.
-            if beat is not None:
-                beat.renew()
+        if st is not None:
+            try:
+                st.end_pass()
+            finally:
+                # Renew after a slow pass even when local cleanup fails.
+                # An outage ends GitHub work for this pass.
+                if beat is not None and not paused:
+                    try:
+                        beat.renew()
+                    except GitHubOutage as err:
+                        _say("GitHub outage: %s; could not renew the station beat" % err)
     return 0

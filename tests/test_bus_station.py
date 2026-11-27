@@ -526,7 +526,7 @@ class FakeGitHub:
             return reply(200, {"data": {"repository": {"issue": {"timelineItems": page}}}})
         if "addPullRequestReviewThreadReply" in query:
             if variables["id"] in self.reply_fails:
-                return reply(502, {"message": "bad gateway"})
+                return reply(422, {"message": "unprocessable"})
             self.replies.append((variables["id"], variables["body"]))
             return reply(200, {"data": {"addPullRequestReviewThreadReply": {"comment": {"id": "c"}}}})
         if "resolveReviewThread" in query:
@@ -10661,6 +10661,24 @@ class OutcomeTest(Base):
         st = station.Station(GitHub("token", transport=self.fake), self.settings)
         self.assertEqual(st.down_lanes(), ["opencode-go-2"])
 
+    def test_a_held_slot_reads_parked_as_held_down_and_never_limited(self):
+        # A slot the operator holds (LOOM_<SLOT>_HELD) beats unavailable with
+        # a "held:" reason: the lane table shows it present and held, dispatch
+        # skips it and moves its briefed tickets on, and no limit is counted.
+        d = os.path.join(self.home, "state", "usage")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "codex-2.json"), "w") as fh:
+            json.dump({"lane": "codex-2", "at": int(time.time()), "available": False,
+                       "reason": "held: LOOM_CODEX_2_HELD is set; the slot takes no "
+                                 "tickets until it is cleared"}, fh)
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        row = next(r for r in st._lane_rows() if r[0] == "codex-2")
+        self.assertEqual(row[1:2] + row[3:], ("parked", "Held by the operator (LOOM_<SLOT>_HELD)"))
+        self.assertFalse(st._heartbeat_ok("codex-2"))
+        self.assertEqual(st.down_lanes(), ["codex-2"])
+        self.assertEqual(st.limited_lanes(), [])
+        self.assertEqual(st.limit_until(), {})
+
     def test_failed_without_a_log_line_says_so(self):
         self.finished("failed")
         self.run_pass()
@@ -14598,7 +14616,7 @@ class VerifyDispatchTest(Base):
     def test_a_search_zero_with_an_unreadable_tree_flags_nothing(self):
         self.fake.issues.pop(1)
         self.fake.code_absent = {"daily status ready"}
-        self.fake.tree_status = 502
+        self.fake.tree_status = 422
         self.run_pass()
         self.assertTrue(any("-2-verify-" in n for n in self.briefs()), self.briefs())
         self.assertEqual(self.fake.comments[2], [])
@@ -15467,13 +15485,13 @@ class VerifyResultTest(Base):
     def test_a_proof_whose_pull_request_facts_cannot_be_read_is_not_applied(self):
         # Unread facts could hide the neutral check: no close on prose alone.
         self.merged_with_neutral_guard()
-        self.fake.check_runs_status = 500
+        self.fake.check_runs_status = 422
         self.result(self.good())
         with mock.patch("bus.station._say") as say:
             self.run_pass()
         self.assertIn("loom:shipped", self.fake.names(5))
         self.assertEqual(self.proofs(), [])
-        self.assertIn("could not read the merged pull requests (status 500)",
+        self.assertIn("could not read the merged pull requests (status 422)",
                       " ".join(str(c) for c in say.call_args_list))
 
     def test_the_proof_comment_carries_the_facts_the_station_checked(self):
@@ -16581,8 +16599,93 @@ class PaceTest(Base):
         plan = pace.read(self.home)["providers"]["codex"]
         self.assertEqual((plan["verdict"], plan["open"], plan["max"], plan["want"]),
                          (pace.BEHIND, 1, 2, 2))
-        self.assertIn("Pace (slack 10 points): codex weekly 2% used, 50% elapsed, behind; "
-                      "slots 1 of 2, asks for 2", body)
+        self.assertIn(f"| codex | weekly | 2% | 50% | {reset} | behind | "
+                      "1 of 2 (asks for 2) |", body)
+
+    def test_subscription_status_preserves_zero_and_refuses_old_windows(self):
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        now = runner.now
+
+        def row(provider, window, minutes, used, end, age=10):
+            return {"provider": provider, "lanes": [provider], "window": window,
+                    "window_minutes": minutes, "used_pct": used,
+                    "resets_at": station.usage._iso(end),
+                    "observed_at": station.usage._iso(now - age)}
+
+        reset = now + 50 * 60
+        station.usage.write(self.home, [
+            row("codex", "weekly", 100, 0, reset),
+            row("claude", "weekly", 10080, 23, reset, age=7201),
+            row("claude", "five-hour", 300, 30, reset),
+            row("agy", "weekly", 10080, 8, now - 1),
+        ])
+        body = runner._lanes_body([])
+        self.assertIn(f"| codex | weekly | 0% | 50% | {station.usage._iso(reset)} | behind |", body)
+        self.assertIn("| claude | weekly | no reading |", body)
+        self.assertEqual(sum(line.startswith("| claude | weekly |")
+                             for line in body.splitlines()), 1, body)
+        self.assertIn("| agy | weekly | no reading |", body)
+        self.assertIn("| copilot | - | no reading |", body)
+
+    def test_subscription_status_refuses_codex_observations_with_unknown_age(self):
+        from bus import meter
+
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        sessions = Path(self.home) / "sessions"
+        sessions.mkdir()
+        (sessions / "session.jsonl").write_text(json.dumps({
+            "type": "event_msg",
+            "payload": {"rate_limits": {"secondary": {"used_percent": 53,
+                        "window_minutes": 10080, "resets_at": runner.now + 3600}}},
+        }) + "\n")
+        missing_sessions = Path(self.home) / "unused-sessions"
+        forwarded = meter.codex_record(str(sessions), runner.now - 60)
+        meter_path = Path(self.home) / "state" / "usage" / "codex.meter.json"
+        for path in (sessions, missing_sessions):
+            with self.subTest(forwarded=path == missing_sessions):
+                meter.write(str(meter_path), forwarded)
+                rows = station.usage.codex_records(["codex"], path, runner.now, self.home)
+                station.usage.write(self.home, rows)
+                self.assertIn("| codex | weekly | no reading |", runner._lanes_body([]))
+
+        del forwarded["windows"][0]["at"]
+        meter.write(str(meter_path), forwarded)
+        rows = station.usage.codex_records(["codex"], missing_sessions, runner.now, self.home)
+        station.usage.write(self.home, rows)
+        self.assertIn("| codex | weekly | 53% |", runner._lanes_body([]))
+
+    def test_subscription_status_ignores_an_oversized_heartbeat_timestamp(self):
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        station.usage.write(self.home, [
+            {"provider": "codex", "lanes": ["codex", "codex-2"], "window": "weekly",
+             "window_minutes": 10080},
+        ])
+        self.write(os.path.join(self.home, "state", "usage", "codex-2.json"),
+                   json.dumps({"at": 10 ** 400}))
+        with mock.patch.dict(os.environ, {"LOOM_PACE_MAX_CODEX": ""}):
+            self.assertIn("| codex | weekly | no reading | - | - | - | 1 of 2 |",
+                          runner._lanes_body([]))
+
+    def test_changed_usage_republishes_inside_the_same_pace_band(self):
+        self.settings.status_repo = REPO
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        now = runner.now
+        row = {"provider": "codex", "lanes": ["codex"], "window": "weekly",
+               "window_minutes": 10080, "used_pct": 1,
+               "resets_at": station.usage._iso(now + 50 * 60),
+               "observed_at": station.usage._iso(now - 60)}
+        with mock.patch.object(runner, "_lane_rows", return_value=[]), \
+                mock.patch.object(runner, "_lanes_issue", return_value=1), \
+                mock.patch.object(runner, "_remote_claim_count", return_value=0), \
+                mock.patch.object(runner, "_upsert_lanes_comment", return_value=2) as post:
+            station.usage.write(self.home, [row])
+            runner.publish_lanes(refresh_pr_counts=False)
+            row["used_pct"] = 2
+            station.usage.write(self.home, [row])
+            runner.publish_lanes(refresh_pr_counts=False)
+            runner.publish_lanes(refresh_pr_counts=False)
+        self.assertEqual(post.call_count, 2)
+        self.assertIn("| codex | weekly | 2% |", post.call_args.args[2])
 
 
 class RunnerSlotClaimTest(Base):
