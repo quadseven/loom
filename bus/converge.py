@@ -38,6 +38,13 @@ THREAD_RE = re.compile(r"^### Thread (\S+) \(comment [^)\n]*\) at (.+):([0-9]+|\
 RULE_RE = re.compile(r"`([A-Za-z0-9][A-Za-z0-9_.:-]*)`")
 # A quoted review line is "    <login>: <body line>" (bus/brain.py _quoted).
 QUOTED_AUTHOR_RE = re.compile(r"^ {4}[A-Za-z0-9_.\[\]-]+: ?")
+_MARKINGS_BOARD_RE = re.compile(r"^[ \t]*## Markings Board[ \t]*$", re.M)
+_HEADING_RE = re.compile(r"^[ \t]*#{1,6} ", re.M)
+# Elder's Markings Board columns are Severity, Effort, File, Line, Rule, Marking.
+_BLOCKING_ROW_RE = re.compile(
+    r"^[ \t]*\|[^|\n]*\b(?:critical|high)[ \t]*\|[^|\n]*\|"
+    r"[ \t]*`([^`|\n]+)`[ \t]*\|[ \t]*([1-9][0-9]*)[ \t]*\|"
+    r"[ \t]*`([^`|\n]+)`[ \t]*\|", re.I | re.M)
 SHOWN_MAX = 5
 
 
@@ -70,6 +77,23 @@ def _line(value: Any) -> Optional[int]:
 def asked_checks(body: str) -> Set[str]:
     """The check names a loom:fix body asked a lane to fix."""
     return {" ".join(name.split()) for name in CHECK_RE.findall(body)}
+
+
+def _blocking_review_findings(output: str) -> List[Finding]:
+    board = _MARKINGS_BOARD_RE.split(output, maxsplit=1)
+    if len(board) == 1:
+        return []
+    rows = _HEADING_RE.split(board[1], maxsplit=1)[0]
+    return [Finding("", path, _line(line), rule.lower())
+            for path, line, rule in _BLOCKING_ROW_RE.findall(rows)]
+
+
+def repeated_review_marking(body: str, check: str, output: str) -> bool:
+    """A blocking marking in the prior fix brief matches the current review."""
+    old = body.partition("\n### Check: %s\n" % " ".join(check.split()))[2]
+    previous = _blocking_review_findings(old.split("\n### ", 1)[0])
+    current = _blocking_review_findings(output)
+    return any(same_finding(before, after) for before in previous for after in current)
 
 
 def asked_findings(body: str) -> List[Finding]:

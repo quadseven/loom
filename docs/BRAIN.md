@@ -1131,6 +1131,11 @@ each criterion as a checkbox under `## Acceptance criteria` (or the shorter
 `## Acceptance` heading). An answer ticket opens no pull request and is
 exempt, as at the runner.
 
+A queued build ticket whose acceptance criteria all require live evidence
+stays unassigned. The station records one status event for the hold. A brief
+revision that adds a code acceptance criterion makes the ticket eligible for
+assignment on the next pass.
+
 In a repo that files its tickets by area of play (it defines at least one
 `area:` label), a ticket carrying no `area:` label gets no lane either: every
 per-area view misses it, and picking the area is intake work. The factory
@@ -1159,7 +1164,10 @@ pushes fixes to the existing branch. Before each round after the first, the
 station asks whether the last one moved anything (`bus/converge.py`): the same
 check names still failing, or a review-bot finding at the same path within 10
 lines under the same rule (a new thread id or check run id does not make it
-new), is a stuck round. A stuck round climbs the model ladder at once
+new), is a stuck round. For high or critical findings reported only in
+Elder's Markings Board, the factory and station compare the file, line and
+rule columns using the same matching rule as inline findings. A stuck round
+climbs the model ladder at once
 (`factory.Factory._climb`, which keeps the model and private-repo rules); a
 new finding is progress and stays on its lane. `LOOM_FIX_ROUNDS` caps the
 rounds per rung (default 3). With no rung left above a stuck round, or the cap
@@ -2767,6 +2775,14 @@ forgets the outcomes before it. A demoted lane still takes verify runs. A
 repo that cannot be read keeps its records, and nothing is cleared by an
 error. The table goes on the lane status comment, and the dashboard's Lanes
 page shows it as Scorecard.
+
+The hourly refresh also reads the finished briefs and their runner logs.
+Each failed brief's final park line determines whether it was a `model_error`
+or an `env_error`. A red check on the unchanged base, a setup failure,
+or a runner interruption is excluded from zero-done demotion. Provider
+limits are counted separately. A missing park line leaves the outcome
+unknown unless the scorecard already recorded it. Only recorded work
+failures count toward the zero-done threshold.
 
 Each merged record also gets a settled difficulty (`bus/difficulty.py`),
 scored blind from the merged work alone: the diff's changed lines and files,
