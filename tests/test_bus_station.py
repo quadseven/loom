@@ -10661,6 +10661,24 @@ class OutcomeTest(Base):
         st = station.Station(GitHub("token", transport=self.fake), self.settings)
         self.assertEqual(st.down_lanes(), ["opencode-go-2"])
 
+    def test_a_held_slot_reads_parked_as_held_down_and_never_limited(self):
+        # A slot the operator holds (LOOM_<SLOT>_HELD) beats unavailable with
+        # a "held:" reason: the lane table shows it present and held, dispatch
+        # skips it and moves its briefed tickets on, and no limit is counted.
+        d = os.path.join(self.home, "state", "usage")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "codex-2.json"), "w") as fh:
+            json.dump({"lane": "codex-2", "at": int(time.time()), "available": False,
+                       "reason": "held: LOOM_CODEX_2_HELD is set; the slot takes no "
+                                 "tickets until it is cleared"}, fh)
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        row = next(r for r in st._lane_rows() if r[0] == "codex-2")
+        self.assertEqual(row[1:2] + row[3:], ("parked", "Held by the operator (LOOM_<SLOT>_HELD)"))
+        self.assertFalse(st._heartbeat_ok("codex-2"))
+        self.assertEqual(st.down_lanes(), ["codex-2"])
+        self.assertEqual(st.limited_lanes(), [])
+        self.assertEqual(st.limit_until(), {})
+
     def test_failed_without_a_log_line_says_so(self):
         self.finished("failed")
         self.run_pass()

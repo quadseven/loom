@@ -3701,12 +3701,14 @@ class Station:
 
     def down_lanes(self) -> List[str]:
         """Lanes whose fresh heartbeat says unavailable for a reason other
-        than a limit (an expired key, a lane stopped on purpose). A stale or
-        missing heartbeat is not counted: a lane deep in a long run can go
-        quiet without being down."""
+        than a limit (an expired key, a lane stopped on purpose, a slot the
+        operator holds with LOOM_<SLOT>_HELD). A stale or missing heartbeat
+        is not counted: a lane deep in a long run can go quiet without being
+        down."""
         out: List[str] = []
+        down = (lane_state.RUNNER_UNAVAILABLE, lane_state.HELD_REASON)
         for lane in LANES:
-            if lane_state.evaluate(self._local_beat(lane), self.now).reason == lane_state.RUNNER_UNAVAILABLE:
+            if lane_state.evaluate(self._local_beat(lane), self.now).reason in down:
                 out.append(lane)
         return out
 
