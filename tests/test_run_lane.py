@@ -8384,6 +8384,57 @@ exit %d
         calls = self.resolve_without_state_file(repo_public=False)
         self.assertNotIn("gh issue", calls)
 
+    def run_ask_lookup(self, call):
+        """Run settle_ask or open_issue with a factory repo holding an open
+        issue #5 that carries the ask's exact title. Only when OUTSIDER is 1
+        does #5 lack the needs:human label, as an issue anyone can file on a
+        public repo would. Returns the gh calls and the script's stdout."""
+        text = RUNNER.read_text()
+        funcs = "".join(re.search(r"^%s\(\) \{\n.*?^\}\n" % name, text, re.S | re.M).group(0)
+                        for name in ("settle_ask", "open_issue"))
+        tmp = Path(self._tmp.name)
+        calls = tmp / "calls"
+        calls.touch()
+        script = (funcs +
+                  'sign_tail() { :; }\nupsert_sticky_comment() { printf "sticky %s\\n" "$2" >> "$CALLS"; }\n'
+                  'python3() { return 0; }\n'
+                  'gh() { printf "gh %s\\n" "$*" >> "$CALLS"; case "$1 $2" in\n'
+                  '  "issue list"|"search issues")\n'
+                  '    case " $* " in *" --label needs:human "*) [ "$OUTSIDER" = 1 ] || printf "5\\n" ;;\n'
+                  '      *) printf "5\\n" ;; esac ;;\n'
+                  'esac; return 0; }\n' + call + '\n')
+        result = subprocess.run(
+            ["bash", "-c", script],
+            env={"PATH": "/usr/bin:/bin", "FACTORY_REPO": "quadseven/loom", "LOOM_ROOT": str(tmp),
+                 "PWD": str(tmp), "CALLS": str(calls), "LOG": str(self.log),
+                 "KEY_REPEAT_MARKER": "<!-- loom:key-repeat v1 -->", "SLOT": "codex-1",
+                 "OUTSIDER": self._outsider},
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return calls.read_text(), result.stdout
+
+    def test_an_outsider_issue_with_the_ask_title_does_not_close_the_lane_ask(self):
+        self._outsider = "1"
+        calls, _ = self.run_ask_lookup('settle_ask "Lane codex sign-in lapsed" 9 "Sign-in failed again"')
+        self.assertNotIn("gh issue close", calls)
+        self.assertNotIn("sticky 5", calls)
+
+    def test_a_lane_ask_filed_first_still_absorbs_a_later_duplicate(self):
+        self._outsider = "0"
+        calls, _ = self.run_ask_lookup('settle_ask "Lane codex sign-in lapsed" 9 "Sign-in failed again"')
+        self.assertIn("gh issue close --repo quadseven/loom 9", calls)
+        self.assertIn("sticky 5", calls)
+
+    def test_an_outsider_issue_with_the_ask_title_is_not_taken_as_the_open_ask(self):
+        self._outsider = "1"
+        _, out = self.run_ask_lookup('open_issue "Lane codex sign-in lapsed" needs:human')
+        self.assertEqual(out.strip(), "")
+
+    def test_an_open_lane_ask_is_found_by_its_title(self):
+        self._outsider = "0"
+        _, out = self.run_ask_lookup('open_issue "Lane codex sign-in lapsed" needs:human')
+        self.assertEqual(out.strip(), "5")
+
     def contract_repo(self, contract=CONTRACT):
         """Give the remote a submodule pinned behind its tip, the contract
         and check.py. Returns the pinned submodule commit."""
