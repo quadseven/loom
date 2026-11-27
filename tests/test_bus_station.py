@@ -16775,9 +16775,9 @@ class PaceTest(Base):
         primary, second = [state / (slot + ".meter.json") for slot in ("claude", "claude-2")]
         reset = now + 10080 * 30
 
-        def meter(file, used, observed):
-            file.write_text(json.dumps({"at": observed, "windows": [
-                {"window": "weekly", "window_minutes": 10080,
+        def meter(file, used, observed, window="weekly", source="test meter"):
+            file.write_text(json.dumps({"at": observed, "source": source, "windows": [
+                {"window": window, "window_minutes": 10080,
                  "used_pct": used, "resets_at": reset}]}))
 
         meter(primary, 3, now - 100)
@@ -16793,9 +16793,12 @@ class PaceTest(Base):
 
         from dashboard import usage as usage_page
 
-        for used, expected in ((97, 97), (True, None)):
-            with self.subTest(second_meter=used):
-                meter(second, used, now - 60)
+        cases = ((97, "weekly", "test meter", 97), (True, "weekly", "test meter", None),
+                 (97, "x" * 201, "test meter", None), (97, "weekly", "x" * 201, 97))
+        for used, window, source, expected in cases:
+            with self.subTest(second_meter=(used, len(window), len(source))):
+                meter(second, used, now - 120 if len(window) > 200 or len(source) > 200 else now - 60,
+                      window, source)
                 with mock.patch.dict(os.environ, {"LOOM_PACE_MAX_CLAUDE": "2"}), \
                         mock.patch.object(station.labels, "LANES", ["claude", "claude-2"]), \
                         mock.patch.object(runner, "_refresh_model_catalogue"), \
@@ -16816,6 +16819,25 @@ class PaceTest(Base):
                 local_rows = station.usage.read_snapshot(self.home)
                 self.assertEqual({row["provider"] for row in local_rows}, {"claude"})
                 self.assertEqual(local_rows[0]["lanes"], ["claude", "claude-2"])
+
+    def test_usage_upload_remembers_the_limit_of_an_account_without_a_meter(self):
+        now = 1_800_000_000.0
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings, now=now)
+        state = Path(self.home) / "state" / "usage"
+        (state / "claude.meter.json").write_text(json.dumps({"at": now, "windows": [
+            {"window": "weekly", "window_minutes": 10080, "used_pct": 3,
+             "resets_at": now + 10080 * 30}]}))
+        second = state / "claude-2.json"
+        second.write_text(json.dumps({"at": now, "available": False, "reason": "limit: account cap"}))
+        with mock.patch.object(station.labels, "LANES", ["claude", "claude-2"]), \
+                mock.patch.object(runner, "_refresh_model_catalogue"), \
+                mock.patch.object(runner, "post_chain"), \
+                mock.patch.object(runner, "upload_usage_limits") as upload:
+            runner._tend_usage()
+            second.write_text(json.dumps({"at": now, "available": True}))
+            runner._tend_usage()
+        rows = [row for row in upload.call_args.args[0] if row["provider"] == "claude-2"]
+        self.assertEqual([row["note"] for row in rows], ["last limit: account cap"])
 
     def test_subscription_status_preserves_zero_and_refuses_old_windows(self):
         runner = station.Station(GitHub("token", transport=self.fake), self.settings)

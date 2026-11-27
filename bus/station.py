@@ -19645,7 +19645,7 @@ class Station:
         try:
             records = usage.collect(self.s.home, now=self.now)
             usage.write(self.s.home, records)
-            published = subscription_view.dashboard_records(self.s.home, records, self.now)
+            published = subscription_view.dashboard_records(self.s.home, records, self.now, persist=True)
             subscriptions = subscription_view.read(
                 self.s.home, self.now, os.environ, published, slot_running_until=self._usage_slot_running_until)
             self.upload_usage_limits(subscription_view.for_upload(published, subscriptions, self.now))

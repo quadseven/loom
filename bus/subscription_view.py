@@ -65,11 +65,14 @@ def _requested(plan, row, now):
     return want if type(want) is int and row["running"] < want <= row["allowed"] else None
 
 
-def _account_records(home, provider, now):
+def _account_records(home, provider, now, *, persist):
     slots = [provider]
     try:
-        records = usage._cli_meter_records(provider, home, slots, now, persist=False)
+        records = usage._cli_meter_records(provider, home, slots, now, persist=persist)
     except (TypeError, ValueError, OverflowError, OSError):
+        records = []
+    records = [record for record in records if _WINDOW.fullmatch(record["window"])]
+    if not records:
         records = [usage._record(provider, slots, "all", None, None, None,
                                  None, "lane meter", now, "invalid meter reading")]
     holds = usage.lane_holds(home, slots)
@@ -78,16 +81,18 @@ def _account_records(home, provider, now):
         pct = pace._number(record.get("used_pct"))
         if pct is None or not 0 <= pct <= 100:
             record["used_pct"] = None
+        if len(record["source"]) > 200:
+            record["source"] = "lane meter"
         record["holds"] = holds
         record["host"] = host
     return records
 
 
-def dashboard_records(home, records, now):
-    """Use separate account readings only in the published Usage views."""
+def dashboard_records(home, records, now, *, persist=False):
+    """Read account windows separately, saving limit history only during collection."""
     result = [record for record in records if record.get("provider") != "claude"]
     for slot in usage._provider_groups(labels.LANES).get("claude", []):
-        result.extend(_account_records(home, slot, now))
+        result.extend(_account_records(home, slot, now, persist=persist))
     return result
 
 
