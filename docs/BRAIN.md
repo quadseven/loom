@@ -1320,6 +1320,11 @@ When the runner finishes, the station finds the brief in `done/` or
   brief) and record the status event `Lane <lane> stopped: [limit] <reason>`;
   the factory moves a ticket briefed on a lane whose heartbeat says `limit:`
   to the next rung at once.
+- Operator decision (`[operator]`): a local build lane asked a person directly
+  or its two models selected different answers. The runner posts the scanned
+  question and any answers in the park comment. The station releases its
+  claim, sets `loom:queued` and `needs:human`, and records a stopped event.
+  This ending spends no rung and does not count toward a runaway.
 - An expired key (an `[auth]` reason): not a failure, not an attempt, and
   never a runaway, whatever else the ticket has been through. Label
   `loom:briefed` again (`loom:pr` for a fix brief) and record the status
@@ -1330,8 +1335,8 @@ When the runner finishes, the station finds the brief in `done/` or
 - Runaway count: a claim's ending is the first of these after it: a `Lane
   <lane> failed:` line, an automatic retry (its `Lane <lane> failed:` reason),
   a factory hold (`Lane <lane> held:`, a `[factory]` ending) or a `Lane <lane>
-  stopped:` event. A claim that ended `[transient]`, `[limit]`, `[auth]` or
-  `[factory]` is not a work attempt and never counts toward a runaway; a stop
+  stopped:` event. A claim that ended `[transient]`, `[limit]`, `[auth]`,
+  `[factory]`, or `[operator]` is not a work attempt and never counts toward a runaway; a stop
   is never worded `failed:`, so failure counts do not read it.
 - A fix brief parked unrun because its pull request merged first (`pull
   request #N is no longer open on <branch> (MERGED ...)`): not a failure, not

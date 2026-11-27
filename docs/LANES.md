@@ -82,6 +82,31 @@ use the documentation ranges `192.0.2.0/24`, `198.51.100.0/24`, or
 `203.0.113.0/24`; add `leak-guard-allow` on a line only when a deliberate
 range bound must appear.
 
+### Blocked build decisions
+
+For a new public-repo build, a local Codex or Claude subscription lane can
+ask its runner to resolve a reversible code ambiguity. The runner adds the
+scratch file path and JSON format to the work prompt. The agent supplies one
+question, the public context, two concrete options, and the number of its
+preferred option. Money, hardware, host changes, account access, credentials,
+physical work, and policy decisions take the operator path directly.
+
+The runner scans the packet with the public leak guard before sending the
+same question, context, and options to the other subscription model through
+`lanes/rewrite_agent.sh`. The second model receives those three fields and
+returns its own selection. The peer uses `LOOM_CLAUDE_MODEL` for Codex builds
+and `LOOM_CODEX_MODEL` for Claude builds. It uses the rewriter's existing
+sign-in configuration, including `LOOM_REWRITE_CLAUDE_TOKEN_SSM` for Claude.
+The model call has a 90-second cap. A missing, unreachable, or invalid second
+answer is a transient stop.
+
+When the selections match, the lane continues once in the same checkout.
+The run log and the pull request's `Lane decision` section name both models
+and their answers. Disagreement and operator-only requests park the run. The
+sticky park comment gives the question and any answers that passed the scan.
+The station releases the claim and queues the ticket with `needs:human` until
+an operator answers.
+
 ## Validation contract
 
 A repo opts in with `.loom/validation.conf`, the same steps its CI runs:
