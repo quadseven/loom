@@ -81,9 +81,16 @@ def _holder(body: str):
     return None
 
 
+def _tick_header(journal, body):
+    header = TICK_RE.search(body)
+    at = header.group(1) if header else journal.get("created_at")
+    holder = (header.group(2) if header else _holder(body)) or "holder missing"
+    return at, holder
+
+
 def _tick(journal):
     body = str(journal.get("body") or "")
-    header = TICK_RE.search(body)
+    at, holder = _tick_header(journal, body)
     trouble = STEP_TROUBLE_RE.findall(body)
     outcome = ("failed" if any(kind == "failed" for _, kind in trouble)
                else "degraded" if trouble else "ok")
@@ -91,8 +98,7 @@ def _tick(journal):
         "%s: %s" % (key, value.strip()) for key, value in BULLET_RE.findall(body)
         if key != "Cost" and not key.startswith("Step ")
         and value.strip().strip(".").lower() != "none"]
-    return {"at": header.group(1) if header else journal.get("created_at"),
-            "holder": (header.group(2) if header else _holder(body)) or "holder missing",
+    return {"at": at, "holder": holder,
             "outcome": outcome, "line": lines[0] if lines else "nothing changed"}
 
 
@@ -153,16 +159,22 @@ def build_brain(record, error, journals, wait_rows=(), waits_error=""):
 
 
 def _journal_holders(journals):
-    holders = {}
+    best = {}
+    seen = set()
     for journal in journals or []:
-        if not str(journal.get("body") or "").startswith(JOURNAL_MARKER):
+        body = str(journal.get("body") or "")
+        if not body.startswith(JOURNAL_MARKER):
             continue
-        tick = _tick(journal)
-        holder = _brain_name(tick["holder"])
-        if holder != "holder missing" and (holder not in holders or
-                                             str(tick["at"] or "") > str(holders[holder]["at"] or "")):
-            holders[holder] = tick
-    return holders
+        key = (body, journal.get("created_at"))
+        if key in seen:
+            continue
+        seen.add(key)
+        at, raw_holder = _tick_header(journal, body)
+        holder = _brain_name(raw_holder)
+        if holder != "holder missing" and (holder not in best or
+                                             str(at or "") > str(best[holder][0] or "")):
+            best[holder] = (at, journal)
+    return {holder: _tick(journal) for holder, (_, journal) in best.items()}
 
 
 def _brain_name(holder):

@@ -114,6 +114,10 @@ class StaleMergedRetryTest(Base):
         self.assertIn("loom:failed", self.fake.names(12))
         self.assertNotIn("loom:pr", self.fake.names(12))
 
+        self.reader().reconcile_pull_requests()
+        self.assertIn("loom:failed", self.fake.names(12))
+        self.assertNotIn("loom:merged", self.fake.names(12))
+
     def test_refuted_merge_is_rejected_but_pending_verification_is_not(self):
         old = self.incomplete_merge()
         comment = {"id": 501, "user": {"login": "alice-example"},

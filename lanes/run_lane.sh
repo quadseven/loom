@@ -748,6 +748,12 @@ pr_body() {
   criteria="$(criteria_section "$WORKDIR/$TICKET.summary.md" 2>/dev/null)"
   [ -n "$criteria" ] || criteria="$(criteria_section "$TREE/$SUMMARY_FILE" 2>/dev/null)"
   [ -n "$criteria" ] || criteria="$(criteria_section "$1")"
+  criteria="$(printf '%s\n' "$criteria" | PYTHONPATH="$REPO_ROOT" python3 -B -c '
+import sys
+from bus.pr_repair import build_checklist
+with open(sys.argv[1], encoding="utf-8") as brief:
+    print(build_checklist(brief.read(), sys.stdin.read().rstrip("\n")))
+' "$1" 2>> "$LOG")" || return 1
   # The lane's own word on operator steps, else the ticket's; a body with
   # neither says so, and the factory's keyword backstop still reads both.
   ops="$(section "$OPERATOR_SECTION" "$WORKDIR/$TICKET.summary.md" 2>/dev/null)"
@@ -778,7 +784,7 @@ PLAN_NOTE_MARKER="<!-- loom:plan-hold-note v1 -->"
 # Compose from the filed brief, or render the ticket again if the run lost it.
 # Keep the recovered copy outside the inbox so it cannot start another run.
 compose_pr_body() {
-  local recovered
+  local recovered status=0
   PLAN_GAPS=""
   if [ -f "$BRIEF" ]; then
     compose_pr_body_from "$BRIEF"
@@ -792,20 +798,21 @@ if not (issue.get("body") or "").strip():
     sys.exit("ticket body is empty")
 print(render_brief(sys.argv[1], issue, sys.argv[2]))
 ' "$REPO" "$LANE" > "$recovered" 2>> "$LOG"; then
-    compose_pr_body_from "$recovered"
+    compose_pr_body_from "$recovered" || status=$?
   else
     echo "[$(date -u +%FT%TZ)] $TICKET [factory] brief file missing: ${BRIEF##*/}; could not rebuild from ticket" >> "$LOG"
-    PR_BODY="$(pr_body /dev/null "$TICKET")"
+    PR_BODY="$(pr_body /dev/null "$TICKET")" || return 1
   fi
   [ -z "${recovered:-}" ] || rm -f "$recovered"
   [ -z "${DECISION_AUDIT:-}" ] || PR_BODY="$PR_BODY"$'\n\n## Lane decision\n\n'"$DECISION_AUDIT"
+  return "$status"
 }
 
 # Repair a failing body from the same source used to compose it. PLAN_GAPS
 # holds any sections that source still lacks for the ticket's plan-hold note.
 compose_pr_body_from() {
   local problems dir summary=() private=()
-  PR_BODY="$(pr_body "$1" "$TICKET")"
+  PR_BODY="$(pr_body "$1" "$TICKET")" || return 1
   problems="$(printf '%s' "$PR_BODY" | PYTHONPATH="$REPO_ROOT" python3 -B -m bus.hunt_plan check - 2>&1)" && return 0
   echo "[$(date -u +%FT%TZ)] $TICKET pull request body fails the plan checks: $(printf '%s' "$problems" | tr '\n' ';')" >> "$LOG"
   if ! dir="$(mktemp -d "$TMPDIR/pr-plan.XXXXXX")"; then
@@ -2165,7 +2172,7 @@ ask_sign_in() {
 # keep one comment on it with a running count headed $3, never one per failure.
 file_ask() {
   local title="$1" body="$2" headline="$3" number existing
-  existing="$(open_issue "$title")"
+  existing="$(open_issue "$title" needs:human)"
   if [ -n "$existing" ]; then
     printf '' | upsert_sticky_comment "$FACTORY_REPO" "$existing" "$KEY_REPEAT_MARKER" repeat \
       --headline "$headline" --items-label "Lanes seen" --item "$SLOT" ||
@@ -2190,9 +2197,11 @@ file_ask() {
 # title is the one ask: a higher one closes itself and counts its lane on the
 # lowest. The earlier filer never closes, since every later ask has a higher
 # number and every later listing sees it. A failed listing keeps the ask.
+# Only needs:human issues count, for the reason open_issue gives.
 settle_ask() {
   local title="$1" number="$2" headline="$3" first
   first="$(TITLE="$title" gh issue list --repo "$FACTORY_REPO" --state open --limit 500 \
+             --label needs:human \
              --json number,title --jq '.[] | select(.title == env.TITLE) | .number' \
              2>>"$LOG" | tr -cd '0-9\n' | sort -n | head -1)" || return 0
   [ -n "$first" ] && [ "$first" -lt "$number" ] || return 0
@@ -2486,8 +2495,11 @@ safe_git() {
 
 # Every lane shares one GitHub App identity, so each lane signs what it writes
 # (bus/signature.py): a final "Signed: lane-<slot>, model <model>" line on each
-# pull request body and comment, and Loom-Lane and Loom-Model trailers on each
-# commit. The model is the run's own ($MODEL), else LOOM_<SLOT>_MODEL.
+# pull request body and comment, and Loom-Engine, Loom-Model, Loom-Lane and
+# Loom-Run trailers on each commit. The model is the run's own ($MODEL), else
+# LOOM_<SLOT>_MODEL. The engine is the agent program run_agent starts for the
+# lane (lane_engine). The run is LOOM_RUN_ID when set, else the brief's name
+# ($TICKET), the name the run's log and lane-log notes carry.
 # signed prints $1 with exactly one signature line; commit_msg prints $1 with
 # the trailers. Both fall back to the plain text when python is unavailable, so
 # a signing fault never costs the run its comment or commit.
@@ -2500,10 +2512,21 @@ signed() {
 # sign_tail prints the signature on its own paragraph, to end a message whose
 # leading words must stay literal (a close comment states its reason first).
 sign_tail() { printf '\n\n%s' "$(signed "")"; }
+# lane_engine prints the agent program run_agent starts for $LANE, and nothing
+# for a lane it does not know (the trailer then reads LOOM_<SLOT>_ENGINE, else
+# unknown). Keep it in step with run_agent.
+lane_engine() {
+  case "${LANE:-}" in
+    codex|claude|agy|copilot) printf '%s' "$LANE" ;;
+    anthropic) printf 'claude' ;;
+    openrouter|tinker|opencode-go|zen|spark|free|zai|workersai) printf 'opencode' ;;
+  esac
+}
 commit_msg() {
   local out
   out="$(PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.signature message \
-    --lane "$SLOT" --model "${MODEL:-}" "$1" 2>> "${LOG:-/dev/null}")" || out="$1"
+    --lane "$SLOT" --model "${MODEL:-}" --engine "$(lane_engine)" \
+    --run "${LOOM_RUN_ID:-${TICKET:-}}" "$1" 2>> "${LOG:-/dev/null}")" || out="$1"
   printf '%s' "$out"
 }
 
@@ -2893,8 +2916,12 @@ KEY_REPEAT_MARKER="<!-- loom:key-repeat v1 -->"
 INCIDENT_REPEAT_MARKER="<!-- loom:incident-repeat v1 -->"
 # The number of the open issue on the factory repo whose title is exactly $1,
 # empty when there is none: one open issue per incident kind, per expired key.
+# The open issue titled $1 that carries label $2 (needs:human for an ask,
+# loom:factory for an incident). The factory repo is public, so anyone can
+# open an issue with the exact title, but only a collaborator can label it:
+# an outsider's issue must never swallow the lane's ask or incident.
 open_issue() {
-  TITLE="$1" gh search issues --repo "$FACTORY_REPO" --state open \
+  TITLE="$1" gh search issues --repo "$FACTORY_REPO" --state open --label "$2" \
     --json number,title --jq '.[] | select(.title == env.TITLE) | .number' \
     -- "$1" 2>>"$LOG" | head -1
 }
@@ -3055,7 +3082,7 @@ file_factory_incident() {  # kind, detail
   title="Factory incident: $subject validation $kind"
   body="$(printf '%s\n\nRepo: %s\nKind: %s\nTicket: %s\n\n%s\n' \
     "$INCIDENT_MARKER" "$subject" "$kind" "$ticket" "$detail")"
-  existing="$(open_issue "$title")"
+  existing="$(open_issue "$title" loom:factory)"
   if [ -n "$existing" ]; then
     number="$existing"
     # One comment on the incident with a running count, never one per run.
@@ -3152,6 +3179,22 @@ CHECK_SLOT_HELD=""
 [[ "$CHECK_SLOT_POLL" =~ ^[0-9]+(\.[0-9]+)?$ ]] || CHECK_SLOT_POLL=5
 . "$LOOM_ROOT/lanes/host_load.sh" || exit 1
 
+# Keep the guard outside the slot directory and hold it through the rename.
+# The shell owns fd 9, so the flock survives the Python process taking it.
+reclaim_check_slot() (
+  local slot="$1" pid="$2"
+  python3 -IB -c '
+import fcntl
+try:
+    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    raise SystemExit(1)
+' 2>>"$LOG" || return 1
+  [ "$(cat "$slot/pid" 2>/dev/null)" = "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null && return 1
+  mv "$slot" "$slot.stale.$$" 2>/dev/null
+) 9>>"$CHECK_SLOT_DIR.guard"
+
 # Try each slot once; sets CHECK_SLOT_HELD and returns 0 on a take.
 try_check_slot() {
   local n slot pid
@@ -3167,9 +3210,8 @@ try_check_slot() {
     # A slot with no pid yet is being taken this instant; leave it.
     [[ "$pid" =~ ^[0-9]+$ ]] || continue
     kill -0 "$pid" 2>/dev/null && continue
-    # Stale: move it aside first (atomic), so a slot another waiter has just
-    # re-made is never the directory removed.
-    if mv "$slot" "$slot.stale.$$" 2>/dev/null; then
+    # Recheck under the guard: another waiter may already have reclaimed it.
+    if reclaim_check_slot "$slot" "$pid"; then
       echo "check slot $n was held by pid $pid, which is gone; reclaimed" >> "$LOG"
       rm -rf "$slot.stale.$$"
       if mkdir "$slot" 2>/dev/null; then
@@ -6105,7 +6147,9 @@ for BRIEF in "$INBOX"/*.md; do
         INTENT_TEXT="${INTENT_TEXT}
 - Dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
       fi
-      compose_pr_body
+      if ! compose_pr_body; then
+        park "$BRIEF" "could not compose the pull request body; nothing pushed" transient; continue
+      fi
       BODY_FILE="$(mktemp "$LOOM_HOME/run/$SLOT-leak-body.XXXXXX")"
       printf '%s\n%s\n' "${TITLE:-$TICKET}" "$PR_BODY" > "$BODY_FILE"
       LEAK_RC=0
@@ -6162,7 +6206,9 @@ for BRIEF in "$INBOX"/*.md; do
         INTENT_TEXT="${INTENT_TEXT}
 - Dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
       fi
-      compose_pr_body
+      if ! compose_pr_body; then
+        park "$BRIEF" "could not compose the pull request body; nothing pushed" transient; continue
+      fi
       PR_BODY="$(printf '%s' "$PR_BODY" | PYTHONPATH="$REPO_ROOT" python3 -B -c \
         'import sys; from bus.pr_repair import public_refs; print("\n".join(public_refs(x, sys.argv[1]) for x in sys.stdin.read().splitlines()))' "$REPO")" || {
         park "$BRIEF" "could not prepare public repo PR text; nothing pushed" transient; continue
@@ -6407,7 +6453,9 @@ Review threads this round left without a reply: $UNANSWERED"
   # before that check, edited by hand, or read differently by the shell and
   # Python readers: compose_pr_body rebuilds it, and marks the pull request
   # when the brief cannot fill it.
-  [ -n "${PR_BODY:-}" ] || compose_pr_body
+  if [ -z "${PR_BODY:-}" ] && ! compose_pr_body; then
+    park "$BRIEF" "could not compose the pull request body; branch $BRANCH is pushed" transient; continue
+  fi
   [ -z "$LIVE_NOTES" ] || PR_BODY="$PR_BODY"$'\n\n'"$LIVE_NOTES"
   # The signature is the last line a reader sees; the plan-hold marker is an
   # HTML comment, so it goes after it (bus/signature.py reads past it).

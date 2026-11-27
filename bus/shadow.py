@@ -103,8 +103,8 @@ ACTIONS = (MERGE, CLOSE, REOPEN, LABEL, DELETE_BRANCH, APPROVE)
 VERDICT = "operator-verdict"
 # Not a request the choke point holds: a label removal is reversible, so
 # GitHub._rest sends it. The station's label pass (bus/label_pass.py,
-# loom#2024) records its own removals as this action in shadow and sends
-# none, so the operator reads what the pass would clean before it does.
+# loom#2024) records its other removals as this action in shadow. It sends
+# state removals for an open issue holding both loom:shipped and loom:failed.
 UNLABEL = "unlabel"
 
 # Labels whose addition grants a merge, each with the labels that mean the

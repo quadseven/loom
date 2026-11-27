@@ -2193,6 +2193,31 @@ printf '%s\\n' '{json.dumps(event)}'
         self.assertFalse(repaired["changed"], repaired)
         self.assertEqual(repaired["old_hash"], repaired["new_hash"])
 
+    def test_a_live_only_build_pr_defers_live_criteria_even_with_a_partial_summary(self):
+        boxes = ("Live: The page shows the corrected total.",
+                 "A test or a ledger row shows it",
+                 "Live: The reported reason is gone or explained.")
+        why, _, after = BRIEF.partition("## Acceptance criteria\n")
+        _, _, size = after.partition("## Size\n")
+        request = "Proof: Check the corrected total with seeded data."
+        why = why.replace("Make the thing work.\n", "Make the thing work.\n" + request + "\n")
+        self.drop_brief(text=why + "## Acceptance criteria\n"
+                        + "".join("- [ ] %s\n" % box for box in boxes) + "\n## Size\n" + size)
+        result = self.run_lane(FAKE_SUMMARY="Correct the total.\n\n## Acceptance criteria\n"
+                               "- [x] %s\n- [x] %s\n" % boxes[:2])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        self.assertIn(request, body.splitlines())
+        for box in (boxes[0], boxes[2]):
+            self.assertIn("- [ ] %s; not built: checked after merge" % box, body)
+            self.assertNotIn("- [x] " + box, body)
+        self.assertIn("- [x] " + boxes[1], body)
+        done = self.inbox / "done" / "T042-fix-the-thing.md"
+        repaired = pr_repair.reconcile(str(done), "Fix the thing", body,
+                                       "codex", "gpt-test-default", "T042-fix-the-thing")
+        self.assertFalse(repaired["changed"], repaired)
+        self.assertEqual(repaired["reason"], "")
+
     def test_uncommitted_agent_edits_are_committed_by_the_runner(self):
         self.drop_brief()
         result = self.run_lane(FAKE_AGENT="edit")
@@ -6114,8 +6139,22 @@ fi
         self.assertTrue((inbox / "failed" / "T043-next.md").exists())
         self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
 
+    def pin_gateway_limit_clock(self):
+        # The shell computes the deadline before Python stamps the heartbeat.
+        # Keep those times apart so a delayed heartbeat cannot hide a bad test.
+        origin = int(time.time()) - 5
+        self.write_tool(self.bin / "date", f"""#!/bin/sh
+if [ "$#" -eq 1 ] && [ "$1" = +%s ]; then
+    printf '%s\\n' {origin}
+else
+    exec /bin/date "$@"
+fi
+""")
+        return origin
+
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_free_gateway_retry_after_sets_the_cluster_slot_hold(self):
+        origin = self.pin_gateway_limit_clock()
         inbox, result = self.api_lane(
             "free-openrouter", FAKE_CURL="503", FAKE_CURL_RETRY_AFTER="43200",
             LOOM_FREE_GATEWAY_URL="http://gateway.example.invalid")
@@ -6123,7 +6162,7 @@ fi
         self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
         beat = json.loads((self.loom / "state" / "usage" / "free-openrouter.json").read_text())
         self.assertFalse(beat["available"])
-        self.assertAlmostEqual(beat["retry_at"] - beat["at"], 43200, delta=2)
+        self.assertEqual(beat["retry_at"], origin + 43200)
         limit = (self.loom / "state" / "usage" / "free-openrouter.limit").read_text().split()
         self.assertEqual(int(limit[0]), beat["retry_at"])
         probes = sum(c.startswith("curl ") for c in self.calls())
@@ -6140,16 +6179,18 @@ fi
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_free_gateway_503_without_retry_after_uses_the_fallback(self):
+        origin = self.pin_gateway_limit_clock()
         _, result = self.api_lane(
             "free-openrouter", FAKE_CURL="503",
             LOOM_FREE_GATEWAY_URL="http://gateway.example.invalid")
         self.assertEqual(result.returncode, 0, result.stderr)
         beat = json.loads((self.loom / "state" / "usage" / "free-openrouter.json").read_text())
         self.assertFalse(beat["available"])
-        self.assertAlmostEqual(beat["retry_at"] - beat["at"], 900, delta=2)
+        self.assertEqual(beat["retry_at"], origin + 900)
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_free_gateway_retry_after_is_capped_at_one_day(self):
+        origin = self.pin_gateway_limit_clock()
         _, result = self.api_lane(
             "free-openrouter",
             FAKE_CURL="503",
@@ -6159,7 +6200,7 @@ fi
         self.assertEqual(result.returncode, 0, result.stderr)
         beat = json.loads((self.loom / "state" / "usage" / "free-openrouter.json").read_text())
         self.assertFalse(beat["available"])
-        self.assertAlmostEqual(beat["retry_at"] - beat["at"], 86400, delta=2)
+        self.assertEqual(beat["retry_at"], origin + 86400)
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_spark_run_cut_off_by_a_503_is_a_limit_not_a_failure(self):
@@ -8359,6 +8400,57 @@ exit %d
         calls = self.resolve_without_state_file(repo_public=False)
         self.assertNotIn("gh issue", calls)
 
+    def run_ask_lookup(self, call):
+        """Run settle_ask or open_issue with a factory repo holding an open
+        issue #5 that carries the ask's exact title. Only when OUTSIDER is 1
+        does #5 lack the needs:human label, as an issue anyone can file on a
+        public repo would. Returns the gh calls and the script's stdout."""
+        text = RUNNER.read_text()
+        funcs = "".join(re.search(r"^%s\(\) \{\n.*?^\}\n" % name, text, re.S | re.M).group(0)
+                        for name in ("settle_ask", "open_issue"))
+        tmp = Path(self._tmp.name)
+        calls = tmp / "calls"
+        calls.touch()
+        script = (funcs +
+                  'sign_tail() { :; }\nupsert_sticky_comment() { printf "sticky %s\\n" "$2" >> "$CALLS"; }\n'
+                  'python3() { return 0; }\n'
+                  'gh() { printf "gh %s\\n" "$*" >> "$CALLS"; case "$1 $2" in\n'
+                  '  "issue list"|"search issues")\n'
+                  '    case " $* " in *" --label needs:human "*) [ "$OUTSIDER" = 1 ] || printf "5\\n" ;;\n'
+                  '      *) printf "5\\n" ;; esac ;;\n'
+                  'esac; return 0; }\n' + call + '\n')
+        result = subprocess.run(
+            ["bash", "-c", script],
+            env={"PATH": "/usr/bin:/bin", "FACTORY_REPO": "quadseven/loom", "LOOM_ROOT": str(tmp),
+                 "PWD": str(tmp), "CALLS": str(calls), "LOG": str(self.log),
+                 "KEY_REPEAT_MARKER": "<!-- loom:key-repeat v1 -->", "SLOT": "codex-1",
+                 "OUTSIDER": self._outsider},
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return calls.read_text(), result.stdout
+
+    def test_an_outsider_issue_with_the_ask_title_does_not_close_the_lane_ask(self):
+        self._outsider = "1"
+        calls, _ = self.run_ask_lookup('settle_ask "Lane codex sign-in lapsed" 9 "Sign-in failed again"')
+        self.assertNotIn("gh issue close", calls)
+        self.assertNotIn("sticky 5", calls)
+
+    def test_a_lane_ask_filed_first_still_absorbs_a_later_duplicate(self):
+        self._outsider = "0"
+        calls, _ = self.run_ask_lookup('settle_ask "Lane codex sign-in lapsed" 9 "Sign-in failed again"')
+        self.assertIn("gh issue close --repo quadseven/loom 9", calls)
+        self.assertIn("sticky 5", calls)
+
+    def test_an_outsider_issue_with_the_ask_title_is_not_taken_as_the_open_ask(self):
+        self._outsider = "1"
+        _, out = self.run_ask_lookup('open_issue "Lane codex sign-in lapsed" needs:human')
+        self.assertEqual(out.strip(), "")
+
+    def test_an_open_lane_ask_is_found_by_its_title(self):
+        self._outsider = "0"
+        _, out = self.run_ask_lookup('open_issue "Lane codex sign-in lapsed" needs:human')
+        self.assertEqual(out.strip(), "5")
+
     def contract_repo(self, contract=CONTRACT):
         """Give the remote a submodule pinned behind its tip, the contract
         and check.py. Returns the pinned submodule commit."""
@@ -9681,13 +9773,19 @@ echo fixed > fix.txt
                 'echo "end" >> "$MARKS"\nrelease_check_slot\n')
         env = {"LOOM_CHECK_SLOTS": "1", "LOOM_CHECK_SLOT_POLL": "0.1", "MARKS": str(marks)}
         procs = [self.slot_script(body, **env) for _ in range(2)]
+        outcomes = []
         for proc in procs:
-            out, err = proc.communicate(timeout=60)
-            self.assertEqual(proc.returncode, 0, err)
+            _, err = proc.communicate(timeout=60)
+            outcomes.append((proc.pid, proc.returncode, err))
+        log_path = tmp / "slots.log"
+        slot_log = log_path.read_text() if log_path.exists() else ""
+        detail = f"Processes (PID, exit, stderr): {outcomes!r}\nSlot log:\n{slot_log}"
+        for _, returncode, _ in outcomes:
+            self.assertEqual(returncode, 0, detail)
         events = marks.read_text().split()
-        self.assertEqual(events, ["start", "end", "start", "end"])
-        self.assertIn("waiting for a check slot", (tmp / "slots.log").read_text())
-        self.assertEqual(list((self.loom / "run" / "check-slots").iterdir()), [])
+        self.assertEqual(events, ["start", "end", "start", "end"], detail)
+        self.assertIn("waiting for a check slot", slot_log, detail)
+        self.assertEqual(list((self.loom / "run" / "check-slots").iterdir()), [], detail)
 
     def test_slots_default_to_three(self):
         body = ('echo "$CHECK_SLOTS"\n')
