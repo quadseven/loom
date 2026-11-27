@@ -75,8 +75,11 @@ for one more slot than the provider's slots running now (fresh
 heartbeats), up to its most: the registry's slots of that provider, or
 `LOOM_PACE_MAX_<PROVIDER>`. On or ahead of pace it asks for none. A
 reading that is stale or from a window that has reset gives no verdict.
-The plan is written to `state/usage/pace.json` and shown as the `Pace`
-line of the lane status comment. It is data only: a lane container runs
+The plan is written to `state/usage/pace.json`. The lane status comment
+shows each subscription's longest window, used and elapsed percentages,
+UTC reset, pace, and running and allowed slots. It shows no reading when
+the meter is missing, stale, or reset. A current slot request appears
+beside the slot counts. The plan itself is data only: a lane container runs
 the slots its deployment names, so the request is what a pod that can
 start slots at runtime would read.
 

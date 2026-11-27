@@ -12,7 +12,7 @@ slots (the registry's slots of that provider, or LOOM_PACE_MAX_<PROVIDER>),
 and the slots it asks for: one more than running when it is behind and a
 ticket waits for a free lane, never more than the most; the running count
 otherwise, so a provider on or ahead of pace opens none. The plan is data in
-state/usage/pace.json and a line in the lane status comment. Opening a slot
+state/usage/pace.json. The lane status reports subscription usage. Opening a slot
 is the pod's to do: the lane container starts the slots its deployment
 names, so nothing here starts or stops a runner.
 """
@@ -186,26 +186,3 @@ def _providers(record: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     if not isinstance(providers, dict):
         return {}
     return {name: info for name, info in sorted(providers.items()) if isinstance(info, dict)}
-
-
-def lines(record: Dict[str, Any]) -> List[str]:
-    """The lane status comment's pace line, or none without a plan."""
-    providers = _providers(record)
-    if not providers:
-        return []
-    parts = []
-    for name, info in providers.items():
-        part = "%s %s %g%% used, %g%% elapsed, %s; slots %s of %s" % (
-            name, info.get("window"), round(float(info.get("used") or 0)),
-            round(float(info.get("elapsed") or 0)), info.get("verdict"), info.get("open"), info.get("max"))
-        if info.get("want") != info.get("open"):
-            part += ", asks for %s" % info.get("want")
-        parts.append(part)
-    return ["Pace (slack %g points): %s" % (float(record.get("slack") or SLACK_DEFAULT), " / ".join(parts))]
-
-
-def summary(record: Dict[str, Any]) -> str:
-    """Verdicts and requests only: what republishes the lane status when it
-    changes, while the elapsed share moves every pass."""
-    return " ".join("%s=%s:%s" % (name, info.get("verdict"), info.get("want"))
-                    for name, info in _providers(record).items())
