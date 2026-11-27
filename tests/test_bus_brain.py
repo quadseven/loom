@@ -1659,6 +1659,24 @@ class SensitiveResumeTests(unittest.TestCase):
             self.assertIn(form, err)
         make.assert_not_called()
 
+    def test_the_brief_command_accepts_live_boxes_answered_by_a_proof_request(self):
+        body = ("## Why\nThe page shows the wrong total.\n\n"
+                "## What\nFix rounding in the total.\n"
+                "Proof: Check the corrected total with seeded data.\n\n"
+                "## Acceptance criteria\n- [ ] Live: The page shows the corrected total.\n"
+                "- [ ] Live: The reported error is gone.\n\n"
+                "## Size\nS\n\n## Out of scope\nOther pages.\n")
+        code, err, make = self.brief_from_the_command_line(body)
+        self.assertEqual(code, 0, err)
+        make.assert_called_once()
+        for line in ("Proof:", "> Proof: Quoted from another ticket."):
+            with self.subTest(line=line):
+                refused = body.replace("Proof: Check the corrected total with seeded data.", line)
+                code, err, make = self.brief_from_the_command_line(refused)
+                self.assertEqual(code, 1)
+                self.assertIn("names no check Loom can run by itself", err)
+                make.assert_not_called()
+
     def test_brief_refuses_invalid_repair_incident_before_writing(self):
         for number in (0, -1, True, "#7"):
             with self.subTest(number=number):

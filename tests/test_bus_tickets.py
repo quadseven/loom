@@ -680,6 +680,41 @@ class ProofChecksTest(unittest.TestCase):
         self.assertIn("A test fails without the fix and passes with it.", section)
         self.assertIn("Live: the dashboard shows the corrected total", section)
         self.assertIn("The operator approves the rollout by hand.", section)
+        self.assertNotIn("## Buildable deliverable", text)
+
+    def test_live_only_briefs_give_the_lane_a_buildable_deliverable(self):
+        from bus import criteria_gate
+
+        live_boxes = (
+            "Live: A quester can finish this que" "st, or the ticket says why no one can",
+            "Live: The ledger reason is gone or explained",
+        )
+        for middle in ((), ("A test or a ledger row shows it",)):
+            with self.subTest(middle=middle):
+                body = ("## What\n\nFix the completion failure.\n\n## Acceptance criteria\n"
+                        + "".join("- [ ] %s\n" % box
+                                  for box in (live_boxes[0], *middle, live_boxes[1])))
+                text = render_brief(REPO, self.issue(body), "codex")
+                self.assertIn("## Buildable deliverable", text)
+                deliverable = text.split("## Buildable deliverable\n", 1)[1].split("\n## ", 1)[0]
+                self.assertIn("fix", deliverable)
+                self.assertIn("regression test", deliverable)
+                self.assertIn("Proof:", deliverable)
+                self.assertIn("not built: checked after merge", text)
+                checks = text.split("## Proof checks\n", 1)[1].splitlines()
+                for box in live_boxes:
+                    self.assertEqual(criteria_gate.kind(box), criteria_gate.LIVE)
+                    check = next(line for line in checks if line.startswith("- " + box))
+                    self.assertIn("verify run", check)
+                    self.assertIn("after the change ships", check)
+                if middle:
+                    self.assertEqual(criteria_gate.kind(middle[0]), criteria_gate.CODE)
+
+    def test_a_specific_code_criterion_supplies_the_buildable_deliverable(self):
+        body = ("## Acceptance criteria\n"
+                "- [ ] Live: The corrected total appears on the dashboard.\n"
+                "- [ ] tests/test_totals.py covers the rounding error.\n")
+        self.assertNotIn("## Buildable deliverable", render_brief(REPO, self.issue(body), "codex"))
 
     def test_criteria_under_the_short_acceptance_heading_are_restated(self):
         # The runner reads criteria under "## Acceptance" too, and the
