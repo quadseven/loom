@@ -2731,21 +2731,52 @@ class Factory:
             runs = self._runs[sha] = self._check_runs(repo, sha)
         return not any(r.get("conclusion") in brain.FAILED_CONCLUSIONS for r in (runs or ()))
 
-    def _close_past_ladder_pr(self, repo: str, pr: Dict[str, Any]) -> None:
+    def _past_ladder_pr_reopened(self, repo: str, number: int) -> bool:
+        """A different actor reversing the station's close takes over the pull request."""
+        notes = (str(c.get("body") or "") for c in self._comments(repo, number))
+        if not any(note.startswith("Closed by the station: its ticket ")
+                   and "past the last rung of the model ladder" in note for note in notes):
+            return False
+        events = self.gh.paginate("/repos/%s/issues/%d/events" % (repo, number))
+        lifecycle = sorted(
+            (e for e in events if isinstance(e, dict)
+             and e.get("event") in ("closed", "reopened")),
+            key=lambda e: (_ts(e.get("created_at")), str(e.get("id") or "").zfill(20)),
+        )
+        if len(lifecycle) < 2:
+            return False
+        closed, reopened = lifecycle[-2:]
+        if (closed["event"], reopened["event"]) != ("closed", "reopened"):
+            return False
+        closer, opener = (
+            rest_login(actor).lower() if isinstance(actor, dict) else ""
+            for actor in (closed.get("actor"), reopened.get("actor"))
+        )
+        if not closer or not opener or closer == opener:
+            return False
+        station = brain.writer_login(self.gh).lower()
+        return not station or closer == station
+
+    def _close_past_ladder_pr(self, repo: str, pr: Dict[str, Any],
+                              comment: str = "") -> bool:
         """Close an open lane pull request whose ticket is past the last rung of
         the model ladder, naming why, so the lane does not stall on it
         indefinitely. Leaves it open when its head has green checks and no
-        conflict, for the brain's ruling."""
+        conflict, or a different actor reopened it. Return whether it closed."""
         number = int(pr["number"])
         if self._past_ladder_pr_green(repo, pr):
             _say("%s#%d kept open past the model ladder: its head has green checks" % (repo, number))
-            return
-        comment = ("Closed by the station: its ticket is past the last rung of the "
+            return False
+        if self._past_ladder_pr_reopened(repo, number):
+            _say("%s#%d kept open past the model ladder: another actor reopened it" % (repo, number))
+            return False
+        comment = comment or ("Closed by the station: its ticket is past the last rung of the "
                    "model ladder and is left loom:failed for the brain, which re-briefs "
                    "the work as a new loom:ticket.")
         self.close(self.gh, repo, number, comment)
         self.actions += 1
         _say("closed %s#%d: its ticket is past the model ladder" % (repo, number))
+        return True
 
     def _send_back(self, repo: str, pr: Dict[str, Any], issue: Dict[str, Any],
                    comments: List[Dict[str, Any]], why: str,
@@ -3019,7 +3050,11 @@ class Factory:
                             prs: Sequence[Dict[str, Any]], closed: set) -> None:
         """Close the superseded lane pull requests of one ticket (item names it)."""
         ticket_number = int(item["number"])
-        ticket = ticket_map.get(ticket_number) or self._ticket(repo, ticket_number)
+        # Another operator's claim can exclude the ticket from the trusted map.
+        observed = ticket_map.get(ticket_number) or self._dependency(repo, ticket_number)
+        if observed and observed.get("state") == "open" and person_claim(observed):
+            return
+        ticket = observed if observed and self._trusted_ticket(observed) else None
         if ticket and _state(ticket) in ("merged", "shipped", "verified"):
             merged = self._merged_pull(repo, ticket_number)
             if merged is not None:
@@ -3036,14 +3071,16 @@ class Factory:
                 return
             if ticket.get("state") == "open":
                 return
-        ended =self._ended_note(repo, ticket, ticket_map) if ticket else None
+        ended = self._ended_note(repo, ticket, ticket_map) if ticket else None
         if ended is not None:
             for pr in prs:
                 if self.actions >= MAX_ACTIONS:
                     return
-                if "past the last rung of the model ladder" in ended and self._past_ladder_pr_green(repo, pr):
-                    continue
-                self._close_ended_pr(repo, pr, ended)
+                if "past the last rung of the model ladder" in ended:
+                    if not self._close_past_ladder_pr(repo, pr, ended):
+                        continue
+                else:
+                    self._close_ended_pr(repo, pr, ended)
                 closed.add(int(pr["number"]))
         elif len(prs) > 1:
             newest = max(prs, key=lambda p: (_ts(p.get("created_at")), int(p["number"])))

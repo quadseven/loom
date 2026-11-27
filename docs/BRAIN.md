@@ -1416,6 +1416,11 @@ instead of filing a second one.
   rung, with a `Not a failure` status event. A runaway or `needs-brain` ticket,
   and one the factory already gave up on past the last rung, stays as it is.
 
+The station leaves a past-ladder pull request open when another actor has
+reopened it after the last close. A ticket's claim also keeps the ladder from
+closing its pull request or moving the ticket to failed. The `Claimed ticket
+pull requests` section in `bus.brain status` lists the claim holders.
+
 The station applies the retry labels with its own login, so that login must
 be in `LOOM_BRIEF_AUTHORS`, or the trust rules refuse the retried ticket.
 
