@@ -75,13 +75,28 @@ probe_signins() {
   for lane in $PROBE_LANES; do
     slots=""
     for slot in $SLOTS; do
-      [ "$slot" = "$lane" ] || [ "${slot%-[0-9]*}" = "$lane" ] && slots="$slots $slot"
+      [ "$slot" = "$lane" ] || [ "${slot%-[0-9]*}" = "$lane" ] || continue
+      if [ "$slot" != "$lane" ] && [ -n "$(own_signin "$slot")" ]; then
+        # A slot with its own sign-in (LOOM_<SLOT>_AUTH_FILE, another account)
+        # is probed alone, on its own file.
+        bash "$PROBE" "$slot" >> "$LOOM_HOME/logs/signin-probe.log" 2>&1 &
+        PROBES="$PROBES $!"
+      else
+        slots="$slots $slot"
+      fi
     done
     [ -n "$slots" ] || continue
     # shellcheck disable=SC2086 # one slot a word
     bash "$PROBE" $slots >> "$LOOM_HOME/logs/signin-probe.log" 2>&1 &
     PROBES="$PROBES $!"
   done
+}
+
+# The sign-in file slot $1 names for itself (LOOM_<SLOT>_AUTH_FILE), if any.
+own_signin() {
+  local var
+  var="LOOM_$(printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_')_AUTH_FILE"
+  printf '%s' "${!var:-}"
 }
 
 drain() {

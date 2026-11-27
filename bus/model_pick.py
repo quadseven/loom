@@ -307,33 +307,37 @@ def read_usage(key: str, env: Mapping[str, str], opener: Opener) -> Optional[Dic
     return out
 
 
-def plan_stop(usage: Optional[Mapping[str, Tuple[float, float]]], now: float
+def plan_stop(usage: Optional[Mapping[str, Tuple[float, float]]], now: float,
+              stops: Optional[Mapping[str, float]] = None, slack: float = PACE_SLACK
               ) -> Optional[Tuple[float, str]]:
     """When paid runs may start again and why, or None while the plan has room.
-    Unreadable usage stops them."""
+    Unreadable usage stops them. `stops` names the windows to check and each
+    one's stop (default USAGE_STOP, the Go plan's); a PACED window also keeps
+    under stop * gone + `slack`. The Claude lane's cap (bus/usage_cap.py)
+    passes its own weekly stop and slack."""
     if usage is None:
         return now + RETRY_NOTHING, "plan usage could not be read"
-    for name, stop in USAGE_STOP.items():
+    for name, stop in (USAGE_STOP if stops is None else stops).items():
         percent, reset = usage[name]
         if percent >= stop:
             return reset, "%s usage %.0f%% is at its %.0f%% stop" % (name, percent, stop)
         if name in PACED:
             gone = min(1.0, max(0.0, 1 - (reset - now) / PACED[name]))
-            allowed = stop * gone + PACE_SLACK
+            allowed = stop * gone + slack
             if percent >= allowed:
-                return (pace_catches_up(percent, stop, reset, PACED[name], now),
+                return (pace_catches_up(percent, stop, reset, PACED[name], now, slack),
                         "%s usage %.0f%% is ahead of its %.0f%% pace" % (name, percent, allowed))
     return None
 
 
 def pace_catches_up(percent: float, stop: float, reset: float, window: float,
-                    now: float) -> float:
+                    now: float, slack: float = PACE_SLACK) -> float:
     """When the pace of a window that renews at `reset` allows `percent`
-    again: the allowance stop * gone + PACE_SLACK reaches it, solved for the
+    again: the allowance stop * gone + slack reaches it, solved for the
     time. Never sooner than RETRY_NOTHING from now. 2026-11-03: a pace stop
     asked again after RETRY_NOTHING, so its lane read free and took the same
     ticket about three times an hour for two days (loom#2809)."""
-    at = reset - window * (1 - (percent - PACE_SLACK) / stop)
+    at = reset - window * (1 - (percent - slack) / stop)
     return max(at, now + RETRY_NOTHING)
 
 

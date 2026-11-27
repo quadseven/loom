@@ -194,6 +194,16 @@ echo "probe $*" >> "$FAKE_LOG"
         self.assertEqual([line for line in lines if line.startswith("probe")],
                          ["probe codex codex-2 codex-12"])
 
+    def test_a_slot_with_its_own_sign_in_is_probed_alone(self):
+        # loom#3660: a second Claude account on its own slot and token file.
+        self.with_fake_probe()
+        result = self.pod(LOOM_POD_SLOTS="claude claude-2 claude-3",
+                          LOOM_CLAUDE_2_AUTH_FILE=str(self.root / "second-token"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = self.log.read_text().splitlines()
+        self.assertEqual(sorted(line for line in lines if line.startswith("probe")),
+                         ["probe claude claude-3", "probe claude-2"])
+
     def test_no_probe_for_api_lanes_or_when_turned_off(self):
         self.with_fake_probe()
         for env in ({"LOOM_POD_SLOTS": "zen opencode-go-5"},

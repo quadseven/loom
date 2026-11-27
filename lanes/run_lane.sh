@@ -2348,6 +2348,32 @@ pick_held() {
   pick_refused "$out"
 }
 
+# A claude slot keeps to a share of its weekly allowance (bus/usage_cap.py,
+# loom#3660): before each run it reads its own meter and holds at its stop
+# (LOOM_<SLOT>_USAGE_STOP, default 90 percent) or while it is ahead of an even
+# pace to that stop by the reset (LOOM_<SLOT>_USAGE_SLACK, default 5 points),
+# the rule the Go plan keeps. 0 when the slot holds until CAP_UNTIL; CAP_NOTE
+# is the verdict either way. A check that gives no answer holds LIMIT_HOLD.
+CAP_UNTIL="" CAP_NOTE=""
+usage_capped() {
+  local out rc
+  CAP_UNTIL="" CAP_NOTE=""
+  [ "$LANE" = claude ] || return 1
+  out="$(PYTHONPATH="$LOOM_ROOT" timeout "$PROBE_TIMEOUT" python3 -B -m bus.usage_cap check \
+    "$LOOM_HOME/state/usage/$SLOT.meter.json" "$(lane_setting USAGE_STOP)" "$(lane_setting USAGE_SLACK)" 2>/dev/null)"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    CAP_NOTE="$(printf '%s' "$out" | tr -cd '[:alnum:] ._:;()%/-' | cut -c1-200)"
+    return 1
+  fi
+  CAP_UNTIL="${out%%$'\t'*}" CAP_NOTE="${out#*$'\t'}"
+  if [ "$rc" -ne 3 ] || ! [[ "$CAP_UNTIL" =~ ^[0-9]+$ ]]; then
+    CAP_UNTIL=$(( $(date +%s) + LIMIT_HOLD )) CAP_NOTE="the usage cap check gave no answer"
+  fi
+  CAP_NOTE="$(printf '%s' "$CAP_NOTE" | tr -cd '[:alnum:] ._:;()%/-' | cut -c1-200)"
+  return 0
+}
+
 # The opencode binary a slot runs: LOOM_<SLOT>_OPENCODE, else opencode from
 # PATH. One slot can try a new major version (its installer would overwrite
 # the binary every other opencode lane runs) without moving the rest.
@@ -5365,8 +5391,14 @@ elif picks_model && pick_held; then
   LIMITED=1
   LIMIT_WHY="no model can run: $PICK_WHY"
   heartbeat false "limit: $LIMIT_WHY; unavailable until $(utc "$PICK_UNTIL")" "$PICK_UNTIL"
+elif usage_capped; then
+  # The slot's weekly use is at its stop or ahead of its pace: said
+  # available, it would spend the account's share past what it may.
+  LIMITED=1
+  LIMIT_WHY="$CAP_NOTE"
+  heartbeat false "limit: $LIMIT_WHY; unavailable until $(utc "$CAP_UNTIL")" "$CAP_UNTIL"
 else
-  heartbeat true ""
+  heartbeat true "$CAP_NOTE"
   lane_meter
 fi
 # Only the sandboxed lanes need the snapshot (codex and claude read the
@@ -5620,6 +5652,12 @@ for BRIEF in "$INBOX"/*.md; do
       park "$BRIEF" "limit: $LIMIT_WHY" limit; continue
     fi
     heartbeat true "model $MODEL in use ($MODEL_KIND)"
+  elif usage_capped; then
+    # The run before this one in the same pass may have reached the cap.
+    LIMITED=1
+    LIMIT_WHY="$CAP_NOTE"
+    heartbeat false "limit: $LIMIT_WHY; unavailable until $(utc "$CAP_UNTIL")" "$CAP_UNTIL"
+    park "$BRIEF" "limit: $LIMIT_WHY" limit; continue
   elif provider_at_limit; then
     hold_provider_limit
     park "$BRIEF" "limit: $LIMIT_WHY" limit; continue
