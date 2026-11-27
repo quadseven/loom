@@ -6735,6 +6735,9 @@ class Station:
             return
         if "loom:failed" in labels and target != "loom:merged":
             return
+        if target == "loom:merged" and pr.get("number") in tickets.rejected_pulls(
+                self._status_texts(repo, int(number))):
+            return
         if target == "loom:merged" and "loom:failed" in labels:
             states = {"loom:" + state for state in brain.STATES + tickets.TICKET_STATES}
             kept = self._drop_claim(name for name in labels
@@ -6748,9 +6751,6 @@ class Station:
                           % int(pr["number"]))
             _say("%s#%d: merged pull request #%d moved failed ticket to loom:merged"
                  % (repo, number, int(pr["number"])))
-            return
-        if target == "loom:merged" and pr.get("number") in tickets.rejected_pulls(
-                self._status_texts(repo, int(number))):
             return
         if target == "loom:merged" and "loom:regression" in labels:
             events = self._paginate("/repos/%s/issues/%d/events" % (repo, number))
