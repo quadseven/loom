@@ -11,25 +11,17 @@ SUBSCRIPTIONS = frozenset(("agy", "claude", "codex", "copilot", "opencode-go"))
 _WINDOW = re.compile(r"[a-z0-9-]{1,24}", re.ASCII)
 
 
-def _number(value):
-    try:
-        value = pace._number(value)
-    except OverflowError:
-        return None
-    return value if value is not None and math.isfinite(value) else None
-
-
 def _longest(records):
     selected = {}
     for record in records:
         provider = record.get("provider")
         window = record.get("window")
-        minutes = _number(record.get("window_minutes"))
+        minutes = pace._number(record.get("window_minutes"))
         if (not isinstance(provider, str) or provider not in SUBSCRIPTIONS
                 or not isinstance(window, str) or not _WINDOW.fullmatch(window)
                 or minutes is None or minutes <= 0):
             continue
-        observed = usage._parse(record.get("observed_at") or record.get("as_of"))
+        observed = usage.observation_time(record)
         rank = (minutes, observed if observed is not None else -math.inf)
         if provider not in selected or rank > selected[provider][0]:
             selected[provider] = (rank, record)
@@ -37,10 +29,10 @@ def _longest(records):
 
 
 def _reading(record, now, points):
-    observed = usage._parse(record.get("observed_at") or record.get("as_of"))
+    observed = usage.observation_time(record)
     reset = usage._parse(record.get("resets_at"))
     elapsed = pace.elapsed_pct(reset, record.get("window_minutes"), now)
-    used = _number(record.get("used_pct"))
+    used = pace._number(record.get("used_pct"))
     if (used is None or not 0 <= used <= 100 or elapsed is None or observed is None
             or not max(reset - record["window_minutes"] * 60, now - usage.STALE_AFTER)
             <= observed <= now):
@@ -50,7 +42,7 @@ def _reading(record, now, points):
 
 
 def _requested(plan, row, now):
-    at = _number(plan.get("at"))
+    at = pace._number(plan.get("at"))
     if at is None or not 0 <= now - at <= usage.HEARTBEAT_FRESH or row["verdict"] is None:
         return None
     decision = pace._providers(plan).get(row["provider"], {})

@@ -19,6 +19,7 @@ names, so nothing here starts or stops a runner.
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
@@ -83,7 +84,11 @@ def queued(waits: Any) -> int:
 def _number(value: Any) -> Optional[float]:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value)
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _reading(row: Dict[str, Any], now: float) -> Optional[Dict[str, Any]]:
