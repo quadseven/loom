@@ -432,6 +432,12 @@ class RewriteIssueTest(Base):
                 body = BODY.replace("- [ ] ", "- [ ] %s\n- [ ] " % live, 1)
                 rewrite.validate(dict(BRIEF, body=body))
 
+    def test_a_rewrite_accepts_a_prose_live_box_with_a_proof_request(self):
+        body = BODY.replace("Cache the query.", "Cache the query.\n"
+                            "Proof: Load the page against seeded data.")
+        body = body.replace("- [ ] The page loads", "- [ ] Live: The page loads")
+        self.assertEqual(self.rewrite(dict(BRIEF, body=body)), "brief")
+
     def test_a_skip_answer_writes_nothing(self):
         self.assertEqual(self.rewrite({"action": "skip", "reason": "unclear"}), "skip")
         self.assertEqual(self.fake.writes_to(7), [])

@@ -874,6 +874,8 @@ _STORED_ROWS_RE = re.compile(
     r"\b(rows?|tables?|quer(y|ies)|database|sqlite|select\s+\S+\s+from)\b", re.I)
 _WHAT_OR_CRITERIA_RE = re.compile(
     r"^## (What|Acceptance criteria)\s*\n(.*?)(?=^## |\Z)", re.M | re.S)
+_PROOF_REQUEST_RE = re.compile(r"^Proof:[ \t]+\S", re.M)
+_MARKDOWN_EXAMPLES_RE = re.compile(r"<!--.*?-->|^(```|~~~)[^\n]*\n.*?^\1[^\n]*", re.M | re.S)
 FIXTURE_NOTE = (
     "This ticket reads stored rows: take each test's fixture rows from the code that "
     "writes them or from a read-only live read, and cite which in the pull request.")
@@ -883,6 +885,13 @@ def reads_stored_rows(body: str) -> bool:
     """Whether a ticket's What or Acceptance criteria name stored rows."""
     return any(_STORED_ROWS_RE.search(m.group(2))
                for m in _WHAT_OR_CRITERIA_RE.finditer(body or ""))
+
+
+def has_proof_request(body: str) -> bool:
+    """Whether What carries a nonempty Proof line for the repo's proof pipeline."""
+    prose = _MARKDOWN_EXAMPLES_RE.sub("", without_original(status.strip_body(body)))
+    return any(m.group(1) == "What" and _PROOF_REQUEST_RE.search(m.group(2))
+               for m in _WHAT_OR_CRITERIA_RE.finditer(prose))
 
 
 # What proves one acceptance criterion, by its kind (bus/criteria_gate.py):
@@ -903,6 +912,17 @@ PROOF_CHECKS_NOTE = (
     "The pull request body answers criterion by criterion: tick each code "
     "criterion the change builds, and mark each one it does not build "
     "\"not built: <reason>\".")
+
+BUILDABLE_DELIVERABLE = """\
+## Buildable deliverable
+
+- Implement the fix described in What.
+- Add a regression test that fails without the fix and passes with it.
+- Include a request in the pull request body for the repository's throwaway-environment
+  proof pipeline. Use a standalone `Proof:` line where the repository uses that format.
+"""
+
+_GENERIC_PROOF_RE = re.compile(r"a test or a (?:ledger )?row shows it\.?", re.I)
 
 
 _ACCEPTANCE_BOX_RE = re.compile(r"^\s*[-*] \[([ xX])\]\s+(.*?)\s*$")
@@ -937,6 +957,17 @@ def proof_checks(body: str) -> List[Tuple[str, str]]:
     from . import criteria_gate  # criteria_gate imports this module
     return [(text, PROOF_CHECK_BY_KIND[criteria_gate.kind(text)])
             for text in _criteria_texts(body or "")]
+
+
+def needs_buildable_deliverable(body: str) -> bool:
+    """Whether the outcomes are live with at most one generic test-or-row box."""
+    from . import criteria_gate
+
+    criteria = _criteria_texts(body)
+    remaining = [text for text in criteria if criteria_gate.kind(text) != criteria_gate.LIVE]
+    return len(remaining) < len(criteria) and (
+        not remaining or (len(remaining) == 1 and bool(
+            _GENERIC_PROOF_RE.fullmatch(" ".join(remaining[0].split())))))
 
 
 def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
@@ -985,9 +1016,15 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
     if body:
         text += body + "\n"
     if fix is None:
+        buildable = headers.get("Deliverable") != "answer" and needs_buildable_deliverable(body)
+        if buildable:
+            text += "\n" + BUILDABLE_DELIVERABLE
         checks = proof_checks(body)
         if checks:
-            text += "\n## Proof checks\n\n" + PROOF_CHECKS_NOTE + "\n\n"
+            text += "\n## Proof checks\n\n" + PROOF_CHECKS_NOTE
+            if buildable:
+                text += ' Leave live criteria unticked and write "not built: checked after merge" for each.'
+            text += "\n\n"
             text += "".join("- %s - proved by %s.\n" % (criterion, check)
                             for criterion, check in checks)
     if reads_stored_rows(body):
