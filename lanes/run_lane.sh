@@ -2172,7 +2172,7 @@ ask_sign_in() {
 # keep one comment on it with a running count headed $3, never one per failure.
 file_ask() {
   local title="$1" body="$2" headline="$3" number existing
-  existing="$(open_issue "$title")"
+  existing="$(open_issue "$title" needs:human)"
   if [ -n "$existing" ]; then
     printf '' | upsert_sticky_comment "$FACTORY_REPO" "$existing" "$KEY_REPEAT_MARKER" repeat \
       --headline "$headline" --items-label "Lanes seen" --item "$SLOT" ||
@@ -2197,9 +2197,11 @@ file_ask() {
 # title is the one ask: a higher one closes itself and counts its lane on the
 # lowest. The earlier filer never closes, since every later ask has a higher
 # number and every later listing sees it. A failed listing keeps the ask.
+# Only needs:human issues count, for the reason open_issue gives.
 settle_ask() {
   local title="$1" number="$2" headline="$3" first
   first="$(TITLE="$title" gh issue list --repo "$FACTORY_REPO" --state open --limit 500 \
+             --label needs:human \
              --json number,title --jq '.[] | select(.title == env.TITLE) | .number' \
              2>>"$LOG" | tr -cd '0-9\n' | sort -n | head -1)" || return 0
   [ -n "$first" ] && [ "$first" -lt "$number" ] || return 0
@@ -2900,8 +2902,12 @@ KEY_REPEAT_MARKER="<!-- loom:key-repeat v1 -->"
 INCIDENT_REPEAT_MARKER="<!-- loom:incident-repeat v1 -->"
 # The number of the open issue on the factory repo whose title is exactly $1,
 # empty when there is none: one open issue per incident kind, per expired key.
+# The open issue titled $1 that carries label $2 (needs:human for an ask,
+# loom:factory for an incident). The factory repo is public, so anyone can
+# open an issue with the exact title, but only a collaborator can label it:
+# an outsider's issue must never swallow the lane's ask or incident.
 open_issue() {
-  TITLE="$1" gh search issues --repo "$FACTORY_REPO" --state open \
+  TITLE="$1" gh search issues --repo "$FACTORY_REPO" --state open --label "$2" \
     --json number,title --jq '.[] | select(.title == env.TITLE) | .number' \
     -- "$1" 2>>"$LOG" | head -1
 }
@@ -3062,7 +3068,7 @@ file_factory_incident() {  # kind, detail
   title="Factory incident: $subject validation $kind"
   body="$(printf '%s\n\nRepo: %s\nKind: %s\nTicket: %s\n\n%s\n' \
     "$INCIDENT_MARKER" "$subject" "$kind" "$ticket" "$detail")"
-  existing="$(open_issue "$title")"
+  existing="$(open_issue "$title" loom:factory)"
   if [ -n "$existing" ]; then
     number="$existing"
     # One comment on the incident with a running count, never one per run.
