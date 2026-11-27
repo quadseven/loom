@@ -462,7 +462,9 @@ unset variables.
   pid is alive is left alone by every lane; one whose pid is gone is
   reclaimed by the next waiter; one with no `pid` file yet is treated as
   being taken and left alone, so write the pid at once. The pid must stay
-  alive for as long as the job runs.
+  alive for as long as the job runs. Lane reapers recheck the PID under a
+  shared guard before removing a stale slot, so one waiter cannot remove a
+  slot another just took.
 - Every step sees `LOOM_CHECK_SANDBOX=1`. The sandbox denies localhost, so a
   repo's test that needs a loopback connection may skip when that variable
   is `1`, and only then; CI and local runs never set it, so the test still
