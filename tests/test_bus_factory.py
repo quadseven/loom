@@ -3547,7 +3547,7 @@ class Queued(Base):
                          ["queued", "queued", "briefed"])
 
     OPUS = "Model: claude-opus-5-5\nDifficulty: hard\n\n## Why\nx\n"
-    OUT = factory.ANTHROPIC + ("claude",)
+    OUT = factory.ANTHROPIC + factory.CLAUDE
 
     def test_opus_pin_never_goes_to_agy_when_every_anthropic_lane_is_out(self):
         # Until 2026-10-21 it moved to agy on gemini-4-argon-high (EQUIVALENTS);
@@ -4566,7 +4566,7 @@ class Tickets(Base):
         self.setUp()
         self.gh.ticket(7, "briefed", lane="codex", body=body)
         busy = (factory.CODEX[1:] + factory.OPENCODE_GO + factory.SPARKS + factory.FREE_POOL
-                + ("openrouter", "workersai", "zen", "zai", "claude"))
+                + ("openrouter", "workersai", "zen", "zai") + factory.CLAUDE)
         for n, lane in enumerate(busy, 20):
             self.gh.ticket(n, "briefed", lane=lane)
         self.go(limited=["codex"])
