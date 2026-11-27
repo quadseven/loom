@@ -3195,13 +3195,18 @@ except BlockingIOError:
   mv "$slot" "$slot.stale.$$" 2>/dev/null
 ) 9>>"$CHECK_SLOT_DIR.guard"
 
+# Some versions of uutils mkdir report success after losing a creation race.
+create_check_slot() {
+  python3 -IB -c 'import os, sys; os.mkdir(sys.argv[1])' "$1" 2>/dev/null
+}
+
 # Try each slot once; sets CHECK_SLOT_HELD and returns 0 on a take.
 try_check_slot() {
   local n slot pid
   mkdir -p "$CHECK_SLOT_DIR" 2>/dev/null || return 1
   for n in $(seq 1 "$CHECK_SLOTS"); do
     slot="$CHECK_SLOT_DIR/slot-$n"
-    if mkdir "$slot" 2>/dev/null; then
+    if create_check_slot "$slot"; then
       echo $$ > "$slot/pid"
       CHECK_SLOT_HELD="$slot"
       return 0
@@ -3214,7 +3219,7 @@ try_check_slot() {
     if reclaim_check_slot "$slot" "$pid"; then
       echo "check slot $n was held by pid $pid, which is gone; reclaimed" >> "$LOG"
       rm -rf "$slot.stale.$$"
-      if mkdir "$slot" 2>/dev/null; then
+      if create_check_slot "$slot"; then
         echo $$ > "$slot/pid"
         CHECK_SLOT_HELD="$slot"
         return 0
