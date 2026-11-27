@@ -55,6 +55,7 @@ from . import lane_markers
 from . import log_capture
 from . import operator_budget
 from . import pace
+from . import subscription_view
 from . import fabric, fabric_reviews
 from . import fixrounds
 from . import logrotate
@@ -11487,10 +11488,13 @@ class Station:
         return None
 
     def _lanes_body(self, rows: List[Tuple[str, str, str, str]],
-                    pr_lines: Optional[List[str]] = None) -> str:
+                    pr_lines: Optional[List[str]] = None,
+                    subscriptions: Optional[List[Dict[str, Any]]] = None) -> str:
         summary = self._spend_shown()
         disk = [line for line in (self._disk_status_line(), self._watchdog_notice()) if line]
         probes = signin.by_slot(signin.read(self.s.home))
+        if subscriptions is None:
+            subscriptions = subscription_view.read(self.s.home, self.now, os.environ)
         body = "\n".join(
             [LANES_MARKER, "Updated " + self._utc(self.now),
              station_beat.stamp_line(station_beat.station_settings(os.environ)[0]), ""]
@@ -11501,7 +11505,7 @@ class Station:
                for row in rows]
             + ["", "Remote claims: muse %d/%d" % (
                 self._remote_claim_count("muse"), REMOTE_LANES["muse"]["slots"])]
-            + pace.lines(pace.read(self.s.home))
+            + subscription_view.lines(subscriptions)
             + (pr_lines or [])
             + self._scorecard_lines()
             + (["", summary.line()] if summary is not None else []))
@@ -11604,8 +11608,8 @@ class Station:
         # Claims paused or resumed for disk republishes (loom#1808).
         values["disk"] = "paused" if self._disk_status_line() else "ok"
         values["disk watchdog"] = self._watchdog_notice() or ""
-        # A new pace verdict or slot request republishes (loom#3630).
-        values["pace"] = pace.summary(pace.read(self.s.home))
+        subscriptions = subscription_view.read(self.s.home, self.now, os.environ)
+        values["pace"] = subscription_view.signature(subscriptions)
         if refresh_pr_counts:
             read_lines, read_at = self._repo_pr_lines(), self.now
             pr_lines = read_lines
@@ -11615,7 +11619,8 @@ class Station:
         if self._lanes_unchanged(repo, values):
             return
         number = self._lanes_issue(repo)
-        comment_id = self._upsert_lanes_comment(repo, number, self._lanes_body(rows, pr_lines))
+        comment_id = self._upsert_lanes_comment(
+            repo, number, self._lanes_body(rows, pr_lines, subscriptions))
         record = {"repo": repo, "issue": number, "comment_id": comment_id,
                   "values": values, "at": self.now}
         if read_lines is not None:

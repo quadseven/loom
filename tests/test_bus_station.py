@@ -16581,8 +16581,54 @@ class PaceTest(Base):
         plan = pace.read(self.home)["providers"]["codex"]
         self.assertEqual((plan["verdict"], plan["open"], plan["max"], plan["want"]),
                          (pace.BEHIND, 1, 2, 2))
-        self.assertIn("Pace (slack 10 points): codex weekly 2% used, 50% elapsed, behind; "
-                      "slots 1 of 2, asks for 2", body)
+        self.assertIn(f"| codex | weekly | 2% | 50% | {reset} | behind | "
+                      "1 of 2 (asks for 2) |", body)
+
+    def test_subscription_status_preserves_zero_and_refuses_old_windows(self):
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        now = runner.now
+
+        def row(provider, window, minutes, used, end, age=10):
+            return {"provider": provider, "lanes": [provider], "window": window,
+                    "window_minutes": minutes, "used_pct": used,
+                    "resets_at": station.usage._iso(end),
+                    "observed_at": station.usage._iso(now - age)}
+
+        reset = now + 50 * 60
+        station.usage.write(self.home, [
+            row("codex", "weekly", 100, 0, reset),
+            row("claude", "weekly", 10080, 23, reset, age=7201),
+            row("claude", "five-hour", 300, 30, reset),
+            row("agy", "weekly", 10080, 8, now - 1),
+        ])
+        body = runner._lanes_body([])
+        self.assertIn(f"| codex | weekly | 0% | 50% | {station.usage._iso(reset)} | behind |", body)
+        self.assertIn("| claude | weekly | no reading |", body)
+        self.assertEqual(sum(line.startswith("| claude | weekly |")
+                             for line in body.splitlines()), 1, body)
+        self.assertIn("| agy | weekly | no reading |", body)
+        self.assertIn("| copilot | - | no reading |", body)
+
+    def test_changed_usage_republishes_inside_the_same_pace_band(self):
+        self.settings.status_repo = REPO
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        now = runner.now
+        row = {"provider": "codex", "lanes": ["codex"], "window": "weekly",
+               "window_minutes": 10080, "used_pct": 1,
+               "resets_at": station.usage._iso(now + 50 * 60),
+               "observed_at": station.usage._iso(now - 60)}
+        with mock.patch.object(runner, "_lane_rows", return_value=[]), \
+                mock.patch.object(runner, "_lanes_issue", return_value=1), \
+                mock.patch.object(runner, "_remote_claim_count", return_value=0), \
+                mock.patch.object(runner, "_upsert_lanes_comment", return_value=2) as post:
+            station.usage.write(self.home, [row])
+            runner.publish_lanes(refresh_pr_counts=False)
+            row["used_pct"] = 2
+            station.usage.write(self.home, [row])
+            runner.publish_lanes(refresh_pr_counts=False)
+            runner.publish_lanes(refresh_pr_counts=False)
+        self.assertEqual(post.call_count, 2)
+        self.assertIn("| codex | weekly | 2% |", post.call_args.args[2])
 
 
 class RunnerSlotClaimTest(Base):
