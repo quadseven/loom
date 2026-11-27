@@ -23,6 +23,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from bus import brain
 
+from . import free_view
+
 REPORT_MARKER = "<!-- loom:report v1 -->"
 JOURNAL_MARKER = "<!-- loom:journal v1 -->"
 PROOF_MARKER = "<!-- loom:proof v1 -->"
@@ -236,12 +238,6 @@ def _latest_measure(notes: Sequence[Dict[str, Any]]) -> Optional[str]:
     return found[-1] if found else None
 
 
-def _proof_issue(row: Dict[str, Any]) -> Dict[str, Any]:
-    """Express an open snapshot row in the brain's proof capacity issue shape."""
-    return {"state": "open",
-            "labels": [{"name": name} for name in row.get("labels") or ()]}
-
-
 def _goal_record(title: Optional[str], notes: Sequence[Dict[str, Any]], tickets: Sequence[str],
                  open_issues: List[Dict[str, Any]], proofs: Dict[str, List[str]],
                  limit: int, now: datetime, unread_notes: Optional[str] = None,
@@ -301,7 +297,7 @@ def goal_context(rows: Sequence[Dict[str, Any]], comments: Sequence[Dict[str, An
         ref = "%s#%s" % (row.get("repo"), row.get("number"))
         by_goal.setdefault(goal, []).append(ref)
         if row.get("open", True):
-            open_issues.setdefault(goal, []).append(_proof_issue(row))
+            open_issues.setdefault(goal, []).append(free_view._ticket_shape(row))
             if row.get("state") in IN_FLIGHT_STATES:
                 flying[goal] = flying.get(goal, 0) + 1
     for goal in list(by_goal):
