@@ -74,8 +74,8 @@ codex_lane_home() {
 # The token file claude slot $1 (default SLOT, else claude) signs in with:
 # LOOM_<SLOT>_AUTH_FILE, else LOOM_CLAUDE_AUTH_FILE. A second account runs on
 # its own slot (claude-2 with LOOM_CLAUDE_2_AUTH_FILE), and its meter is that
-# slot's own (state/usage/<slot>.meter.json), so each account is metered
-# alone. Empty when neither is set.
+# slot's own (state/usage/<slot>.meter.json), so each account is capped alone
+# (bus/usage_cap.py). Empty when neither is set.
 claude_auth_file() {
   local slot="${1:-${SLOT:-claude}}" var
   [[ "$slot" =~ ^[a-z][a-z0-9-]*$ ]] || slot=claude
