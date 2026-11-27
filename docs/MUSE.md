@@ -1063,14 +1063,16 @@ lane. Quotas and lane limits still apply.
 
 Codex runs gpt-6-luna only and agy the gemini-3.8-flash family only (the
 operator, 2026-10-21). A ticket with no `Model:` line runs its lane's
-default; the table `HARD_MODELS` in bus/factory.py is empty,
-and so is `EQUIVALENTS`: a ticket pinned to claude-opus-5-5 waits for an
-Anthropic lane and never goes to agy on an equivalent. A queued ticket whose
-pin is a default, not a hard pin, takes the first free lane with that
-lane's own model once its model had no free lane for
-`LOOM_PIN_FALLBACK_MINUTES` (docs/BRAIN.md, Tickets no lane takes). A `Model:` line naming gpt-6-sol or a
-gemini-4-argon model reads as gpt-6-luna or gemini-3.8-flash-high, and the
-brain writes the same stand-in (`FORBIDDEN_MODELS` in bus/tickets.py).
+default. The `HARD_MODELS` and `EQUIVALENTS` tables in bus/factory.py are
+empty. The factory tries the pinned model first. A queued ticket with a
+default pin takes the first eligible free local lane by cost, using that
+lane's own model, after `LOOM_PIN_FALLBACK_MINUTES` without a free lane for
+the pinned model. Fallback applies regardless of who opened the ticket. It
+skips tickets labeled `class:sensitive` or `tier:security` and pins set by
+the model ladder (docs/BRAIN.md, Tickets no lane takes).
+A `Model:` line naming gpt-6-sol or a gemini-4-argon model reads as
+gpt-6-luna or gemini-3.8-flash-high, and the brain writes the same stand-in
+(`FORBIDDEN_MODELS` in bus/tickets.py).
 
 A ticket off a lane at a limit or down takes the first free other lane of
 the list, keeping private repos off the public-only lanes. With every other
