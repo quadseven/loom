@@ -2493,8 +2493,11 @@ safe_git() {
 
 # Every lane shares one GitHub App identity, so each lane signs what it writes
 # (bus/signature.py): a final "Signed: lane-<slot>, model <model>" line on each
-# pull request body and comment, and Loom-Lane and Loom-Model trailers on each
-# commit. The model is the run's own ($MODEL), else LOOM_<SLOT>_MODEL.
+# pull request body and comment, and Loom-Engine, Loom-Model, Loom-Lane and
+# Loom-Run trailers on each commit. The model is the run's own ($MODEL), else
+# LOOM_<SLOT>_MODEL. The engine is the agent program run_agent starts for the
+# lane (lane_engine). The run is LOOM_RUN_ID when set, else the brief's name
+# ($TICKET), the name the run's log and lane-log notes carry.
 # signed prints $1 with exactly one signature line; commit_msg prints $1 with
 # the trailers. Both fall back to the plain text when python is unavailable, so
 # a signing fault never costs the run its comment or commit.
@@ -2507,10 +2510,21 @@ signed() {
 # sign_tail prints the signature on its own paragraph, to end a message whose
 # leading words must stay literal (a close comment states its reason first).
 sign_tail() { printf '\n\n%s' "$(signed "")"; }
+# lane_engine prints the agent program run_agent starts for $LANE, and nothing
+# for a lane it does not know (the trailer then reads LOOM_<SLOT>_ENGINE, else
+# unknown). Keep it in step with run_agent.
+lane_engine() {
+  case "${LANE:-}" in
+    codex|claude|agy|copilot) printf '%s' "$LANE" ;;
+    anthropic) printf 'claude' ;;
+    openrouter|tinker|opencode-go|zen|spark|free|zai|workersai) printf 'opencode' ;;
+  esac
+}
 commit_msg() {
   local out
   out="$(PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.signature message \
-    --lane "$SLOT" --model "${MODEL:-}" --engine "${ENGINE:-}" --run "${LOOM_RUN_ID:-}" "$1" 2>> "${LOG:-/dev/null}")" || out="$1"
+    --lane "$SLOT" --model "${MODEL:-}" --engine "$(lane_engine)" \
+    --run "${LOOM_RUN_ID:-${TICKET:-}}" "$1" 2>> "${LOG:-/dev/null}")" || out="$1"
   printf '%s' "$out"
 }
 

@@ -1,5 +1,5 @@
 """Every lane signs what it writes: the signature line on each pull request
-body and comment, and the Loom-Lane and Loom-Model trailers on each commit."""
+body and comment, and the four Loom- trailers on each commit."""
 from __future__ import annotations
 
 import os
@@ -209,6 +209,27 @@ class RunnerShellTest(unittest.TestCase):
         out = shell('MODEL=%s; commit_msg "$(commit_msg "Fix the thing")"' % MODEL)
         self.assertEqual(out.strip(), "Fix the thing\n\nLoom-Engine: unknown\nLoom-Model: " + MODEL
                          + "\nLoom-Lane: lane-spark\nLoom-Run: unknown")
+
+    def test_commit_msg_names_the_lanes_engine_and_the_briefs_run(self):
+        out = shell('LANE=opencode-go; TICKET=example.repo-7-r2; MODEL=%s; commit_msg "Fix"' % MODEL,
+                    SLOT="opencode-go-2")
+        self.assertEqual(out.strip().splitlines()[-4:], [
+            "Loom-Engine: opencode", "Loom-Model: " + MODEL, "Loom-Lane: lane-opencode-go-2",
+            "Loom-Run: example.repo-7-r2"])
+
+    def test_lane_engine_names_the_program_run_agent_starts_for_each_lane(self):
+        cases = {"codex": "codex", "claude": "claude", "anthropic": "claude", "agy": "agy",
+                 "copilot": "copilot", "openrouter": "opencode", "tinker": "opencode",
+                 "opencode-go": "opencode", "zen": "opencode", "spark": "opencode",
+                 "free": "opencode", "zai": "opencode", "workersai": "opencode", "nosuch": ""}
+        for name, engine in cases.items():
+            self.assertEqual(shell("LANE=%s; lane_engine" % name), engine, name)
+        body = SCRIPT[SCRIPT.index("\nrun_agent() {"):]
+        body = body[:body.index("\n}\n")]
+        groups = re.findall(r"^    ([a-z|-]+)\)", body, re.M)
+        lanes = {x for group in groups for x in group.split("|")}
+        self.assertTrue(lanes)
+        self.assertEqual(lanes - set(cases), set(), "lane_engine misses a run_agent lane")
 
     def test_a_real_commit_made_with_commit_msg_has_the_trailers(self):
         with tempfile.TemporaryDirectory() as tmp:
