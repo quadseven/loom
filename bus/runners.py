@@ -98,6 +98,7 @@ TRACKED_SLOTS = {
     "opencode-go-3": {"LOOM_OPENCODE_GO_3_MODEL": "opencode-go/deepseek-v4.1-flash"},
     "opencode-go-4": {"LOOM_OPENCODE_GO_4_MODEL": "opencode-go/muse-spark-1.3-contributor"},
     **{"anthropic-%d" % n: {} for n in range(2, 9)},
+    **{"codex-%d" % n: {"LOOM_CODEX_%d_MODEL" % n: "gpt-6-luna"} for n in range(2, 9)},
 }
 OPENCODE_GO_SLOTS = tuple("opencode-go-%d" % n for n in range(1, 5))
 OPENCODE_GO_KEY_SSM = "LOOM_OPENCODE_GO_KEY_SSM"
