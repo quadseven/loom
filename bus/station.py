@@ -19607,7 +19607,8 @@ class Station:
         try:
             records = usage.collect(self.s.home, now=self.now)
             usage.write(self.s.home, records)
-            self.upload_usage_limits(records)
+            subscriptions = subscription_view.read(self.s.home, self.now, os.environ, records)
+            self.upload_usage_limits(subscription_view.for_upload(records, subscriptions, self.now))
             waits = _read_json(os.path.join(self.state, "ticket-waits.json"), {}, strict=False)
             pace.write(self.s.home, pace.plan(self.s.home, records, pace.queued(waits),
                                               os.environ, self.now))

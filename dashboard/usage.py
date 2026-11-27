@@ -540,10 +540,13 @@ def _resource_meter(w: dict[str, Any], now: datetime) -> str:
 def _unknown_meter(w: dict[str, Any], now: datetime) -> str:
     if w["kind"] == "run" and w.get("peak_mem_mib") is not None:
         return _resource_meter(w, now)
+    figure, detail = "Unknown", _unknown_note(w, now)
+    if w["used"] is not None and w["stale"]:
+        figure, detail = "No reading", _meter_detail(w, now)
     return ('<div class="um um-none"><span class="um-name">%s</span>'
             '<div class="um-bar um-unknown" aria-hidden="true"></div>'
-            '<p class="um-fig">Unknown</p><p class="um-detail">%s</p></div>'
-            % (html.escape(w["name"]), html.escape(_unknown_note(w, now))))
+            '<p class="um-fig">%s</p><p class="um-detail">%s</p></div>'
+            % (html.escape(w["name"]), figure, html.escape(detail)))
 
 
 def _meter_detail(w: dict[str, Any], now: datetime) -> str:
@@ -570,24 +573,23 @@ def _meter_detail(w: dict[str, Any], now: datetime) -> str:
 def _meter(w: dict[str, Any], now: datetime) -> str:
     """One window: a used/left bar with the projected use at reset, its
     figures with units, and the reset and pace in words."""
-    if w["used"] is None:
+    if w["used"] is None or w["stale"]:
         return _unknown_meter(w, now)
     esc = html.escape
-    used, stale = w["used"], bool(w["stale"])
-    tone = "" if stale else " um-bad" if used >= NEAR_LIMIT_PCT else " um-warn" if w["runs_out"] else ""
+    used = w["used"]
+    tone = " um-bad" if used >= NEAR_LIMIT_PCT else " um-warn" if w["runs_out"] else ""
     marker = ""
     if w["at_reset"] is not None and w["at_reset"] > used:
         marker = '<i class="um-proj" style="left:%.1f%%"></i>' % w["at_reset"]
-    label = "%s used, %s left%s" % (percent(used), percent(100 - used), ", stale" if stale else "")
+    label = "%s used, %s left" % (percent(used), percent(100 - used))
     figure = '<strong>%s</strong> used <span class="um-sep">/</span> <strong>%s</strong> left' % (
         percent(used), percent(100 - used))
     if "usd_left" in w:
         figure += ' <span class="um-usd">(USD %.2f left)</span>' % w["usd_left"]
-    return ('<div class="um%s%s"><span class="um-name">%s</span>'
-            '<div class="um-bar%s" role="img" aria-label="%s"><span style="width:%.1f%%"></span>%s</div>'
+    return ('<div class="um%s"><span class="um-name">%s</span>'
+            '<div class="um-bar" role="img" aria-label="%s"><span style="width:%.1f%%"></span>%s</div>'
             '<p class="um-fig">%s</p><p class="um-detail">%s</p></div>'
-            % (tone, " um-is-stale" if stale else "", esc(w["name"]), " um-stale" if stale else "",
-               esc(label), used, marker, figure, esc(_meter_detail(w, now))))
+            % (tone, esc(w["name"]), esc(label), used, marker, figure, esc(_meter_detail(w, now))))
 
 
 def _holds(windows: list[dict[str, Any]], now: datetime) -> str:

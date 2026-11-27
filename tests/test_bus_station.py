@@ -16562,6 +16562,30 @@ class PaceTest(Base):
     """loom#3630: each pass the station paces every windowed subscription and
     the lane status shows used, elapsed and verdict per subscription."""
 
+    def test_usage_upload_carries_one_summary_per_subscription(self):
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        now = runner.now
+        base = {"provider": "codex", "lanes": ["codex"], "source": "lane meter",
+                "resets_at": station.usage._iso(now + 1000),
+                "as_of": station.usage._iso(now), "used_pct": 0}
+        records = [
+            dict(base, window="5-hour", window_minutes=300),
+            dict(base, window="weekly", window_minutes=10080),
+        ]
+        with mock.patch.object(station.usage, "collect", return_value=records), \
+                mock.patch.object(runner, "_refresh_model_catalogue"), \
+                mock.patch.object(runner, "post_chain"), \
+                mock.patch.object(runner, "upload_usage_limits") as upload:
+            runner._tend_usage()
+        payload = upload.call_args.args[0]
+        summaries = [row["subscription_pace"] for row in payload if "subscription_pace" in row]
+        codex = [row for row in summaries if row["provider"] == "codex"]
+        self.assertEqual(len(codex), 1, payload)
+        self.assertEqual((codex[0]["window"], codex[0]["used_pct"]), ("weekly", 0))
+        (missing,) = [row for row in summaries if row["provider"] == "claude"]
+        self.assertIsNone(missing["used_pct"])
+        self.assertEqual(station.usage.read_snapshot(self.home), records)
+
     def test_a_pass_writes_the_pace_plan_and_the_status_shows_it(self):
         from bus import pace
         now = time.time()

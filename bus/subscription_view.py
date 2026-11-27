@@ -62,9 +62,9 @@ def _requested(plan, row, now):
     return want if type(want) is int and row["running"] < want <= row["allowed"] else None
 
 
-def read(home, now, env):
+def read(home, now, env, records=None):
     """One row per subscription, including providers without a current meter."""
-    records = _longest(usage.read_snapshot(home))
+    records = _longest(usage.read_snapshot(home) if records is None else records)
     groups = usage._provider_groups(labels.LANES)
     plan = pace.read(home)
     points = pace.slack(env)
@@ -82,6 +82,22 @@ def read(home, now, env):
         row["requested"] = _requested(plan, row, now)
         result.append(row)
     return result
+
+
+def for_upload(records, subscriptions, now):
+    """Add one summary per provider without rewriting the raw meter readings."""
+    pending = {row["provider"]: {key: value for key, value in row.items() if key != "requested"}
+               for row in subscriptions}
+    payload = []
+    for record in records:
+        summary = pending.pop(record.get("provider"), None)
+        payload.append({**record, "subscription_pace": summary} if summary is not None else record)
+    groups = usage._provider_groups(labels.LANES)
+    for provider, summary in pending.items():
+        row = usage._record(provider, groups[provider], "all", None, None, None,
+                            None, "subscription meter", now, "no reading")
+        payload.append({**row, "subscription_pace": summary})
+    return payload
 
 
 def _cells(row):
