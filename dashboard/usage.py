@@ -220,7 +220,9 @@ def _staleness(used: float | None, reset: datetime | None, observed: datetime | 
                now: datetime) -> str | None:
     """Why a reading cannot be taken as current, or None."""
     if observed is None:
-        return None
+        return "observation time unknown" if used is not None else None
+    if observed > now:
+        return "observation time is in the future"
     if used is not None and reset is not None and reset <= now:
         # The window rolled over after the reading: its figure is history.
         return "the window reset %s, after this reading" % time_until(reset, now)
@@ -252,7 +254,7 @@ def read_window(row: dict[str, Any], now: datetime) -> dict[str, Any]:
     """One reading, judged: its figures, reset, pace and freshness."""
     window = str(row.get("window") or "")
     collected = parse_time(row.get("as_of"))
-    observed = parse_time(row.get("observed_at")) or collected
+    observed = parse_time(row["observed_at"]) if "observed_at" in row else collected
     reset = parse_time(row.get("resets_at"))
     used = _number(row.get("used_pct"))
     note = str(row.get("note") or "").strip()

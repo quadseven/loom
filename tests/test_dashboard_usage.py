@@ -282,6 +282,18 @@ class UsageDashboardTests(unittest.TestCase):
         self.assertNotIn("near limit", codex)
         self.assertNotIn("is 97% used", body)
 
+    def test_a_meter_with_an_unknown_observation_time_hides_its_figure(self):
+        for observation in (None, "invalid", (NOW + timedelta(minutes=1)).isoformat()):
+            with self.subTest(observation=observation):
+                record = reading("codex", ["codex"], "weekly", 53,
+                                 (NOW + timedelta(days=1)).isoformat(), observed_at=observation)
+                store = Store()
+                store.upload([record], now=NOW)
+                page = usage.render(usage.build(store.snapshot()["readings"], NOW))
+                codex = provider_row(page, "codex")
+                self.assertIn('<p class="um-fig">No reading</p>', codex)
+                self.assertNotIn("53%", codex)
+
     def test_lanes_group_by_state_and_holds_read_in_the_dashboard_timezone(self):
         rows = [reading("spark", [lane], "thermal hold", source="state/usage/%s.limit" % lane,
                         note="no active hold") for lane in ("spark", "spark-2", "spark-3")]
