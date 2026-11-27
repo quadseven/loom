@@ -9165,7 +9165,7 @@ class Station:
         slots = set(runners.runner_slots())
         eligible = [lane for lane in free if lane not in slots and self._inbox_empty(lane)
                     and (not needs_public_repo(lane, "") or self._public(repo))]
-        credit = ("claude",) + factory.ANTHROPIC
+        credit = factory.CLAUDE + factory.ANTHROPIC
         return next((lane for lane in eligible if lane not in credit),
                     eligible[0] if eligible else None)
 
