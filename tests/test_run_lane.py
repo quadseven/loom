@@ -256,6 +256,17 @@ printf 'agent-tmpdir=%s tmpdir-exists=%s tmpdir-islink=%s stale=%s targetfile=%s
 [ -z "${FAKE_AGENT_ENV:-}" ] || printf '%s\\n' "${GH_TOKEN:-none}" "${LOOM_GITHUB_APP_ID:-none}" "${GIT_CONFIG_COUNT:-none}" "${GH_CONFIG_DIR:-none}" "$(cat "${GH_CONFIG_DIR:-/nonexistent}/hosts.yml" 2>/dev/null | tr '\\n' ' ')" >> "$FAKE_AGENT_ENV"
 [ -z "${FAKE_AGENT_SAYS:-}" ] || printf '%s\\n' "$FAKE_AGENT_SAYS"
 cat > /dev/null
+if [ "${FAKE_AGENT:-}" = decision ]; then
+  case "$*" in
+    *"## Agreed lane decision"*"Use stable ordering."*)
+      [ "$(cat fix.txt)" = partial ] || exit 3
+      echo fixed > fix.txt
+      exit 0 ;;
+  esac
+  echo partial > fix.txt
+  printf '%s\n' "$FAKE_DECISION" > "$TMPDIR/T042-fix-the-thing.operator.json"
+  exit 0
+fi
 if [ "${FAKE_AGENT:-commit}" = fail ]; then exit 3; fi
 if [ "${FAKE_AGENT:-commit}" = say ]; then
   if [ -n "${FAKE_LAST_MESSAGE:-}" ]; then
@@ -1665,6 +1676,14 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         prompt = "\n".join(self.calls())
         self.assertIn("real person's mail or street address", prompt)
 
+    def test_the_build_prompt_checks_the_ticket_premise_before_editing(self):
+        self.drop_brief()
+        self.run_lane()
+        prompt = "\n".join(self.calls())
+        self.assertIn("If you are choosing a ticket, read its body and explain each skip", prompt)
+        self.assertIn("Check the ticket's premise in the current code before building", prompt)
+        self.assertIn("cite the code you checked in the Intent summary", prompt)
+
     def test_files_the_brief_names_commit_and_push_normally(self):
         self.drop_brief(text=BRIEF.replace(
             "Make the thing work.",
@@ -1984,6 +2003,87 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         line = self.failure_line()
         self.assertIn("agent made no commit and wrote no reason", line)
         self.assertNotIn("internal", line)
+
+    def run_decision(self, packet, answer="1", lane="codex", **env):
+        prompt = Path(self._tmp.name) / "consult-prompt"
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/bash\nshift 2\nexec "$@"\n')
+        peer, event = ("claude", {"type": "result", "result": answer}) if lane == "codex" else (
+            "codex", {"type": "item.completed", "item": {"type": "agent_message", "text": answer}})
+        self.write_tool(self.bin / lane, FAKE_AGENT)
+        self.write_tool(self.bin / peer, f"""#!/bin/bash
+cat > '{prompt}'
+printf '%s\\n' '{json.dumps(event)}'
+""")
+        inbox = self.loom / "briefs" / lane
+        inbox.mkdir(parents=True, exist_ok=True)
+        (inbox / "T042-fix-the-thing.md").write_text(BRIEF.replace("Lane: codex", "Lane: " + lane))
+        result = self.run_lane(lane, FAKE_AGENT="decision", FAKE_DECISION=json.dumps(packet), **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return prompt
+
+    @staticmethod
+    def decision_packet():
+        return {"kind": "ambiguity", "question": "How should equal results be ordered?",
+                "context": "The brief leaves ties unspecified and consumers compare the result order.",
+                "options": ["Use stable ordering.", "Use lexical ordering."], "answer": 1}
+
+    def test_agreeing_models_continue_the_build_and_record_both_answers(self):
+        packet = self.decision_packet()
+        prompt = self.run_decision(packet).read_text()
+        self.assertIn(packet["question"], prompt)
+        self.assertIn(packet["context"], prompt)
+        self.assertNotIn('"answer"', prompt)
+        body = self.body.read_text()
+        log = (self.loom / "logs/codex/T042-fix-the-thing.log").read_text()
+        for output in (body, log):
+            self.assertIn("gpt-test-default: Use stable ordering.", output)
+            self.assertIn("claude-test-default: Use stable ordering.", output)
+
+    def test_claude_build_consults_codex_and_continues(self):
+        prompt = self.run_decision(self.decision_packet(), lane="claude")
+        self.assertTrue(prompt.is_file())
+        self.assertIn("gpt-test-default: Use stable ordering.", self.body.read_text())
+
+    def test_disagreement_parks_the_build_with_both_answers_in_the_comment(self):
+        packet = self.decision_packet()
+        packet["question"] += " The choice applies to every consumer of the ordered result."
+        packet["options"][0] += " Keep input order whenever the existing comparison returns a tie."
+        packet["options"][1] += " Compare each result by record name."
+        self.run_decision(packet, answer="2")
+        self.assertIn("[operator]", self.failure_line())
+        self.assertFalse(self.body.exists())
+        note, = self.tail_bodies()
+        self.assertIn("gpt-test-default: " + packet["options"][0], note)
+        self.assertIn("claude-test-default: " + packet["options"][1], note)
+        self.assertIn("Models disagreed.", note)
+
+    def test_operator_actions_park_without_a_consult(self):
+        for kind, question in (
+            ("credential", "Can the operator provision a service credential?"),
+            ("money", "Can the operator approve the subscription cost?"),
+            ("host", "Can the operator resize the build host?"),
+            ("policy", "Which retention policy will the operator approve?"),
+        ):
+            with self.subTest(kind=kind):
+                (self.loom / "logs/codex/T042-fix-the-thing.log").unlink(missing_ok=True)
+                prompt = self.run_decision({"kind": kind, "question": question})
+                self.assertFalse(prompt.exists())
+                self.assertIn("[operator] Ask: " + question, self.failure_line())
+                self.assertFalse(self.body.exists())
+
+    def test_unusable_second_answer_is_retried_instead_of_becoming_an_ask(self):
+        prompt = self.run_decision(self.decision_packet(), answer="I would choose option one.")
+        self.assertTrue(prompt.is_file())
+        self.assertIn("[transient] the second model returned an invalid decision answer", self.failure_line())
+        self.assertFalse(self.body.exists())
+
+    def test_decision_context_that_fails_the_leak_scan_never_reaches_the_second_model(self):
+        packet = self.decision_packet()
+        packet["context"] = "A private issue is referenced as %s#%d." % ("example-other", 19)
+        prompt = self.run_decision(packet)
+        self.assertFalse(prompt.exists())
+        self.assertIn("[transient] the leak scan refused the decision packet", self.failure_line())
+        self.assertNotIn(packet["context"], "\n".join(self.tail_bodies()))
 
     def test_a_summary_that_is_not_a_no_change_reason_is_still_a_failure(self):
         self.drop_brief()
@@ -7238,7 +7338,7 @@ exit %d
             r'cd "\$TREE" && unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN "\$\{!LOOM_GITHUB_APP_@\}" '
             r'"\$\{!GIT_CONFIG_@\}" &&\s*export GH_CONFIG_DIR="\$AGENT_GH_CONFIG" && '
             r'github_auth_agent_path &&\s*'
-            r'run_agent "\$RUN_BRIEF"',
+            r'run_agent_with_decision "\$RUN_BRIEF"',
         )
 
     def test_a_lane_whose_app_token_cannot_be_minted_posts_nothing_as_anyone(self):

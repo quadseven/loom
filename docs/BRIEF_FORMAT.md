@@ -114,8 +114,9 @@ factory marker comment or a claim line), oldest first, each clipped to 1500
 characters, every line prefixed `> `. `## Linked pull requests` lists the
 pull requests, in any repo, that reference the ticket on its timeline, merged
 or open, one `owner/name#N, merged YYYY-MM-DD: title` line each. The lane is
-told a note outranks the ticket where they disagree, and to change nothing
-when a note or a merged pull request shows the work is done.
+told a note outranks the ticket where they disagree. Before building, the
+lane checks the ticket's premise in the current code. If the issue is absent
+or already fixed, it writes a no-change Intent summary citing what it read.
 
 The agent edits files in the checked-out repository and leaves the result on
 the requested branch. The runner commits any remaining changes, pushes that
