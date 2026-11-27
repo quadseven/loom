@@ -28,8 +28,9 @@ holder's.
 
 A body Part of #N that names a different issue than the sub-issue parent is
 not changed: it is one health note, kept in the step's state file and said
-once. In shadow mode (bus/shadow.py) each removal is a ledger line (action
-UNLABEL) and is not sent. An issue another operator owns
+once. In shadow mode (bus/shadow.py), the station sends state removals for
+open issues carrying both loom:shipped and loom:failed. It records other
+removals as UNLABEL ledger lines. An issue another operator owns
 (tickets.owned_elsewhere) is left alone.
 
 plan() is pure: the station reads, plan() decides, the station writes.
