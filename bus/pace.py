@@ -54,10 +54,12 @@ def verdict(used_pct: float, elapsed: float, points: float) -> str:
 def elapsed_pct(resets_at: Optional[float], window_minutes: Any, now: float) -> Optional[float]:
     """The share of the window that ends at RESETS_AT already elapsed at NOW,
     in percent; None when the window length is unknown or NOW is outside it."""
-    if (resets_at is None or isinstance(window_minutes, bool)
-            or not isinstance(window_minutes, (int, float)) or window_minutes <= 0):
+    minutes = _number(window_minutes)
+    if resets_at is None or minutes is None or minutes <= 0:
         return None
-    length = float(window_minutes) * 60
+    length = minutes * 60
+    if not math.isfinite(length):
+        return None
     start = resets_at - length
     if not start <= now < resets_at:
         return None
