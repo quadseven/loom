@@ -1637,9 +1637,10 @@ the account, the brain included.
   or a brief for it in a lane inbox) is scanned every pass; any other repo
   at most every 10 minutes, so a ticket briefed in an idle repo can wait
   that long to be claimed.
-- Reconciliation reads a repo's pull requests only while it has a `loom:pr`
-  ticket, and then only the open ones and one page of the most recently
-  closed ones.
+- Reconciliation reads open pull requests to match them with tickets. When
+  there are tickets to reconcile, it pages through closed pull requests to
+  find merges that delivered waiting tickets and to recover older outcomes
+  for tickets whose open pull request disappeared.
 - Below 15% of any rate limit (from the `X-RateLimit-*` headers of the last
   response, kept across passes) a pass does claims and reports only; the
   rest (reconciliation, hand-back, lane status, asks, standups, goal

@@ -113,6 +113,25 @@ class RemoteLaneTests(unittest.TestCase):
         self.assertEqual(labels(gh)[-1], "loom:running")
         self.assertIsNone(lane.claim(gh, ["example/project"], now=1001))
 
+    def test_a_merged_refs_pull_from_another_branch_settles_the_queued_ticket(self):
+        gh = FakeGitHub()
+        gh.closed = [dict(self.merged("Refs #4"), base={"ref": "main"})]
+        stderr = io.StringIO()
+        with mock.patch("sys.stderr", stderr):
+            self.assertIsNone(lane.claim(gh, ["example/project"], now=1000))
+            self.assertIsNone(lane.claim(gh, ["example/project"], now=1001))
+        self.assertEqual(labels(gh), ["loom:ticket", "loom:merged"])
+        self.assertEqual(gh.comments[4], [])
+        self.assertEqual(stderr.getvalue().count("pull request #13 merged"), 1)
+
+    def test_a_side_branch_or_partial_merge_leaves_the_ticket_claimable(self):
+        for base, body in (("release", "Refs #4"), ("main", "Refs #4\n\n" + BODY)):
+            with self.subTest(base=base):
+                gh = FakeGitHub()
+                gh.closed = [dict(self.merged(body), base={"ref": base})]
+                self.assertEqual(lane.claim(gh, ["example/project"], now=1000)["number"], 4)
+                self.assertIn("loom:running", labels(gh))
+
     def test_a_queued_source_of_an_open_ticket_is_not_claimed(self):
         gh = FakeGitHub()
         gh.issues[4]["labels"].append({"name": "loom:rewritten"})
@@ -137,13 +156,14 @@ class RemoteLaneTests(unittest.TestCase):
         gh = FakeGitHub()
         lane.claim(gh, ["example/project"], now=1000)
         gh.pulls = [{"number": 9, "head": {"ref": "loom/4-add-a-feature"}}]
+        before_recovery = len(gh.calls)
         active = lane._recover_and_count(gh, ["example/project"], "muse",
                                           1000 + lane.PR_AGE + 1)
         self.assertEqual(active, 0)
         self.assertIn("loom:pr", labels(gh))
         self.assertNotIn("loom:queued", labels(gh))
         self.assertFalse(any(x["body"].startswith("[transient]") for x in gh.comments[4]))
-        pulls = [c for c in gh.calls if "/pulls?" in c[1]]
+        pulls = [c for c in gh.calls[before_recovery:] if "/pulls?" in c[1]]
         self.assertFalse(pulls)  # paginate is used, never a full pull listing
         # The lookup names the branch instead of listing every pull request.
         self.assertTrue(lane._pull_for(gh, "example/project", "loom/4-add-a-feature"))
@@ -192,9 +212,10 @@ class RemoteLaneTests(unittest.TestCase):
     def test_the_branch_match_stays_primary_and_reads_no_closed_pulls(self):
         gh = self.stranded([])
         gh.pulls = [{"number": 9, "head": {"ref": "loom/4-add-a-feature"}}]
+        before_recovery = len(gh.calls)
         lane._recover_and_count(gh, ["example/project"], "muse", 1001)
         self.assertIn("loom:pr", labels(gh))
-        self.assertFalse([c for c in gh.calls if "state=closed" in c[1]])
+        self.assertFalse([c for c in gh.calls[before_recovery:] if "state=closed" in c[1]])
 
     def test_a_heartbeat_keeps_a_claim_and_a_claim_with_no_pr_expires_after_pr_age(self):
         gh = FakeGitHub()

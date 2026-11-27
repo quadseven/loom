@@ -1524,11 +1524,15 @@ def unticked_criteria(ticket_body: str, pull_bodies: Sequence[str]) -> List[str]
     return left
 
 
-def unbuilt_criteria(ticket_body: str, pull_bodies: Sequence[str]) -> List[str]:
+def unbuilt_criteria(ticket_body: str, pull_bodies: Sequence[str], *,
+                     allow_unreported: bool = False) -> List[str]:
     """The unticked boxes that send a ticket back for more work: its code
     boxes. A box marked "not built: <reason>" answers a lane's gate but is
     still unbuilt, so a partial merge sends its ticket back (loom#2026). Live
-    and operator boxes are the verify path's, so alone they send nothing back."""
+    and operator boxes are the verify path's, so alone they send nothing back.
+    A pre-claim check can let verification judge a merge with no report."""
+    if allow_unreported and not any(acceptance_criteria(body) for body in pull_bodies):
+        return []
     return [text for text in unticked_criteria(ticket_body, pull_bodies)
             if criteria_gate.kind(NOT_BUILT_RE.sub("", text)) == criteria_gate.CODE]
 
