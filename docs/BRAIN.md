@@ -132,7 +132,10 @@ when `needs:human` or a `needs:<login>` label says a person holds the issue;
 label of a ticket at `loom:answered`, whose lane answered with no change. A
 body `Part of #N` naming another issue than the sub-issue parent is changed
 by nobody: it is one health note in the step's state file, logged once. In
-shadow mode each removal is an `unlabel` line of the ledger and is not sent.
+shadow mode the pass sends state removals for open issues carrying both
+`loom:shipped` and `loom:failed`. Those issues count toward the 20-issue write
+limit. The pass records other removals as `unlabel` ledger lines without
+spending that limit.
 
 ### Shipping Loom itself
 

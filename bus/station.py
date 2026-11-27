@@ -14528,8 +14528,9 @@ class Station:
         contradict each other or describe a step that is over, on at most
         label_pass.PER_RUN issues a run, at most once every label_pass.EVERY
         seconds. A body Part of #N that disagrees with the sub-issue parent is
-        one health note in the state file, said once. In shadow each removal
-        is a ledger line and is not sent."""
+        one health note in the state file, said once. In shadow the pass
+        still reconciles the states of an open shipped-and-failed issue.
+        Other changes are ledger lines."""
         path = os.path.join(self.state, label_pass.STATE_FILE)
         state = _read_json(path, {}, strict=False)
         state = state if isinstance(state, dict) else {}
@@ -14592,42 +14593,50 @@ class Station:
                 notes.pop(key, None)
             if not (found.remove or found.add) or changed >= left:
                 continue
-            self._add_labels(repo, number, found.add)
-            for removal in found.remove:
-                self._unlabel(repo, number, removal)
-            # A shadow repo's removals are ledger lines that are never sent,
-            # so the same issues come first on every pass: they must not use
-            # up the budget of the repos after it.
-            if not shadow.active(repo):
+            if self._apply_label_plan(repo, issue, found):
                 changed += 1
         return changed
 
-    def _add_labels(self, repo: str, number: int, names: Sequence[str]) -> None:
+    def _apply_label_plan(self, repo: str, issue: Dict[str, Any],
+                          found: label_pass.Plan) -> bool:
+        """Apply the plan and report whether a write used the pass budget."""
+        number = int(issue["number"])
+        reconcile_states = (issue.get("state", "open") == "open"
+                            and {"loom:shipped", "loom:failed"}.issubset(_label_names(issue)))
+        changed = self._add_labels(repo, number, found.add)
+        for removal in found.remove:
+            reconcile = reconcile_states and removal.label in label_pass.STATE_LABELS
+            if self._unlabel(repo, number, removal, reconcile_state=reconcile):
+                changed = True
+        return changed
+
+    def _add_labels(self, repo: str, number: int, names: Sequence[str]) -> bool:
         """Add labels, or in shadow record that they would be added. Added
         before any removal, so a failed write never leaves a ticket with no
-        ask label."""
+        ask label. Return whether an addition was sent."""
         if not names:
-            return
+            return False
         if shadow.active(repo):
             shadow.record_held(shadow.LABEL, repo, number, "issue",
                                reason="add %s" % ", ".join(names), label=names[0],
                                source="station clean_labels")
-            return
+            return False
         self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": list(names)})
         _say("%s#%d: add %s" % (repo, number, ", ".join(names)))
+        return True
 
     def _unlabel(self, repo: str, number: int, removal: Any,
-                 source: str = "station clean_labels") -> None:
-        """Remove one label (a removal with .label and .why), or in shadow
-        record that it would be removed."""
+                 source: str = "station clean_labels", *, reconcile_state: bool = False) -> bool:
+        """Send a label removal, or record it in shadow and return False."""
         why = "remove %s: %s" % (removal.label, removal.why)
-        if shadow.active(repo):
+        if not reconcile_state and shadow.active(repo):
             shadow.record_held(shadow.UNLABEL, repo, number, "issue", reason=why,
                                label=removal.label, source=source)
-            return
+            return False
         self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s"
                      % (repo, number, quote(removal.label, safe="")), ok=(404,))
         _say("%s#%d: %s" % (repo, number, why))
+        return True
 
     def referee_claims(self) -> None:
         """One claim per ticket, idle engine claims expire (bus/claim_referee.py,
