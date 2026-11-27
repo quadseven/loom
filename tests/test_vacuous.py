@@ -10,6 +10,19 @@ from bus import vacuous
 
 
 class VacuousTests(unittest.TestCase):
+    def test_the_same_fixture_finding_on_two_ladder_rungs_is_held(self):
+        finding = "changes a fixture used by test test_expected"
+
+        self.assertEqual(vacuous.repeated_fixture_findings(
+            [finding], [(1, finding)], 2), [finding])
+
+    def test_a_different_fixture_finding_on_the_next_rung_does_not_hold(self):
+        earlier = [(1, "changes a fixture used by test test_previous")]
+        current = ["changes a fixture used by test test_current"]
+
+        # An empty hold result leaves the factory's normal climb path open.
+        self.assertEqual(vacuous.repeated_fixture_findings(current, earlier, 2), [])
+
     def test_names_a_builtin_mapping_with_missing_key_overrides(self):
         source = "class _MonitorMap(dict):\n def __getitem__(self, key): return 1\n"
         self.assertEqual(vacuous.container_lookup_overrides(source), [
