@@ -6722,7 +6722,7 @@ class Station:
         return None
 
     def _reconcile_pr_ticket(self, repo: str, pr: dict, tickets_by_number: dict,
-                             landed: Sequence[dict] = ()) -> None:
+                             landed: Sequence[dict] = (), *, drop_lane: bool = False) -> None:
         number = self._pr_ticket_number(repo, pr)
         ticket = tickets_by_number.get(number) if number is not None else None
         if ticket is None:
@@ -6759,7 +6759,9 @@ class Station:
         left: List[str] = []
         merged = target == "loom:merged"
         if merged:
-            left = self._unbuilt_criteria(ticket, [pr, *landed])
+            left = self._unbuilt_criteria(
+                ticket, [pr, *landed],
+                allow_unreported=bool({"loom:queued", "loom:briefed"}.intersection(labels)))
             if left:
                 events = self._paginate("/repos/%s/issues/%d/events" % (repo, number))
                 if (tickets.merged_before_requeue(pr.get("merged_at"), events)
@@ -6773,7 +6775,8 @@ class Station:
         states = {"loom:" + state for state in state_names}
         kept = self._drop_claim(
             name for name in labels
-            if name not in states and not (target == "loom:queued" and name.startswith("lane:")))
+            if name not in states
+            and not ((drop_lane or target == "loom:queued") and name.startswith("lane:")))
         # A merged pull request lands the lane's run, so a runaway hold the run
         # caused is cleared even when the ticket is requeued to build criteria
         # the pull request left unbuilt; otherwise a runaway ticket can never
@@ -6800,11 +6803,13 @@ class Station:
                  % (repo, number, int(pr["number"]), len(every)))
 
     @staticmethod
-    def _unbuilt_criteria(ticket: dict, merged: Sequence[dict]) -> List[str]:
+    def _unbuilt_criteria(ticket: dict, merged: Sequence[dict], *,
+                          allow_unreported: bool = False) -> List[str]:
         """The ticket's code criteria that no merged pull request for it ticks
         built: a box marked "not built: <reason>" is still unbuilt (loom#2026)."""
         return factory.unbuilt_criteria(str(ticket.get("body") or ""),
-                                        [str(pr.get("body") or "") for pr in merged])
+                                        [str(pr.get("body") or "") for pr in merged],
+                                        allow_unreported=allow_unreported)
 
     def _reconcile_adoptions(self, repo: str, open_tickets: List[Dict[str, Any]]) -> None:
         """Move each open adoption ticket to loom:merged once the pull
@@ -6870,8 +6875,7 @@ class Station:
             and not TREE_DONE_STATES.intersection(_label_names(i))}
         self._reconcile_adoptions(repo, open_tickets)
         # Only a closed pull request changes a ticket. Those PRs are the most
-        # recently updated closed ones, so one page of them is read, never the
-        # repo's whole PR history. A merged one delivers the ticket even while
+        # recently updated closed ones first. A merged one delivers the ticket even while
         # a second PR for it is still open (a duplicate lane run would
         # otherwise keep taking fix rounds on work already on main). A merge
         # before a regression re-queue cannot deliver its newer attempt. A
@@ -6939,8 +6943,8 @@ class Station:
         waiting = {n: t for n, t in tickets_by_number.items()
                    if not any(_linked_pr(t, repo, p) for p in open_prs)}
         # Fetch ALL closed PRs (paginated). The reconcile window uses only the
-        # first 100 (most recently updated); _clear_pull_gone uses the full
-        # list to find merged PRs beyond the 100-item window.
+        # first 100 (most recently updated) for linked tickets; the full list
+        # also finds older merges for unlinked tickets and vanished pulls.
         all_closed = self._paginate("/repos/%s/pulls?state=closed&sort=updated"
                                     "&direction=desc&per_page=100" % repo)
         closed = all_closed[:100] if isinstance(all_closed, list) else []
@@ -6954,6 +6958,11 @@ class Station:
                 self._reconcile_pr_ticket(repo, pr, pool, landed)
                 if merged:
                     self._deliver_unlinked(repo, pr, unlinked)
+        for pr in all_closed[100:]:
+            if not unlinked:
+                break
+            if isinstance(pr, dict) and self._terminal_label(pr) == "loom:merged":
+                self._deliver_unlinked(repo, pr, unlinked)
         for number, ticket in tickets_by_number.items():
             self._clear_pull_gone(repo, number, ticket, open_prs, all_closed)
 
@@ -7094,24 +7103,32 @@ class Station:
         outside loom/. A branch outside loom/ also takes the lane label off,
         and its note names the merge commit (loom#2938)."""
         number = self._pr_ticket_number(repo, pr)
-        ticket = unlinked.get(number) if number is not None else None
-        was = self._deliverable(repo, pr, ticket) if ticket is not None else None
+        if number not in unlinked:
+            return
+        base = (pr.get("base") or {}).get("ref")
+        if base and base != self._default_branch(repo):
+            return
+        ticket = self._issue(repo, number)
+        if ticket.get("state") != "open" or tickets.ticket_state(ticket) in tickets.MERGED_STATES:
+            del unlinked[number]
+            return
+        was = self._deliverable(repo, pr, ticket)
         if was is None:
             return
-        self._reconcile_pr_ticket(repo, pr, {number: ticket})
+        branch = str((pr.get("head") or {}).get("ref") or "")
+        outside_lane = not branch.startswith("loom/")
+        self._reconcile_pr_ticket(repo, pr, {number: ticket}, drop_lane=outside_lane)
         if "loom:merged" not in _label_names(ticket):
             return
         del unlinked[number]
         note = ("Pull request #%d merged while this ticket was at %s, so it moved to "
                 "loom:merged." % (int(pr["number"]), was))
-        branch = str((pr.get("head") or {}).get("ref") or "")
-        if not branch.startswith("loom/"):
-            self._drop_lane_label(repo, ticket)
+        if outside_lane:
             note += (" It merged from branch %s, outside loom/ (merge commit %s), so the "
                      "ticket no longer holds a lane." % (
                          branch, str(pr.get("merge_commit_sha") or "")[:12] or "unknown"))
-            _say("%s#%d merged from a non-lane branch: pull request #%d"
-                 % (repo, number, int(pr["number"])))
+        _say("%s#%d: merged pull request #%d moved %s ticket to loom:merged"
+             % (repo, number, int(pr["number"]), was))
         self._comment(repo, number, note, notify.MERGED)
 
     def _deliverable(self, repo: str, pr: Dict[str, Any],
@@ -7127,7 +7144,9 @@ class Station:
                 or not _linked_pr(ticket, repo, pr)):
             return None
         labels = _label_names(ticket)
-        was = next((s for s in UNLINKED_STATES if s in labels), "loom:queued")
+        was = next((s for s in UNLINKED_STATES if s in labels), None)
+        if was is None:
+            return None
         if str(head.get("ref") or "").startswith("loom/") and was not in (
                 "loom:queued", "loom:briefed"):
             return None
@@ -7137,17 +7156,6 @@ class Station:
         if tickets.merged_before_requeue(pr.get("merged_at"), events):
             return None
         return was
-
-    def _drop_lane_label(self, repo: str, ticket: Dict[str, Any]) -> None:
-        """Take the lane: labels off a ticket a pull request outside loom/
-        delivered: no lane run holds it, and the label read as lane load."""
-        names = _label_names(ticket)
-        kept = [n for n in names if not n.startswith("lane:")]
-        if kept == names:
-            return
-        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, int(ticket["number"])),
-                     {"labels": kept})
-        ticket["labels"] = [{"name": n} for n in kept]
 
     def _contributor_ticket(self, repo: str, pr: Dict[str, Any],
                             author: str) -> Optional[Dict[str, Any]]:
