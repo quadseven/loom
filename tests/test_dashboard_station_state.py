@@ -98,17 +98,21 @@ class TwoReplicasTest(SharedBase):
                    subscription_pace=subscription)
         shorter = dict(row, window="5-hour", used_pct=55)
         del shorter["subscription_pace"]
-        self.assertEqual(call(self.first, "POST", "/api/usage", [row, shorter])[0], 201)
+        self.assertEqual(call(self.first, "POST", "/api/usage", [shorter, row])[0], 201)
         restarted = State(station_state.Store(self.db))
         code, snapshot = call(restarted, "GET", "/api/usage")
         self.assertEqual(code, 200)
-        self.assertEqual(snapshot["readings"][0]["subscription_pace"], subscription)
+        self.assertNotIn("subscription_pace", snapshot["readings"][0])
+        self.assertEqual(snapshot["readings"][1]["subscription_pace"], subscription)
 
         with patch.dict(os.environ, {"LOOM_DASHBOARD_TZ": "UTC"}):
             code, page = call(restarted, "GET", "/usage")
         self.assertEqual(code, 200)
-        start = page.index('aria-labelledby="usage-subscriptions"')
-        summary = page[start:page.index("</section>", start)]
+        start = page.find('aria-labelledby="usage-subscriptions"')
+        self.assertNotEqual(start, -1, "subscription summary section is missing")
+        end = page.find("</section>", start)
+        self.assertNotEqual(end, -1, "subscription summary section is not closed")
+        summary = page[start:end]
         self.assertEqual(summary.count("example-subscription"), 1)
         self.assertIn("Weekly", summary)
         self.assertIn("0% used", summary)
