@@ -442,11 +442,12 @@ def _goal_child_row(goal, info, own, now):
 
 def _goal_epic_row(epic):
     esc = html.escape
+    count = ("open tickets %d/%d" % (epic.get("open_tickets", 0), goals_view.EPIC_TICKET_CAP)
+             if epic.get("open", True) else "tickets %d" % epic.get("tickets", 0))
     return ('<li><a href="/tickets?epic=%s"><span class="goal-child-title">%s</span>'
-            '<span class="machine-fact">%s / tickets %d/%d / %d in flight</span></a></li>') % (
+            '<span class="machine-fact">%s / %s / %d in flight</span></a></li>') % (
                 quote(epic["ref"], safe=""), esc(goals_view.short(strip_kind(epic.get("title")) or _short_ref(epic["ref"]), 90)),
-                esc(_short_ref(epic["ref"])), epic.get("tickets", 0), goals_view.EPIC_TICKET_CAP,
-                epic.get("in_flight", 0))
+                esc(_short_ref(epic["ref"])), count, epic.get("in_flight", 0))
 
 
 def _goal_epics_html(info):
@@ -473,7 +474,7 @@ def _goal_unproven_html(info):
     held, limit = info.get("unproven"), info.get("unproven_limit")
     if not (isinstance(held, int) and isinstance(limit, int)):
         return ""
-    note = "unproven work %d/%d (merged or shipped with no standing proof)" % (held, limit)
+    note = "unproven work %d/%d (open shipped tickets with no standing proof)" % (held, limit)
     if held > limit:
         note += " - over limit: no new build tickets until the goal finishes its proof"
     apart = info.get("live_event_held")
