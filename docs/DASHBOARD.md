@@ -111,9 +111,12 @@ no ticket reads "idle, able to take work" or "idle, held" with its reason, from
 the same lane status comment and usage heartbeats as the Lanes page. The strip
 and the Moving now rows are one read of that state, served at
 `GET /api/floor/live` as `{lanes, moving}` HTML fragments that the Floor's
-script swaps in every 5 seconds while the tab is visible. A change shows as
-soon as the background refresh (`LOOM_DASHBOARD_REFRESH_SECONDS`, default 60)
-or a usage heartbeat has read it.
+script swaps in every 5 seconds while the tab is visible. The next poll
+shows changes after the background refresh publishes a snapshot or the
+dashboard receives a usage heartbeat. `LOOM_DASHBOARD_REFRESH_SECONDS` sets
+the wait between refresh passes (default 60 seconds). Each dashboard process
+keeps its own GitHub ticket snapshot. Use one dashboard replica to serve a
+single Floor snapshot through the load balancer.
 
 `/tickets` lists the tickets in flight in one table per goal home; `?done=1`
 lists merged, shipped, verified and closed ones, and `state`, `goal` and
@@ -353,6 +356,13 @@ Each refresh keeps only the fields the pages read from each pull request and
 comment it lists (`PULL_REQUEST_FIELDS` and `COMMENT_FIELDS` in
 `dashboard/github.py`), not GitHub's whole answers with their embedded
 repositories and users, and the Ticket page keeps at most 64 tickets' details.
+
+Tickets are read in full at startup and once an hour per repository. Between
+full reads the dashboard asks GitHub for issues updated since its cursor,
+including closed issues and issues that lost the `loom:ticket` label, and
+merges them by number. An unchanged cursor allows a conditional GitHub read.
+A failed read keeps the previous records and cursor for retry. The hourly
+read reconciles issues that were deleted or transferred out of the repository.
 
 Pull requests are read in full once an hour (`PR_FULL_READ_SECONDS`). Between
 those reads a refresh asks only for the pull requests updated since the newest
