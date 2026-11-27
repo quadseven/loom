@@ -3174,6 +3174,7 @@ CHECK_SLOT_WAIT="${LOOM_CHECK_SLOT_WAIT:-5400}"
 CHECK_SLOT_POLL="${LOOM_CHECK_SLOT_POLL:-5}"
 CHECK_SLOT_DIR="$LOOM_HOME/run/check-slots"
 CHECK_SLOT_HELD=""
+CHECK_SLOT_SYSTEM="$(/usr/bin/uname -s 2>/dev/null)" || CHECK_SLOT_SYSTEM=""
 [[ "$CHECK_SLOTS" =~ ^[1-9][0-9]*$ ]] || CHECK_SLOTS=3
 [[ "$CHECK_SLOT_WAIT" =~ ^[0-9]+$ ]] || CHECK_SLOT_WAIT=5400
 [[ "$CHECK_SLOT_POLL" =~ ^[0-9]+(\.[0-9]+)?$ ]] || CHECK_SLOT_POLL=5
@@ -3195,9 +3196,14 @@ except BlockingIOError:
   mv "$slot" "$slot.stale.$$" 2>/dev/null
 ) 9>>"$CHECK_SLOT_DIR.guard"
 
-# Some versions of uutils mkdir report success after losing a creation race.
+# Darwin's system mkdir avoids starting Python for each acquisition. On other
+# systems use the syscall directly: uutils mkdir can falsely report success.
 create_check_slot() {
-  python3 -IB -c 'import os, sys; os.mkdir(sys.argv[1])' "$1" 2>/dev/null
+  if [ "$CHECK_SLOT_SYSTEM" = Darwin ]; then
+    /bin/mkdir "$1" 2>/dev/null
+  else
+    python3 -IB -c 'import os, sys; os.mkdir(sys.argv[1])' "$1" 2>/dev/null
+  fi
 }
 
 # Try each slot once; sets CHECK_SLOT_HELD and returns 0 on a take.
