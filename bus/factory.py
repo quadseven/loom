@@ -385,6 +385,11 @@ ANTHROPIC = ("anthropic",) + tuple("anthropic-%d" % n for n in range(2, 9))
 # lanes only, beat available and sat idle while medium and hard tickets
 # waited "no free lane in tier" (tests/test_bus_codex_slots.py).
 CODEX = ("codex",) + tuple("codex-%d" % n for n in range(2, 17))
+# The claude lane and claude-2, a second subscription on its own sign-in
+# (labels.SLOTS). LANE_ORDER names both, so a queued ticket reaches either; the
+# LADDER rungs still name claude alone, so a climbing ticket keeps the rung
+# rules the factory tests pin (tests/test_bus_claude_slots.py).
+CLAUDE = ("claude", "claude-2")
 # The slots that draw on one API credit: an empty credit holds all of them.
 # run_lane.sh reads this set (`python3 -m bus.factory credit-slots`).
 SHARED_CREDIT = ANTHROPIC
@@ -432,7 +437,7 @@ OPENCODE_GO = ("opencode-go", "opencode-go-1", "opencode-go-2", "opencode-go-3",
 LANE_ORDER: Tuple[str, ...] = (
     SPARKS
     + FREE_POOL + ("openrouter", "tinker", "workersai", "zen", "zai", "copilot")
-    + OPENCODE_GO + CODEX + ("claude", "agy", "muse")
+    + OPENCODE_GO + CODEX + CLAUDE + ("agy", "muse")
     + ANTHROPIC)
 # What a lane costs, for the dashboard's Tiers and allowances page (loom#968):
 # own-hardware (the Sparks), free (a free provider's allowance), subscription
