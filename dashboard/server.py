@@ -1587,7 +1587,8 @@ def _dispatch_basic(handler, state, path):
 # requests and two weeks of comments made /api/tickets 164 MB (2026-10-15).
 RAW_SOURCES = ("pull_requests", "issue_comments", "review_comments", "footer_models", "footer_runs",
                "state_entered")
-INTERNAL_SNAPSHOT_KEYS = ("_version", "models_resolved", "all_tickets", "newest_lane_models", "fix_round_refs")
+INTERNAL_SNAPSHOT_KEYS = ("_version", "models_resolved", "all_tickets", "newest_lane_models",
+                          "fix_round_refs", "scoreboard")
 
 
 def _api_tickets(payload):
@@ -1954,7 +1955,10 @@ def _lane_cards_only(payload, tickets, state=None):
 def _lane_view_data(payload, tickets, state=None):
     prs = payload.get("pull_requests", [])
     lanes = _lane_cards_only(payload, tickets, state=state)
-    return {"lanes": lanes, "scoreboard": views.build_scoreboard(_scoreboard_rows(prs, tickets)),
+    scoreboard = payload.get("scoreboard")
+    if scoreboard is None:
+        scoreboard = views.build_scoreboard(_scoreboard_rows(prs, tickets))
+    return {"lanes": lanes, "scoreboard": scoreboard,
             "anthropic_share": _anthropic_share(payload),
             "scorecard": _scorecard_rows(payload.get("lanes", []))}
 
