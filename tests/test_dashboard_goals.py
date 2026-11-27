@@ -166,7 +166,8 @@ class ApiTickets(unittest.TestCase):
 
 class UnprovenWork(unittest.TestCase):
     def rows(self, *states):
-        return [{"repo": REPO, "number": 7 + n, "goal": REPO + "#30", "state": state}
+        return [{"repo": REPO, "number": 7 + n, "goal": REPO + "#30", "state": state,
+                 "open": True, "labels": ["loom:ticket", "loom:" + state]}
                 for n, state in enumerate(states)]
 
     def test_only_shipped_tickets_count_as_unproven(self):
@@ -176,10 +177,32 @@ class UnprovenWork(unittest.TestCase):
         self.assertEqual(card["unproven"], 1)
         self.assertEqual(card["unproven_limit"], 30)
 
-    def test_a_ticket_held_for_a_live_event_is_counted_apart(self):
+    def test_closed_and_non_ticket_rows_release_proof_capacity_but_keep_history(self):
         rows = self.rows("shipped", "shipped", "shipped")
-        rows[1]["labels"] = ["loom:shipped", "wait:live-event"]
-        rows[2]["labels"] = ["loom:shipped", "wait:live-event"]
+        rows[1]["open"] = False
+        rows[2]["labels"] = ["loom:shipped"]
+        proofs = [comment(8, "<!-- loom:proof v1 -->\nProof")]
+        card = goals.goal_context(rows, proofs, {}, [], None, NOW)[REPO + "#30"]
+        self.assertEqual(card["unproven"], 1)
+        self.assertEqual(card["tickets"], 3)
+        self.assertEqual(card["metric"], "1")
+
+    def test_awaiting_live_evidence_consumes_capacity_above_the_exclusion(self):
+        rows = self.rows("shipped", "shipped", "shipped", "shipped")
+        for row in rows[1:]:
+            row["labels"].append("loom:awaiting-evidence")
+        rows[1]["state"] = "awaiting-evidence"
+        with unittest.mock.patch.dict(os.environ, {"LOOM_UNVERIFIED_LIMIT": "1"}):
+            card = goals.goal_context(rows[:3], [], {}, [], None, NOW)[REPO + "#30"]
+            self.assertEqual(card["unproven"], 1)
+            card = goals.goal_context(rows, [], {}, [], None, NOW)[REPO + "#30"]
+            self.assertEqual(card["unproven"], 2)
+
+    def test_a_ticket_held_for_a_live_event_is_counted_apart(self):
+        rows = self.rows("shipped", "shipped", "shipped", "shipped")
+        for row in rows[1:]:
+            row["labels"].append("wait:live-event")
+        rows[3]["open"] = False
         card = goals.goal_context(rows, [], {}, [], None, NOW)[REPO + "#30"]
         self.assertEqual(card["unproven"], 1)
         self.assertEqual(card["live_event_held"], 2)
@@ -641,6 +664,8 @@ class EpicsOnGoals(unittest.TestCase):
             ticket(8, "queued", body="## Why\nx\n\nPart of #40\n"),        # names epic 40
             ticket(9, "pr", body="## Why\nx\n\nPart of #41\n"),            # under closed epic 41
             ticket(10, "queued", body="## Why\nx\n\nPart of #30\n"),       # straight under the goal
+            dict(ticket(11, "verified", body="## Why\nx\n\nPart of #40\n"), state="closed"),
+            dict(ticket(12, "verified", body="## Why\nx\n\nPart of #41\n"), state="closed"),
         ]
         issues = {
             "/repos/%s/issues/30" % REPO: {"number": 30, "title": "Main goal", "body": "## Why\nx",
@@ -678,12 +703,13 @@ class EpicsOnGoals(unittest.TestCase):
         # The row sits under "open epics", so the title drops its "Epic:".
         self.assertIn('<span class="goal-child-title">the first chunk</span>', epics)
         self.assertNotIn("Epic:", epics)
-        self.assertIn("sample" "#40 / tickets 2/15 / 2 in flight", epics)
+        self.assertIn("sample" "#40 / open tickets 2/15 / 2 in flight", epics)
         self.assertIn('href="/tickets?epic=%s"' % server.quote(REPO + "#40", safe=""), epics)
         closed = epics[epics.index("goal-epics-closed"):]
         self.assertIn("1 closed epic", closed)
         self.assertIn('<span class="goal-child-title">an older chunk</span>', closed)
-        self.assertIn("4 tickets on this goal", card)
+        self.assertIn("sample" "#41 / tickets 2 / 1 in flight", closed)
+        self.assertIn("6 tickets on this goal", card)
 
     def test_the_tickets_page_filters_by_epic_and_the_header_names_epic_and_goal(self):
         from dashboard import ticket, tickets_table

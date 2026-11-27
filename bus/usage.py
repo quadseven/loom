@@ -391,7 +391,9 @@ def _meter_records(provider: str, home: str, slots: List[str], now: float) -> Li
                          _utc_epoch(window.get("resets_at"), now, relative=False),
                          source, now, _meter_note(window))
         record["window_minutes"] = window.get("window_minutes")
-        record["observed_at"] = _utc_epoch(window.get("at"), now, relative=False) or observed
+        # Legacy meters omitted the window timestamp and used the file's time.
+        # An explicit null or invalid timestamp means the observation time is unknown.
+        record["observed_at"] = _utc_epoch(window["at"], now, relative=False) if "at" in window else observed
         records.append(record)
     if records:
         return records
@@ -616,6 +618,11 @@ def _parse(value: Any) -> Optional[float]:
     return moment.timestamp() if moment.tzinfo else None
 
 
+def observation_time(row: Dict[str, Any]) -> Optional[float]:
+    """Use the collection time only for legacy rows with no observation field."""
+    return _parse(row.get("observed_at", row.get("as_of")))
+
+
 def stale_reason(row: Dict[str, Any], now: float) -> Optional[str]:
     """Why a reading's figure cannot be taken as current, or None."""
     if row.get("used_pct") is None:
@@ -623,7 +630,9 @@ def stale_reason(row: Dict[str, Any], now: float) -> Optional[str]:
     reset = _parse(row.get("resets_at"))
     if reset is not None and reset <= now and row.get("window") not in ("credit",):
         return "its window reset after this reading"
-    observed = _parse(row.get("observed_at")) or _parse(row.get("as_of"))
+    observed = observation_time(row)
+    if observed is None and "observed_at" in row:
+        return "observation time is unknown"
     if observed is not None and now - observed > STALE_AFTER:
         return "read %dh ago" % ((now - observed) // 3600)
     return None
