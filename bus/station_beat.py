@@ -19,9 +19,8 @@ GitHub credentials it already has, in the comments of the lane status issue
 
 Freshness is read from GitHub's own updated_at, so no two clocks are compared.
 A station's id is published only as a short hash (public_tag): the status repo
-may be public. The guard fails open: a read that fails lets the pass run, since
-a pass that cannot reach GitHub can do nothing anyway. LOOM_STATION_GUARD=0
-turns it off.
+may be public. Ordinary read failures let the pass run. GitHub outages pause
+the pass. LOOM_STATION_GUARD=0 turns the guard off.
 """
 from __future__ import annotations
 
@@ -33,7 +32,7 @@ import time
 from typing import Any, Callable, List, NamedTuple, Optional, Tuple
 
 from . import notify
-from .github import GitHubError
+from .github import GitHubError, GitHubOutage
 
 BEAT_MARKER = "<!-- loom:station-beat v1 -->"
 LANES_LABEL = "loom:lanes"
@@ -133,6 +132,8 @@ class Guard:
         """Why this station must stand by, or None to run the pass."""
         try:
             comments = self._comments()
+        except GitHubOutage:
+            raise
         except (GitHubError, OSError) as err:
             self.say("station guard: could not read %s (%s); running the pass" % (self.repo, err))
             return None
@@ -170,6 +171,8 @@ class Guard:
                 made = notify.post(self.gh, self.repo, self.number, body, notify.RECORD).data
                 if isinstance(made, dict) and isinstance(made.get("id"), int):
                     self.beat_id = int(made["id"])
+        except GitHubOutage:
+            raise
         except (GitHubError, OSError) as err:
             self.say("station guard: could not write the beat (%s)" % err)
 

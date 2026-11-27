@@ -8,6 +8,7 @@ from typing import Collection, Dict, Iterable, List
 from urllib.parse import quote
 
 from .github import GitHub
+from .readiness import DONE_MARKER, READY_MARKER
 from .stale_claims import OVERFLOW_CLAIM
 from .tickets import VERIFY_HANDOFF_LABEL
 
@@ -86,6 +87,8 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:goal": {"color": "5319e7", "description": "The goal's home issue"},
     "loom:backlog": {"color": "5319e7", "description": "The goal home that holds the repo's whole backlog"},
     "loom:ticket": {"color": "0e8a16", "description": "A ticket issue"},
+    READY_MARKER: {"color": "0e8a16", "description": "Candidate for a worker to check in the code"},
+    DONE_MARKER: {"color": "ededed", "description": "Readiness found merged work for this ticket"},
     "loom:queued": {"color": "c5def5", "description": "Written by the brain, no lane chosen yet"},
     "loom:briefed": {"color": "1d76db", "description": "Assigned to a lane, waiting for the station"},
     "loom:running": {"color": "fbca04", "description": "Handed to the lane's runner"},

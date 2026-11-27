@@ -88,8 +88,10 @@ CI or a throwaway environment (`go test ./internal/ledger/...`), or a test
 that fails without the change. Proof is that test, run at build time, not an
 observation of the live system after the fact (owner ruling of 2026-11-19).
 `bus.brain brief` and the rewrite refuse a body whose boxes name none, so it
-goes back to its writer before it is filed; an answer ticket is exempt, and
-tickets already on the board are not read by this rule.
+goes back to its writer before it is filed. Answer tickets and tickets
+already on the board are exempt. A ticket eligible for the buildable
+deliverable below can use its required regression test when `## What`
+declares a `Proof:` request.
 
 Both write the marker `<!-- loom:test-named -->` into the body of the ticket
 they file. A ticket that reaches the board another way (a person puts the
@@ -106,21 +108,26 @@ carries the marker too. The marker is words in the body and is trusted only
 as far as the body is: the station's trust rules (docs/BRAIN.md, Trust)
 check the body's author and last editor before any lane sees the ticket.
 
-A `Live:` box is written only when it names a read-only check Loom can run by
-itself: an `https://` URL, a `gh api <path>` read, a read-only `kubectl get
+A `Live:` box can name a read-only check Loom can run by itself. Examples
+include an `https://` URL, a `gh api <path>` read, a read-only `kubectl get
 ...` or `kubectl rollout status ...`, a `log:<source>` or `sql:` step for the
 repo's adapter, a `SELECT`, or a quoted log string with a time window
-("within 24 hours"). A quoted string alone is not a check: nothing says when
-to read the log for it, and such a box could only wait. When no such check
-exists, the ticket carries no Live box. The one templated Live box of a
-health or friction intake ticket stays as written, because the station's own
-absence tracking proves it.
+("within 24 hours"). A quoted log string needs a time window.
+A `Live:` box without a runnable check is allowed when a standalone `Proof:`
+line under `## What` requests a throwaway-environment check that answers it.
+The one templated Live box of a health or friction intake ticket is proved
+by the station's own absence tracking.
+
+When the criteria are all live or include only one generic test-or-row box
+alongside the live boxes, the build brief asks for the fix, a regression test,
+and a request to the repository's proof pipeline.
 
 Right after the ticket body, a build brief carries a `## Proof checks`
 section: each acceptance criterion restated as the check that proves it
 (the lane's pull request ticking it, the station's verify run observing it
 live, or the operator's own hand, by the criterion's kind). The pull
-request body answers criterion by criterion.
+request body answers criterion by criterion. For the buildable deliverable
+above, every live box stays unticked with `not built: checked after merge`.
 
 After the ticket body, a station brief carries two sections when they have
 anything to say. `## Operator notes` quotes the ticket's newest five comments
@@ -129,8 +136,9 @@ factory marker comment or a claim line), oldest first, each clipped to 1500
 characters, every line prefixed `> `. `## Linked pull requests` lists the
 pull requests, in any repo, that reference the ticket on its timeline, merged
 or open, one `owner/name#N, merged YYYY-MM-DD: title` line each. The lane is
-told a note outranks the ticket where they disagree, and to change nothing
-when a note or a merged pull request shows the work is done.
+told a note outranks the ticket where they disagree. Before building, the
+lane checks the ticket's premise in the current code. If the issue is absent
+or already fixed, it writes a no-change Intent summary citing what it read.
 
 The agent edits files in the checked-out repository and leaves the result on
 the requested branch. The runner commits any remaining changes, pushes that

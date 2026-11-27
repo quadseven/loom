@@ -44,6 +44,15 @@ class Classify(unittest.TestCase):
         self.assertEqual(judge(issue("claim:loom-app", "wait:ci"), line).kind,
                          readiness.HELD)
 
+    def test_a_stated_wait_keeps_an_own_app_claim_active(self):
+        line = [{"event": "labeled", "actor": {"login": "loom-app"},
+                 "label": {"name": "claim:loom-app"}, "created_at": at(3 * DAY)},
+                {"event": "commented", "user": {"login": "loom-app"},
+                 "body": "waiting: CI until " + at(-3600), "created_at": at(3600)}]
+        verdict = readiness.classify(issue("claim:loom-app"), line, [], time.time(), DAY,
+                                     OURS, own_apps=OURS)
+        self.assertEqual(verdict.kind, readiness.HELD)
+
     def test_a_ticket_with_an_open_pull_request_is_not_ready(self):
         self.assertEqual(judge(issue(), pulls=[at(60)]).kind, readiness.HAS_PR)
 

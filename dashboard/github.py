@@ -260,7 +260,7 @@ def _int_or(value: Any, default: int = 0) -> int:
 VIEW_SOURCES = {
     "improving": ("improving", "improving_built", "floor_context", "workhorse"),
     "lanes": ("lanes",),
-    "pull_requests": ("pull_requests", "footer_models", "footer_runs"),
+    "pull_requests": ("pull_requests", "footer_models", "footer_runs", "newest_lane_models", "scoreboard"),
     "brain_step": ("brain_step", "brain_step_error"),
     "comments": ("issue_comments", "review_comments", "comment_errors", "hot_spots_error"),
 }
@@ -583,6 +583,10 @@ class TicketStore:
         carried = [source for source in VIEW_SOURCES if read_at.get(source)]
         for source in carried:
             data.update({key: self._snapshot[key] for key in VIEW_SOURCES[source] if key in self._snapshot})
+        if "pull_requests" in carried and data["tickets"] != self._snapshot["tickets"]:
+            # Ticket reads can reach the floor after updating a difficulty.
+            rows = [row for found in data["tickets"].values() if found for row in found]
+            _, _, _, data["scoreboard"] = views.summarize_prs(data["pull_requests"], rows)
         data["source_read_at"], data["sources_carried"] = read_at, carried
         # The goal cards keep the last pass that read them. Dropping them
         # here left every Goals card at "-" with "No report on this goal
@@ -626,15 +630,8 @@ class TicketStore:
                         all(key in entry for key in ("is_goal", "is_backlog", "is_epic"))})
         data["goal_context_error"] = ""
 
-    def _read_dashboard(self, data: Dict[str, Any]) -> None:
-        """Read optional view sources; errors stay visible without failing tickets."""
-        if self._below_floor():
-            self._skip_dashboard_below_floor(data)
-            return
-
-        journals, reports, metric_comments, prs, lanes = [], [], [], [], []
-        errors = []
-        homes, status_home = _dashboard_homes()
+    def _read_dashboard_homes(self, homes, status_home, errors):
+        journals, reports, metric_comments, lanes = [], [], [], []
         with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
             home_results = list(pool.map(lambda home: self._dashboard_home_result(*home), homes))
         for found_journals, found_reports, found_metrics, found_lanes, found_errors in home_results:
@@ -650,9 +647,18 @@ class TicketStore:
         # reads them (Floor standup and next move, Improving, Lanes, Goals),
         # so a marker-shaped comment from anyone else counts nowhere.
         trusted = {login.lower() for login in brain.trusted_authors()}
-        journals, reports, metric_comments, lanes = (
-            [c for c in found if _by_trusted(c, trusted)]
-            for found in (journals, reports, metric_comments, lanes))
+        return tuple([c for c in found if _by_trusted(c, trusted)]
+                     for found in (journals, reports, metric_comments, lanes))
+
+    def _read_dashboard(self, data: Dict[str, Any]) -> None:
+        """Read optional view sources; errors stay visible without failing tickets."""
+        if self._below_floor():
+            self._skip_dashboard_below_floor(data)
+            return
+
+        prs, errors = [], []
+        homes, status_home = _dashboard_homes()
+        journals, reports, metric_comments, lanes = self._read_dashboard_homes(homes, status_home, errors)
         with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
             pull_results = list(pool.map(self._pull_requests_for_repo, self.repos))
         for found, repo_errors in pull_results:
@@ -674,8 +680,9 @@ class TicketStore:
         data["floor_context"] = _floor_context(reports, journals, self.operator_items, errors)
         data["lanes"] = lanes
         data["pull_requests"] = prs
-        # One pass at refresh, not per page (server.footer_models).
-        data["footer_models"], data["footer_runs"], data["newest_lane_models"] = views.parse_pr_footers(prs)
+        # One pass at refresh, not per page (server.footer_models, scoreboard).
+        (data["footer_models"], data["footer_runs"], data["newest_lane_models"],
+         data["scoreboard"]) = views.summarize_prs(prs, rows)
         data["dashboard_errors"] = errors
         data["brain_step"], data["brain_step_error"] = self._read_brain_step(status_home)
         data["workhorse"] = self._read_workhorse(errors)
@@ -1418,6 +1425,7 @@ class TicketStore:
                 "footer_models": snapshot.get("footer_models"),
                 "footer_runs": snapshot.get("footer_runs"),
                 "newest_lane_models": snapshot.get("newest_lane_models"),
+                "scoreboard": snapshot.get("scoreboard"),
                 "fix_round_refs": snapshot.get("fix_round_refs"),
                 "all_tickets": snapshot.get("all_tickets"),
                 "models_resolved": bool(snapshot.get("models_resolved")),

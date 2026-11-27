@@ -441,6 +441,24 @@ class BrainTickTest(unittest.TestCase):
         self.assertTrue((self.home / "brain" / "loom" / "docs" / "MUSE.md").exists())
         self.assertEqual("python3 -m bus unlock example/loom --holder lane-machine", calls[-1])
 
+    def test_report_queue_survives_checkout_cleanup_and_prompt_reserves_work(self):
+        self.tick()
+        queue = self.home / "brain" / "report-budget.json"
+        queue.write_text('{"pending": []}\n')
+        run, calls = self.tick()
+        self.assertEqual(0, run.returncode)
+        prompt = next(c for c in calls if c.startswith("claude "))
+        working = self.home / "brain" / "loom" / "report-budget.json"
+        self.assertIn("report-plan --state \"%s\"" % working, prompt)
+        self.assertIn("--holder lane-machine --lock-repo example/loom", prompt)
+        self.assertIn("verify, brief, triage and sweep", prompt)
+        self.assertIn("Reports deferred", prompt)
+        self.assertEqual('{"pending": []}\n', queue.read_text())
+        working.write_text('{"pending": ["%s#%d"]}\n' % ("example/project", 1))
+        self.tick()
+        self.assertEqual(working.read_text(), queue.read_text())
+        self.assertIn('"example/project' + '#1"', queue.read_text())
+
     def test_the_agent_records_its_steps_as_the_wrapper_holder(self):
         _, calls = self.tick()
         claude = [c for c in calls if c.startswith("claude ")]

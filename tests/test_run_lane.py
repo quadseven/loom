@@ -226,6 +226,13 @@ fi
 if [ "$1 $2" = "issue comment" ]; then
   exit 0
 fi
+# `issue list` prints $FAKE_GH_LIST (default empty), the numbers its --jq
+# keeps; $FAKE_GH_LIST_FAIL fails it.
+if [ "$1 $2" = "issue list" ]; then
+  [ -z "${FAKE_GH_LIST_FAIL:-}" ] || { echo "HTTP 502" >&2; exit 1; }
+  printf '%b' "${FAKE_GH_LIST:-}"
+  exit 0
+fi
 """
 
 # Fake agent: records the call, then commits a file ($FAKE_AGENT=commit),
@@ -249,6 +256,17 @@ printf 'agent-tmpdir=%s tmpdir-exists=%s tmpdir-islink=%s stale=%s targetfile=%s
 [ -z "${FAKE_AGENT_ENV:-}" ] || printf '%s\\n' "${GH_TOKEN:-none}" "${LOOM_GITHUB_APP_ID:-none}" "${GIT_CONFIG_COUNT:-none}" "${GH_CONFIG_DIR:-none}" "$(cat "${GH_CONFIG_DIR:-/nonexistent}/hosts.yml" 2>/dev/null | tr '\\n' ' ')" >> "$FAKE_AGENT_ENV"
 [ -z "${FAKE_AGENT_SAYS:-}" ] || printf '%s\\n' "$FAKE_AGENT_SAYS"
 cat > /dev/null
+if [ "${FAKE_AGENT:-}" = decision ]; then
+  case "$*" in
+    *"## Agreed lane decision"*"Use stable ordering."*)
+      [ "$(cat fix.txt)" = partial ] || exit 3
+      echo fixed > fix.txt
+      exit 0 ;;
+  esac
+  echo partial > fix.txt
+  printf '%s\n' "$FAKE_DECISION" > "$TMPDIR/T042-fix-the-thing.operator.json"
+  exit 0
+fi
 if [ "${FAKE_AGENT:-commit}" = fail ]; then exit 3; fi
 if [ "${FAKE_AGENT:-commit}" = say ]; then
   if [ -n "${FAKE_LAST_MESSAGE:-}" ]; then
@@ -1658,6 +1676,14 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         prompt = "\n".join(self.calls())
         self.assertIn("real person's mail or street address", prompt)
 
+    def test_the_build_prompt_checks_the_ticket_premise_before_editing(self):
+        self.drop_brief()
+        self.run_lane()
+        prompt = "\n".join(self.calls())
+        self.assertIn("If you are choosing a ticket, read its body and explain each skip", prompt)
+        self.assertIn("Check the ticket's premise in the current code before building", prompt)
+        self.assertIn("cite the code you checked in the Intent summary", prompt)
+
     def test_files_the_brief_names_commit_and_push_normally(self):
         self.drop_brief(text=BRIEF.replace(
             "Make the thing work.",
@@ -1978,6 +2004,87 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertIn("agent made no commit and wrote no reason", line)
         self.assertNotIn("internal", line)
 
+    def run_decision(self, packet, answer="1", lane="codex", **env):
+        prompt = Path(self._tmp.name) / "consult-prompt"
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/bash\nshift 2\nexec "$@"\n')
+        peer, event = ("claude", {"type": "result", "result": answer}) if lane == "codex" else (
+            "codex", {"type": "item.completed", "item": {"type": "agent_message", "text": answer}})
+        self.write_tool(self.bin / lane, FAKE_AGENT)
+        self.write_tool(self.bin / peer, f"""#!/bin/bash
+cat > '{prompt}'
+printf '%s\\n' '{json.dumps(event)}'
+""")
+        inbox = self.loom / "briefs" / lane
+        inbox.mkdir(parents=True, exist_ok=True)
+        (inbox / "T042-fix-the-thing.md").write_text(BRIEF.replace("Lane: codex", "Lane: " + lane))
+        result = self.run_lane(lane, FAKE_AGENT="decision", FAKE_DECISION=json.dumps(packet), **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return prompt
+
+    @staticmethod
+    def decision_packet():
+        return {"kind": "ambiguity", "question": "How should equal results be ordered?",
+                "context": "The brief leaves ties unspecified and consumers compare the result order.",
+                "options": ["Use stable ordering.", "Use lexical ordering."], "answer": 1}
+
+    def test_agreeing_models_continue_the_build_and_record_both_answers(self):
+        packet = self.decision_packet()
+        prompt = self.run_decision(packet).read_text()
+        self.assertIn(packet["question"], prompt)
+        self.assertIn(packet["context"], prompt)
+        self.assertNotIn('"answer"', prompt)
+        body = self.body.read_text()
+        log = (self.loom / "logs/codex/T042-fix-the-thing.log").read_text()
+        for output in (body, log):
+            self.assertIn("gpt-test-default: Use stable ordering.", output)
+            self.assertIn("claude-test-default: Use stable ordering.", output)
+
+    def test_claude_build_consults_codex_and_continues(self):
+        prompt = self.run_decision(self.decision_packet(), lane="claude")
+        self.assertTrue(prompt.is_file())
+        self.assertIn("gpt-test-default: Use stable ordering.", self.body.read_text())
+
+    def test_disagreement_parks_the_build_with_both_answers_in_the_comment(self):
+        packet = self.decision_packet()
+        packet["question"] += " The choice applies to every consumer of the ordered result."
+        packet["options"][0] += " Keep input order whenever the existing comparison returns a tie."
+        packet["options"][1] += " Compare each result by record name."
+        self.run_decision(packet, answer="2")
+        self.assertIn("[operator]", self.failure_line())
+        self.assertFalse(self.body.exists())
+        note, = self.tail_bodies()
+        self.assertIn("gpt-test-default: " + packet["options"][0], note)
+        self.assertIn("claude-test-default: " + packet["options"][1], note)
+        self.assertIn("Models disagreed.", note)
+
+    def test_operator_actions_park_without_a_consult(self):
+        for kind, question in (
+            ("credential", "Can the operator provision a service credential?"),
+            ("money", "Can the operator approve the subscription cost?"),
+            ("host", "Can the operator resize the build host?"),
+            ("policy", "Which retention policy will the operator approve?"),
+        ):
+            with self.subTest(kind=kind):
+                (self.loom / "logs/codex/T042-fix-the-thing.log").unlink(missing_ok=True)
+                prompt = self.run_decision({"kind": kind, "question": question})
+                self.assertFalse(prompt.exists())
+                self.assertIn("[operator] Ask: " + question, self.failure_line())
+                self.assertFalse(self.body.exists())
+
+    def test_unusable_second_answer_is_retried_instead_of_becoming_an_ask(self):
+        prompt = self.run_decision(self.decision_packet(), answer="I would choose option one.")
+        self.assertTrue(prompt.is_file())
+        self.assertIn("[transient] the second model returned an invalid decision answer", self.failure_line())
+        self.assertFalse(self.body.exists())
+
+    def test_decision_context_that_fails_the_leak_scan_never_reaches_the_second_model(self):
+        packet = self.decision_packet()
+        packet["context"] = "A private issue is referenced as %s#%d." % ("example-other", 19)
+        prompt = self.run_decision(packet)
+        self.assertFalse(prompt.exists())
+        self.assertIn("[transient] the leak scan refused the decision packet", self.failure_line())
+        self.assertNotIn(packet["context"], "\n".join(self.tail_bodies()))
+
     def test_a_summary_that_is_not_a_no_change_reason_is_still_a_failure(self):
         self.drop_brief()
         result = self.run_lane(FAKE_AGENT="no-change", FAKE_SUMMARY="Make the thing work")
@@ -2085,6 +2192,31 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertEqual(repaired["reason"], "")
         self.assertFalse(repaired["changed"], repaired)
         self.assertEqual(repaired["old_hash"], repaired["new_hash"])
+
+    def test_a_live_only_build_pr_defers_live_criteria_even_with_a_partial_summary(self):
+        boxes = ("Live: The page shows the corrected total.",
+                 "A test or a ledger row shows it",
+                 "Live: The reported reason is gone or explained.")
+        why, _, after = BRIEF.partition("## Acceptance criteria\n")
+        _, _, size = after.partition("## Size\n")
+        request = "Proof: Check the corrected total with seeded data."
+        why = why.replace("Make the thing work.\n", "Make the thing work.\n" + request + "\n")
+        self.drop_brief(text=why + "## Acceptance criteria\n"
+                        + "".join("- [ ] %s\n" % box for box in boxes) + "\n## Size\n" + size)
+        result = self.run_lane(FAKE_SUMMARY="Correct the total.\n\n## Acceptance criteria\n"
+                               "- [x] %s\n- [x] %s\n" % boxes[:2])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        self.assertIn(request, body.splitlines())
+        for box in (boxes[0], boxes[2]):
+            self.assertIn("- [ ] %s; not built: checked after merge" % box, body)
+            self.assertNotIn("- [x] " + box, body)
+        self.assertIn("- [x] " + boxes[1], body)
+        done = self.inbox / "done" / "T042-fix-the-thing.md"
+        repaired = pr_repair.reconcile(str(done), "Fix the thing", body,
+                                       "codex", "gpt-test-default", "T042-fix-the-thing")
+        self.assertFalse(repaired["changed"], repaired)
+        self.assertEqual(repaired["reason"], "")
 
     def test_uncommitted_agent_edits_are_committed_by_the_runner(self):
         self.drop_brief()
@@ -3049,7 +3181,8 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
 
     def beats(self):
         usage = self.loom / "state" / "usage"
-        return {p.stem: json.loads(p.read_text()) for p in usage.glob("*.json")}
+        # Heartbeats only: a codex pass also writes its codex.meter.json.
+        return {p.stem: json.loads(p.read_text()) for p in usage.glob("*.json") if "." not in p.stem}
 
     def test_empty_credit_on_one_anthropic_slot_holds_all_eight(self):
         self.hold_credit("anthropic-3")
@@ -6801,6 +6934,45 @@ echo fixed > fix.txt
         self.assertIn("Lanes seen: opencode-go-2, opencode-go-3\n", note)
         self.assertEqual(len([c for c in self.calls() if c.startswith("gh issue create")]), 1)
 
+    def key_ask_race(self, **env):
+        """Lane opencode-go-2 files the ask for an expired key while the search
+        still finds no open ask, as when another lane filed one a second ago."""
+        script = ('FACTORY_REPO=quadseven/loom KEY_ASK_MARKER="<!-- loom:key-ask v1 -->"\n'
+                  'KEY_REPEAT_MARKER="<!-- loom:key-repeat v1 -->"\n'
+                  'SLOT=opencode-go-2 LOG=/dev/null NET_TIMEOUT=30 LOOM_ROOT="%s"\n' % RUNNER.parent.parent
+                  + self.source_functions("open_issue", "upsert_sticky_comment", "signed", "sign_tail",
+                                         "settle_ask", "file_ask", "ask_renew_key") +
+                  'ask_renew_key "API key expired: renew /k/go"\n')
+        result = subprocess.run(["bash", "-c", script, "bash"],
+                                env={**self.lane_env(), "FAKE_GH_ISSUE_NUMBER": "12", **env},
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return [c for c in self.calls() if c.startswith("gh issue close")]
+
+    def test_two_lanes_that_file_one_key_ask_at_once_leave_one_open(self):
+        # loom#3536: two lanes search, find nothing, and both file. The later
+        # ask (the higher number) sees the earlier one when it lists the open
+        # issues again, closes itself, and counts its lane on the earlier ask.
+        closed = self.key_ask_race(FAKE_GH_LIST="11\\n12\\n")
+        self.assertEqual(len(closed), 1, self.calls())
+        self.assertTrue(closed[0].startswith("gh issue close --repo quadseven/loom 12 "), closed)
+        self.assertIn("#11", closed[0])
+        [note] = self.sticky_bodies()
+        self.assertIn("Could not use the key again: 1 time", note)
+        self.assertIn("Lanes seen: opencode-go-2\n", note)
+        listed = [c for c in self.calls() if c.startswith("gh issue list")]
+        self.assertEqual(len(listed), 1, self.calls())
+        self.assertIn("--state open", listed[0])
+
+    def test_the_earlier_of_two_racing_key_asks_stays_open(self):
+        self.assertEqual(self.key_ask_race(FAKE_GH_LIST="12\\n13\\n"), [])
+        self.assertEqual(self.sticky_bodies(), [])
+
+    def test_a_key_ask_that_cannot_list_the_open_asks_stays_open(self):
+        # A failed listing proves nothing: keeping a possible duplicate beats
+        # closing the only ask.
+        self.assertEqual(self.key_ask_race(FAKE_GH_LIST_FAIL="1"), [])
+
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_provider_that_answers_lets_the_run_go_ahead(self):
         requests, env = self.provider((200, '{"choices": [{"message": {"content": "p"}}]}'))
@@ -7001,6 +7173,32 @@ exit %d
         self.assertEqual(beat["lane"], "codex")
         self.assertGreaterEqual(beat["at"], before)
 
+    def test_an_idle_codex_pass_writes_its_session_usage_to_the_shared_home(self):
+        # loom#3630: in the cluster the sessions live in the lane's own Codex
+        # home, which the station does not mount; the lane writes the meter
+        # into the Loom home the station reads.
+        sessions = self.home / "codex-lane-home" / "sessions" / "2026" / "11" / "26"
+        sessions.mkdir(parents=True)
+        (sessions / "rollout.jsonl").write_text(json.dumps({
+            "timestamp": "2026-11-26T14:40:00Z", "type": "event_msg", "payload": {
+                "type": "token_count", "rate_limits": {"secondary": {
+                    "used_percent": 3, "window_minutes": 10080, "resets_at": 1795000000}}}}) + "\n")
+        self.run_lane(CODEX_HOME=str(self.home / "codex-lane-home"))
+        written = json.loads((self.loom / "state" / "usage" / "codex.meter.json").read_text())
+        self.assertEqual([(w["window"], w["used_pct"], w["window_minutes"]) for w in written["windows"]],
+                         [("weekly", 3.0, 10080)])
+
+    def test_a_codex_run_keeps_its_session_in_the_lanes_codex_home(self):
+        # A Codex home with no sessions folder yet: the run's session must
+        # still land where the lane meter reads it, not in the run's scratch
+        # home that is removed after the run.
+        codex_home = self.home / "fresh-codex-home"
+        codex_home.mkdir()
+        self.drop_brief()
+        self.run_lane(CODEX_HOME=str(codex_home))
+        self.assertTrue(any(c.startswith("codex ") for c in self.calls()))
+        self.assertTrue((codex_home / "sessions").is_dir())
+
     def test_failed_run_is_parked_once_and_the_next_brief_still_runs(self):
         self.drop_brief("T001-broken.md", BRIEF.replace("T042-fix-the-thing", "T001-broken"))
         self.drop_brief("T002-later.md", BRIEF.replace("T042-fix-the-thing", "T002-later"))
@@ -7165,7 +7363,7 @@ exit %d
             r'cd "\$TREE" && unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN "\$\{!LOOM_GITHUB_APP_@\}" '
             r'"\$\{!GIT_CONFIG_@\}" &&\s*export GH_CONFIG_DIR="\$AGENT_GH_CONFIG" && '
             r'github_auth_agent_path &&\s*'
-            r'run_agent "\$RUN_BRIEF"',
+            r'run_agent_with_decision "\$RUN_BRIEF"',
         )
 
     def test_a_lane_whose_app_token_cannot_be_minted_posts_nothing_as_anyone(self):

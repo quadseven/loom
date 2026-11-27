@@ -242,6 +242,12 @@ class HostOnly(unittest.TestCase):
     def test_a_ticket_of_host_checks_only_is_host_only(self):
         self.assertEqual(len(operator_hold.host_only(TICKET_5783)), 3)
 
+    def test_a_ticket_with_a_fix_and_deferred_proof_can_go_to_a_lane(self):
+        body = ("## What\nFix rounding in the total.\n"
+                "Proof: Check the corrected total with seeded data.\n\n"
+                "## Acceptance criteria\n- [ ] Live: The page shows the corrected total.\n")
+        self.assertEqual(operator_hold.host_only(body), [])
+
     def test_a_ticket_with_one_criterion_a_pull_request_can_meet_is_not(self):
         for body in (TICKET_5783.replace("## Acceptance criteria\n",
                                          "## Acceptance criteria\n- [ ] A test covers the "

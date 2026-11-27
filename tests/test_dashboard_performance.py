@@ -8,13 +8,14 @@ import json
 import sys
 import threading
 import unittest
+from datetime import datetime, timedelta, timezone
 from email.message import Message
 from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from dashboard import server, station_state, views  # noqa: E402
+from dashboard import brain_view, fleet, server, station_state, views  # noqa: E402
 from tests.sandbox_caps import LOCALHOST, NO_LOCALHOST  # noqa: E402
 
 
@@ -207,6 +208,164 @@ class StationStateSyncAndLiveFloorTest(unittest.TestCase):
         self.assertEqual(rows3["chain"]["at"], 5.0)
         self.assertEqual(rows1["chain"]["at"], 5.0)
         self.assertEqual(rows2["chain"]["at"], 5.0)
+
+
+class Wave4OptimizationParityTest(unittest.TestCase):
+    def test_build_improvements_index_matches_linear_scan(self):
+        repo = "example-owner/sample"
+        ref_direct = "%s#%d" % (repo, 10)
+        ref_body = "%s#%d" % (repo, 60)
+        tickets = [
+            {"repo": repo, "number": 10, "title": "Direct first", "state": "shipped", "body": "## Why\nOther."},
+            {"repo": repo, "number": 10, "title": "Direct duplicate", "state": "queued", "body": ""},
+            {"repo": repo, "number": 20, "title": "Noticed mismatch", "state": "queued",
+             "body": "Noticed in https://example.com/issues/1#issuecomment-200: unrelated slow build step\n"},
+            {"repo": repo, "number": 21, "title": "Noticed match", "state": "merged",
+             "body": "Noticed in https://example.com/issues/1#issuecomment-200: runner cache miss during compile\n"},
+            {"repo": repo, "number": 22, "title": "Noticed short", "state": "briefed",
+             "body": "Noticed in https://example.com/issues/1#issuecomment-201\n"},
+            {"repo": repo, "number": 23, "title": "Refs id", "state": "pr",
+             "body": "Refs journal comment 202\n"},
+            {"repo": repo, "number": 30, "title": "Why overlap first", "state": "shipped",
+             "body": "## Why\nThe checkout step timed out repeatedly when cloning large fixtures.\n## Out of scope\nNone"},
+            {"repo": repo, "number": 31, "title": "Why overlap second", "state": "queued",
+             "body": "## Why\nThe checkout step timed out repeatedly when cloning large fixtures.\n"},
+            {"repo": repo, "number": 60, "title": "Body ref", "state": "running", "body": ""},
+            {"repo": repo, "number": 70, "title": "Journal issue ref", "state": "queued",
+             "refs": [(repo, "99")], "body": ""},
+        ]
+        journals = [
+            {"id": 100, "html_url": "https://example.com/issues/1#issuecomment-100",
+             "created_at": "2030-01-10T10:00:00Z", "repo": repo, "issue_number": 1,
+             "body": "<!-- loom:journal v1 -->\n- Friction: see %s for retry delay.\n" % ref_direct},
+            {"id": 200, "html_url": "https://example.com/issues/1#issuecomment-200",
+             "created_at": "2030-01-10T09:00:00Z", "repo": repo, "issue_number": 1,
+             "body": "<!-- loom:journal v1 -->\n- Friction: runner cache miss during compile.\n"},
+            {"id": 201, "html_url": "https://example.com/issues/1#issuecomment-201",
+             "created_at": "2030-01-10T08:00:00Z", "repo": repo, "issue_number": 1,
+             "body": "<!-- loom:journal v1 -->\n- Friction: short noticed link friction line.\n"},
+            {"id": 202, "html_url": "https://example.com/issues/1#issuecomment-202",
+             "created_at": "2030-01-10T07:00:00Z", "repo": repo, "issue_number": 1,
+             "body": "<!-- loom:journal v1 -->\n- Friction: refs id matched friction line.\n"},
+            {"id": 300, "html_url": "https://example.com/issues/1#issuecomment-300",
+             "created_at": "2030-01-10T06:00:00Z", "repo": repo, "issue_number": 1,
+             "body": "<!-- loom:journal v1 -->\n- Friction: checkout step timed out repeatedly when cloning large fixtures.\n"},
+            {"id": 400, "html_url": "https://example.com/issues/1#issuecomment-400",
+             "created_at": "2030-01-10T05:00:00Z", "repo": repo, "issue_number": 1,
+             "body": "<!-- loom:journal v1 -->\n- Done: linked %s.\n- Friction: unmatched friction falls back to body ref.\n" % ref_body},
+            {"id": 500, "html_url": "https://example.com/issues/99#issuecomment-500",
+             "created_at": "2030-01-10T04:00:00Z", "repo": repo, "issue_number": 99,
+             "body": "<!-- loom:journal v1 -->\n- Friction: unmatched friction falls back to issue ref.\n"},
+        ]
+        built = views.build_improvements(journals, tickets, [])
+        # Compare every friction match against the original linear _ticket_for_friction.
+        for record in built["records"]:
+            journal = record["journal"]
+            expected = views._ticket_for_friction(journal, record["friction"], str(journal["body"]), tickets)
+            self.assertEqual(record["ticket"], expected)
+        matched_numbers = [r["ticket"]["number"] for r in built["records"]]
+        self.assertEqual(matched_numbers, [10, 21, 22, 23, 30, 60, 70])
+
+    def test_journal_url_prefix_keeps_the_legacy_digit_boundary(self):
+        url = "https://example.com/issues/1#issuecomment-123"
+        journal = {"html_url": url}
+        for suffix, matches in (("", True), (" appendix", True), ("extra", True), ("4", False)):
+            with self.subTest(suffix=suffix):
+                ticket = {"body": url + suffix}
+                expected = ticket if matches else None
+                self.assertIs(views._ticket_refs_journal([ticket], journal), expected)
+                index = views._TicketIndex([{"body": "Unrelated ticket"}, ticket])
+                with patch.object(index, "_ticket_matches_journal", wraps=index._ticket_matches_journal) as matcher:
+                    self.assertIs(index.ticket_refs_journal(journal, ""), expected)
+                self.assertEqual([call.args[0] for call in matcher.call_args_list], [1] if matches else [])
+
+    def test_journal_url_embedded_in_another_url_matches(self):
+        url = "https://example.com/issues/1#issuecomment-123"
+        journal = {"html_url": url}
+        ticket = {"body": "https://example.com/redirect?target=" + url}
+        self.assertIs(views._ticket_refs_journal([ticket], journal), ticket)
+        self.assertIs(views._TicketIndex([ticket]).ticket_refs_journal(journal, ""), ticket)
+
+    def test_journal_id_matches_without_a_url(self):
+        journal = {"id": 123}
+        ticket = {"body": "See issuecomment-123."}
+        tickets = [{"body": "See issuecomment-1234."}, ticket]
+        self.assertIs(views._ticket_refs_journal(tickets, journal), ticket)
+        self.assertIs(views._TicketIndex(tickets).ticket_refs_journal(journal, ""), ticket)
+
+    def test_noticed_quote_stays_with_its_journal_across_unlinked_lines(self):
+        url = "https://example.com/issues/1#issuecomment-123"
+        journal = {"html_url": url, "id": 123}
+        friction = "runner cache miss during compile"
+        wrong = {"body": f"Noticed in {url}: slow dashboard redraw after refresh\n"
+                         "Noticed in: no linked comment on this line\n"
+                         "Noticed in https://example.com/issues/1#issuecomment-567: " + friction}
+        right = {"body": f"Noticed in {url}: {friction}"}
+        tickets = [wrong, right]
+        self.assertIs(views._ticket_refs_journal(tickets, journal, friction), right)
+        self.assertIs(views._TicketIndex(tickets).ticket_refs_journal(journal, friction), right)
+
+    def test_summarize_prs_matches_scoreboard_and_lane_view_uses_precomputed(self):
+        repo = "example-owner/sample"
+        tickets = [
+            {"repo": repo, "number": 1, "difficulty": "easy"},
+            {"repo": repo, "number": 2, "difficulty": "hard"},
+            {"repo": repo, "number": 3, "difficulty": None},
+        ]
+        prs = [
+            {"number": 101, "state": "closed", "merged_at": "2030-01-09T12:00:00Z",
+             "created_at": "2030-01-09T10:00:00Z", "updated_at": "2030-01-09T12:00:00Z",
+             "html_url": "https://example.com/pr/101",
+             "body": "Loom ticket example-owner.sample-1, lane codex, model gpt-5.\n"},
+            {"number": 102, "state": "open", "merged_at": None,
+             "created_at": "2030-01-09T11:00:00Z", "updated_at": "2030-01-09T11:00:00Z",
+             "html_url": "https://example.com/pr/102",
+             "body": "Loom ticket example-owner.sample-2, lane anthropic, model claude-sonnet.\n"},
+            {"number": 103, "state": "closed", "merged_at": None, "difficulty": "medium",
+             "created_at": "2030-01-09T09:00:00Z", "updated_at": "2030-01-09T09:00:00Z",
+             "html_url": "https://example.com/pr/103",
+             "body": "Loom ticket example-owner.sample-3, lane codex, model gpt-5.\n"},
+        ]
+        models, runs, by_lane, scoreboard = views.summarize_prs(prs, tickets)
+        self.assertEqual(models, views.footer_models(prs))
+        self.assertEqual(runs, views.footer_runs(prs))
+        self.assertEqual(by_lane, server._newest_lane_models(prs))
+        self.assertEqual(scoreboard, views.build_scoreboard(server._scoreboard_rows(prs, tickets)))
+
+        payload = {"pull_requests": prs, "lanes": [], "improving": {"metrics_comments": []},
+                   "newest_lane_models": by_lane, "scoreboard": scoreboard}
+        with patch.object(views, "build_scoreboard", side_effect=AssertionError("should use precomputed")):
+            lane_data = server._lane_view_data(payload, tickets)
+        self.assertEqual(lane_data["scoreboard"], scoreboard)
+
+    def test_journal_holders_and_fleet_journal_rows_skip_redundant_scans(self):
+        now = datetime(2030, 1, 10, 12, 0, tzinfo=timezone.utc)
+        start = now - timedelta(hours=24)
+        old_body = "<!-- loom:journal v1 -->\nTick 2030-01-05T10:00:00Z, muse\n- Done: old work.\n"
+        new_body = "<!-- loom:journal v1 -->\nTick 2030-01-10T11:00:00Z, muse\n- Step 2: failed check.\n"
+        journals = [
+            {"id": 1, "created_at": "2030-01-05T10:00:00Z", "repo": "example-owner/sample",
+             "issue_number": 30, "body": old_body},
+            {"id": 2, "created_at": "2030-01-05T10:00:00Z", "repo": "example-owner/sample",
+             "issue_number": 31, "body": old_body},
+            {"id": 3, "created_at": "2030-01-10T11:00:00Z", "repo": "example-owner/sample",
+             "issue_number": 30, "body": new_body},
+            {"id": 4, "created_at": "2030-01-10T11:00:00Z", "repo": "example-owner/sample",
+             "issue_number": 31, "body": new_body},
+        ]
+        holders = brain_view._journal_holders(journals)
+        self.assertEqual(set(holders.keys()), {"muse"})
+        self.assertEqual(holders["muse"]["outcome"], "failed")
+        self.assertEqual(holders["muse"]["at"], "2030-01-10T11:00:00Z")
+
+        rows, homes = fleet._journal_rows(journals, start, now)
+        muse_row = next(r for r in rows if r["key"] == "brain:muse")
+        self.assertEqual(len(muse_row["_all"]), 2)
+        in_window = [e for e in muse_row["_all"] if start <= e["at"] <= now]
+        self.assertEqual(len(in_window), 1)
+        self.assertEqual(in_window[0]["kind"], "tick-failed")
+        self.assertIn("Step 2: failed check", in_window[0]["gist"])
+        self.assertEqual(homes, {("example-owner/sample", 30)})
 
 
 if __name__ == "__main__":

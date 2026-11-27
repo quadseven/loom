@@ -80,6 +80,8 @@ decides who acts:
 | `loom:goal` | The goal's home issue. |
 | `loom:backlog` | With `loom:goal`: the goal home that holds the repo's whole backlog (docs/NAMING.md). |
 | `loom:ticket` | Every ticket issue. |
+| `loom:pickable` | The station found a candidate for a worker to read and check in the code. |
+| `loom:readiness-done` | The station found merged work or a completed state. Review the ticket for verification. |
 | `loom:queued` | Ready ticket with no lane yet. After claims, the station gives it a free lane of its Difficulty tier, by priority then oldest; a future `Not before:` or missing Difficulty keeps it queued. |
 | `loom:briefed` | Assigned to the lane named by its single `lane:<name>` label; waiting for the station. An `After:` line holds it there until the tickets it names are merged. |
 | `loom:running` | A lane has claimed the ticket. The station clears a local run's running label when it reports the outcome, and its lane label too when the ticket goes back to the queue; a ticket at `loom:pr` or `loom:failed` keeps its lane label for fix rounds and the model ladder. Each pass requeues stale running tickets with no local brief or pending outcome. |
@@ -1129,6 +1131,11 @@ each criterion as a checkbox under `## Acceptance criteria` (or the shorter
 `## Acceptance` heading). An answer ticket opens no pull request and is
 exempt, as at the runner.
 
+A queued build ticket whose acceptance criteria all require live evidence
+stays unassigned. The station records one status event for the hold. A brief
+revision that adds a code acceptance criterion makes the ticket eligible for
+assignment on the next pass.
+
 In a repo that files its tickets by area of play (it defines at least one
 `area:` label), a ticket carrying no `area:` label gets no lane either: every
 per-area view misses it, and picking the area is intake work. The factory
@@ -1157,7 +1164,10 @@ pushes fixes to the existing branch. Before each round after the first, the
 station asks whether the last one moved anything (`bus/converge.py`): the same
 check names still failing, or a review-bot finding at the same path within 10
 lines under the same rule (a new thread id or check run id does not make it
-new), is a stuck round. A stuck round climbs the model ladder at once
+new), is a stuck round. For high or critical findings reported only in
+Elder's Markings Board, the factory and station compare the file, line and
+rule columns using the same matching rule as inline findings. A stuck round
+climbs the model ladder at once
 (`factory.Factory._climb`, which keeps the model and private-repo rules); a
 new finding is progress and stays on its lane. `LOOM_FIX_ROUNDS` caps the
 rounds per rung (default 3). With no rung left above a stuck round, or the cap
@@ -1320,6 +1330,11 @@ When the runner finishes, the station finds the brief in `done/` or
   brief) and record the status event `Lane <lane> stopped: [limit] <reason>`;
   the factory moves a ticket briefed on a lane whose heartbeat says `limit:`
   to the next rung at once.
+- Operator decision (`[operator]`): a local build lane asked a person directly
+  or its two models selected different answers. The runner posts the scanned
+  question and any answers in the park comment. The station releases its
+  claim, sets `loom:queued` and `needs:human`, and records a stopped event.
+  This ending spends no rung and does not count toward a runaway.
 - An expired key (an `[auth]` reason): not a failure, not an attempt, and
   never a runaway, whatever else the ticket has been through. Label
   `loom:briefed` again (`loom:pr` for a fix brief) and record the status
@@ -1330,8 +1345,8 @@ When the runner finishes, the station finds the brief in `done/` or
 - Runaway count: a claim's ending is the first of these after it: a `Lane
   <lane> failed:` line, an automatic retry (its `Lane <lane> failed:` reason),
   a factory hold (`Lane <lane> held:`, a `[factory]` ending) or a `Lane <lane>
-  stopped:` event. A claim that ended `[transient]`, `[limit]`, `[auth]` or
-  `[factory]` is not a work attempt and never counts toward a runaway; a stop
+  stopped:` event. A claim that ended `[transient]`, `[limit]`, `[auth]`,
+  `[factory]`, or `[operator]` is not a work attempt and never counts toward a runaway; a stop
   is never worded `failed:`, so failure counts do not read it.
 - A fix brief parked unrun because its pull request merged first (`pull
   request #N is no longer open on <branch> (MERGED ...)`): not a failure, not
@@ -1825,26 +1840,35 @@ no-lane reasons and dropped when a lane takes it), and the factory acts on it:
 
 ## Picking a ticket to work
 
-A worker told to take a ready ticket reads the tickets and decides by
-reading. It does not trust a label, because the same label means different
-things in different repos, and some repos carry no ready label at all (a
-Loom ticket waiting for a lane carries `loom:queued`, not a ready marker).
+A worker told to take a ready ticket starts with `loom:pickable` candidates
+when available, and also reads the open tickets when the marker is missing
+or the candidates are unsuitable. Repos may use different queue labels.
 The rule for any session that picks work, in the order it applies:
 
-1. List the open issues and read their bodies, not only their labels.
-2. Skip, and say why in the report, a ticket that: has an open pull request
-   naming it; is an epic, goal or tracker; carries `needs:human` or
-   `wait:blocked`; has a claim label whose holder acted in the last 24 hours
-   (a claim whose holder has been silent longer is stale and may be taken);
-   has only live or production boxes left; or needs a person, a credential
-   or a purchase.
+1. List the open issues and read their bodies.
+2. Skip epics, goals, trackers and tickets with an open pull request,
+   `needs:human`, `wait:blocked`, or only live or production boxes left.
+   Skip any ticket that needs a person, a credential or a purchase.
+   Respect a claim while its holder has acted in the past 24 hours or a
+   stated wait still holds it. Give the reason for each skip in the report.
 3. Check the ticket's premise in the code before building. If the described
-   problem is not there, or the work already merged, write that finding in
-   the report and take the next ticket. No pull request is opened for it.
+   problem is absent or the work already merged, record the finding on the
+   ticket with the code you checked, include it in the report, and take the
+   next ticket. An assigned lane records the finding through its no-change
+   Intent summary, which the station reports on the ticket.
 4. Build the smallest change that meets the code boxes, with a test that
    fails before the change.
 
-This rule lives here so it does not depend on any one session's prompt.
+The station's `refresh_ticket_readiness` step scans the open Loom tickets
+in each configured repo, up to 40 per repo per hour, resuming by issue number
+on a larger backlog. It checks for open pull requests, claims, person waits,
+and work already merged. It removes stale pickability labels and clears this
+Loom's inactive claims using `LOOM_CLAIM_IDLE_HOURS` (24 by default). It
+checks a released ticket again on a later pass. Tickets with only live
+checks left stay off the build list. Each repo's log line counts newly
+marked candidates, cleared claims, and newly flagged done tickets. Both
+labels are advisory. The worker still checks the code, and verification
+still follows the ticket's existing lifecycle.
 
 ## needs-brain holds nothing answers
 
@@ -2120,6 +2144,10 @@ times (default 6, 0 is off) with no lane claiming it stops moving: it takes
 Repeated escalation to the same known model and lane counts as one move
 while that assignment stays in place.
 
+A ticket with `LOOM_FAILED_RUN_CAP` work attempts (default 8, 0 is off) since its
+last brief takes `loom:runaway` with one comment, however its failure reasons
+differ or how far apart the runs are. A new brief starts the count again.
+
 A `; not built:` reason that says the work is already there must cite code on
 the pull request's base branch: `<path>:<line>`, `<path>#L<line>`,
 `<path>::<symbol>`, or `` `<path>` `<symbol>` ``. Status prints
@@ -2334,9 +2362,10 @@ is read fresh.
 A ticket whose every acceptance criterion is a check on a live host or
 network (a command run on a host, a reach test from a network, a port, a
 firewall or ACL rule, a check across the hosts, or a Live line, and none
-naming a test) gets no lane: the factory puts it to `needs:human` with one
-ask instead of giving it one, and `bus.brain brief` refuses it. The
-station's close of a shipped ticket whose Live line names nothing to search
+naming a test) needs a buildable deliverable and a `Proof:` request to go to
+a lane (docs/BRIEF_FORMAT.md). Otherwise, the factory puts it to `needs:human`
+with one ask, and `bus.brain brief` refuses it. The station's close of a
+shipped ticket whose Live line names nothing to search
 leaves it open while an unticked criterion is such a host or network check:
 a merge proves none of them.
 
@@ -2748,6 +2777,14 @@ repo that cannot be read keeps its records, and nothing is cleared by an
 error. The table goes on the lane status comment, and the dashboard's Lanes
 page shows it as Scorecard.
 
+The hourly refresh also reads the finished briefs and their runner logs.
+Each failed brief's final park line determines whether it was a `model_error`
+or an `env_error`. A red check on the unchanged base, a setup failure,
+or a runner interruption is excluded from zero-done demotion. Provider
+limits are counted separately. A missing park line leaves the outcome
+unknown unless the scorecard already recorded it. Only recorded work
+failures count toward the zero-done threshold.
+
 Each merged record also gets a settled difficulty (`bus/difficulty.py`),
 scored blind from the merged work alone: the diff's changed lines and files,
 the fix rounds sent back and the review findings, never the ticket's
@@ -3039,8 +3076,20 @@ valid report, a measurement (a journal or report with a `Measure:` line that
 is not none) and a completed action (a `Shipped:` line that is not none),
 and its report state: ok, due (from 2 hours 15 minutes before its reading
 time), or overdue (30 minutes past the reading time). Due and overdue goals are listed under "Reports
-owed before unlock"; the tick posts those reports before it unlocks. A due
+owed before unlock"; the tick queues those reports for its capped report turn. A due
 or overdue goal that is quiet (below) is not listed there.
+
+`python3 -m bus.brain report-plan --state REPORT_STATE.json --holder HOLDER
+--owed OWNER/NAME#N` retains owed reports across ticks. It offers one report
+until a fixed deadline: at most half the tick's total time, and half the
+remaining time before the existing work cutoff. It then offers timed turns
+for verify, brief, triage and sweep (docs/MUSE.md, Report budget turn).
+The queue removes a goal only with `--done OWNER/NAME#N`, after a successful
+post or a fresh read proving the report no longer owed. A partial read never
+discards queued goals. Keep the state file across ticks; the lane wrapper
+preserves its working copy across checkout cleanup, including for sandboxed
+rungs. The helper's `- Reports deferred: N` line goes in the tick journal.
+Report contents, the tick's stop, and the per-goal report gap do not change.
 
 Two reports on one goal home stay at least 90 minutes apart (the
 `report-cadence` invariant). A due or overdue goal with a report under 90

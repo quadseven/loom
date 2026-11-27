@@ -545,9 +545,8 @@ SILENT_MAX = 30 * 60
 # The rung marker format is owned by bus/history.py (loom#2457).
 RUNG_MARKER = history.RUNG_MARKER
 RUNG_RE = history.RUNG_RE
-# The thread and check headings bus.brain.fix writes into a loom:fix comment.
+# The thread heading bus.brain.fix writes into a loom:fix comment.
 FIX_THREAD_RE = re.compile(r"^### Thread (\S+) ", re.M)
-FIX_CHECK_RE = re.compile(r"^### Check: ", re.M)
 CLAIM_RE = history.CLAIM_RE
 # The factory's own note when it moves a stalled ticket to another lane.
 STALL_MOVE_RE = re.compile(r"^Not a failure \(briefed \d+ hours on lane ")
@@ -903,12 +902,13 @@ def last_climb(comments: Sequence[Dict[str, Any]]) -> float:
 def stuck(comments: Sequence[Dict[str, Any]], open_threads: Sequence[str],
           checks_failing: bool, age: float, now: float = 0.0,
           no_test: bool = False, unticked: Sequence[str] = (),
-          threads: Sequence[Dict[str, Any]] = ()) -> bool:
+          threads: Sequence[Dict[str, Any]] = (), review_check: str = DEFAULT_REVIEW_CHECK,
+          failing_names: Sequence[str] = ()) -> bool:
     """Did the last fix round fail to move this pull request? True when a
     thread it was asked to fix is still open, or an open one in `threads`
     holds the same finding (bus/converge.py: same path, a nearby line, the
     same rule; the review bot may post it again as a new thread), when
-    checks it was asked to fix still fail, when it was asked for a test and
+    ordinary checks it was asked to fix still fail, when it was asked for a test and
     still has none, or when the
     pull request is older than STUCK_AGE and has not moved on the ladder for
     STUCK_AGE (age alone climbs once per window, not on every round)."""
@@ -923,7 +923,9 @@ def stuck(comments: Sequence[Dict[str, Any]], open_threads: Sequence[str],
         return True
     if _unticked_left(last, unticked):
         return True
-    return checks_failing and bool(FIX_CHECK_RE.search(last))
+    asked = converge.asked_checks(last) - {" ".join(review_check.split())}
+    current = {" ".join(name.split()) for name in failing_names} if failing_names else asked
+    return checks_failing and bool(asked & current)
 
 
 def _last_fix(comments: Sequence[Dict[str, Any]]) -> str:
@@ -939,22 +941,20 @@ def _unticked_left(last: str, unticked: Sequence[str]) -> bool:
 def _finding_survived(last: str, open_threads: Sequence[str],
                       threads: Sequence[Dict[str, Any]]) -> bool:
     """A thread the last fix round asked about is still open, by its id or,
-    posted again, by its finding's signature (bus/converge.py). Failing
-    checks are judged by stuck() itself: any check the round was asked to fix
-    while checks still fail."""
+    posted again, by its finding's signature (bus/converge.py)."""
     return (bool(set(FIX_THREAD_RE.findall(last)) & set(open_threads))
             or bool(converge.persistent(last, (), threads)))
 
 
 def review_findings_remain(last: str, threads: Sequence[Dict[str, Any]],
                            check: str, output: str) -> bool:
-    """Whether a fix round left a trusted thread or a blocking review check."""
-    if threads:
-        return _finding_survived(last, [str(t.get("id")) for t in threads], threads)
+    """Whether a trusted thread or a blocking review marking survived a fix round."""
+    if _finding_survived(last, [str(t.get("id")) for t in threads], threads):
+        return True
     title, _, summary = output.partition("\n")
     match = _REVIEW_MARKINGS_RE.search(title)
     return bool(match and int(match[1]) > 0 and not degraded_review(title, summary)
-                and check in converge.asked_checks(last))
+                and converge.repeated_review_marking(last, check, summary))
 
 
 def _end(thread: Dict[str, Any], field: str, index: int) -> Dict[str, Any]:
@@ -2097,6 +2097,7 @@ class Factory:
         self._merged_prs: Dict[str, Dict[int, int]] = {}
         # Each repo's open pull requests, read once a pass by _open_lane_pull.
         self._open_pulls: Dict[str, List[Dict[str, Any]]] = {}
+        self._closed_pulls: Dict[str, List[Dict[str, Any]]] = {}
         self._stack_checked: set = set()
         self._overlap_unknown: set = set()
         self._overlap_health: Dict[Tuple[str, int, str], bool] = {}
@@ -2771,20 +2772,25 @@ class Factory:
             return
         box_budget = no_change.active(comments) and bool(unproven_criteria(str(issue.get("body") or ""), ""))
         threads = self._trusted_open(repo, pr, open_threads)
-        if (not conflict_only and not box_budget
-                and self._review_stuck(pr, _last_fix(comments), threads)
-                and self.hold_review_split(repo, issue, comments)):
+        review_stuck = (not conflict_only and not box_budget
+                        and self._review_stuck(pr, _last_fix(comments), threads))
+        if review_stuck and self.hold_review_split(repo, issue, comments):
             return
         if checks_failing and not box_budget and self._past_no_change(repo, issue, comments):
             return
         age = self.now - _ts(pr.get("created_at"))
+        sha = str((pr.get("head") or {}).get("sha") or "")
+        failing_names = [str(r.get("name") or "") for r in self._runs.get(sha, [])
+                         if r.get("conclusion") in brain.FAILED_CONCLUSIONS]
         # A conflict alone is mechanical (the fix brief's runner merges the
         # base), so it never climbs, waits for a rung or closes the pull
         # request past the ladder, however old the pull request is
         # (loom#1963): a ready pull request that hand merges left
         # conflicting got no brief at all once its age read as stuck.
-        if (not conflict_only and not box_budget and stuck(comments, open_threads, checks_failing, age, self.now,
-                                        no_test, tuple(unticked) + tuple(unproven), threads)
+        if (not conflict_only and not box_budget
+                and (review_stuck or stuck(comments, open_threads, checks_failing, age, self.now,
+                                           no_test, tuple(unticked) + tuple(unproven), threads,
+                                           self.review_check, failing_names))
                 and not self._climb_or_stop(repo, pr, issue, comments, why)):
             return
         notes = TEST_NOTES if no_test else FIX_NOTES
@@ -2883,8 +2889,8 @@ class Factory:
         sha = str((pr.get("head") or {}).get("sha") or "")
         output = next((r.get("output") or {} for r in self._runs.get(sha, [])
                        if r.get("name") == self.review_check and r.get("conclusion") == "failure"), {})
-        return review_findings_remain(last, threads, self.review_check,
-                                     "%s\n%s" % (output.get("title") or "", output.get("summary") or ""))
+        return review_findings_remain(last, threads, self.review_check, "\n".join(
+            str(output.get(field) or "") for field in ("title", "summary", "text")))
 
     def hold_review_split(self, repo: str, issue: Dict[str, Any],
                           comments: Sequence[Dict[str, Any]]) -> bool:
@@ -5486,6 +5492,8 @@ class Factory:
             return "%s is claimed by the claim:%s label" % (ref, label_claim)
         if self._move_queued_refs_pr(repo, issue):
             return "%s has an open trusted pull request" % ref
+        if self._move_queued_merged_pr(repo, issue):
+            return "%s has a merged trusted pull request" % ref
         briefer_pr = self._briefer_refs_pr(repo, issue)
         if briefer_pr:
             reason = "an open pull request #%s names it" % briefer_pr
@@ -5574,6 +5582,37 @@ class Factory:
             return True
         return False
 
+    def _move_queued_merged_pr(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """Move a queued ticket to loom:merged when a merged same-repo PR from
+        a trusted author or briefer names it with a bare Refs line, so its work
+        is not given a lane again."""
+        number = int(issue["number"])
+        ref = "%s#%d" % (repo, number)
+        authors = self.trusted | self.briefers
+        for pr in self._closed_pull_requests(repo):
+            login = str((pr.get("user") or {}).get("login") or "").lower()
+            if (not pr.get("merged_at") or login not in authors
+                    or ((pr.get("head") or {}).get("repo") or {}).get("full_name") != repo
+                    or not self._refs_ticket(str(pr.get("body") or ""), number)):
+                continue
+            labels = brain._moved_labels(_labels(issue), "merged", "")
+            self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": labels})
+            issue["labels"] = [{"name": name} for name in labels]
+            _say("%s: linked pull request #%s is merged" % (ref, pr.get("number", "?")))
+            return True
+        return False
+
+    def _closed_pull_requests(self, repo: str) -> List[Dict[str, Any]]:
+        """The repo's most recently updated closed pull requests (first page
+        only), read once a pass for queued ticket checks."""
+        if repo not in self._closed_pulls:
+            rows = self.gh.rest("GET", "/repos/%s/pulls?state=closed&sort=updated"
+                                "&direction=desc&per_page=100" % repo).data
+            self._closed_pulls[repo] = [pr for pr in rows if isinstance(pr, dict)] \
+                if isinstance(rows, list) else []
+        return self._closed_pulls[repo]
+
     def _briefer_refs_pr(self, repo: str, issue: Dict[str, Any]) -> Any:
         """The number of an open same-repo pull request, opened by a
         LOOM_TRUSTED_BRIEFERS login, that names this ticket with a bare Refs
@@ -5613,7 +5652,8 @@ class Factory:
             self._waiting(repo, issue["number"], CAP_WAIT)
             return "waits: " + CAP_WAIT
         held = (self._brief_wait(repo, issue) or self._no_criteria(repo, issue)
-                or self._no_test(repo, issue) or self._no_split(repo, issue)
+                or self._live_only_wait(repo, issue) or self._no_test(repo, issue)
+                or self._no_split(repo, issue)
                 or self._no_area(repo, issue) or self._superseded_or_blocked(repo, issue))
         if held:
             return "waits: " + held
@@ -5681,6 +5721,31 @@ class Factory:
             _say("held queued %s#%d for the brain: no acceptance box names a test" % (repo, number))
         reason = "names no test in an acceptance box"
         self._waiting(repo, number, reason)
+        return reason
+
+    def _live_only_wait(self, repo: str, issue: Dict[str, Any]) -> str:
+        """Keep a live-only brief in the queue and record its hold once."""
+        reason = brief_check.live_only_hold(str(issue.get("body") or ""))
+        if not reason:
+            return ""
+        number = int(issue["number"])
+        self._waiting(repo, number, reason)
+        note = ("Held in the queue: %s. A lane can take it when the brief "
+                "names a buildable deliverable." % reason)
+        try:
+            if _lane(issue):
+                self._relabel(repo, issue, [name for name in _labels(issue)
+                                            if not name.startswith("lane:")])
+            allowed = status.logins(self.gh, self.trusted)
+            comments = status.expand(
+                self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)), allowed)
+            if not any(isinstance(c, dict) and c.get(status.EXPANDED) and c.get("body") == note
+                       and tickets._login(c.get("user")) in allowed for c in comments):
+                self._status_note(repo, number, note)
+        except (RateLimited, ShadowHeld):
+            raise
+        except GitHubError as err:
+            _say("could not record the live-only hold on %s#%d: %s" % (repo, number, err))
         return reason
 
     def _no_split(self, repo: str, issue: Dict[str, Any]) -> str:

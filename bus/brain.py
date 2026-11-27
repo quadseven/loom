@@ -6,6 +6,7 @@ import hashlib
 from collections import Counter
 import json
 import os
+from pathlib import Path
 import re
 import sys
 import threading
@@ -29,6 +30,7 @@ from .tickets import (FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket,
                       verify_handoff_source)
 from . import lane_markers, lane_state, tick_clock
 from . import brief_check, home_repo, incident_probe, state_store
+from .report_budget import plan as report_plan
 
 BRAIN_FIX_MARKER = "<!-- loom:brain-fix v1 -->"
 # A comment the brain posts to cancel a pending brain fix (loom#1998): the
@@ -2284,9 +2286,8 @@ def _check_brief_args(title: str, body: str, lane: Optional[str],
                          "bot's plan checks: " + "; ".join(found))
 
 
-def _check_live_criterion(body: str) -> None:
-    """A Live criterion names a check Loom can run by itself, or the brief
-    writes no Live box at all.
+def _check_live_criterion(body: str, *, allow_proof_request: bool = False) -> None:
+    """A Live criterion names a check Loom can run, or a proof request answers it.
 
     Owner ruling of 2026-11-19 (#3277): proof belongs in a test that runs in
     CI or a throwaway environment at build time, not in a live observation
@@ -2297,6 +2298,8 @@ def _check_live_criterion(body: str) -> None:
     bus/live_proof.py runnable_form reads. The one templated box of a health
     or friction intake ticket passes as written: the station's own absence
     tracking proves it."""
+    if allow_proof_request and tickets.has_proof_request(body):
+        return
     found = _LIVE_LINE.search(body or "")
     if not found:
         return
@@ -2307,11 +2310,12 @@ def _check_live_criterion(body: str) -> None:
     if " ".join(line.split(":", 1)[-1].split()) in templated:
         return
     if not live_proof.runnable_form(line):
+        alternative = ". A Proof: request under What can also answer the Live box" if allow_proof_request else ""
         raise ValueError(
-            "the Live criterion names no check Loom can run by itself. Write a Live box only "
-            "with one of: %s. Otherwise leave the Live box out and write a box that names the "
-            "test that proves the ticket: a test file path, or a command that runs in CI or a "
-            "throwaway environment" % "; ".join(live_proof.RUNNABLE_FORMS))
+            "the Live criterion names no check Loom can run by itself. Use one of: %s. "
+            "Otherwise write a box that names the test that proves the ticket: a test file path, "
+            "or a command that runs in CI or a throwaway environment%s"
+            % ("; ".join(live_proof.RUNNABLE_FORMS), alternative))
 
 
 def _check_test_named(body: str) -> None:
@@ -8438,6 +8442,16 @@ def _cmd_step_pending(gh: GitHub, args: argparse.Namespace) -> int:
     return 0 if go_on else 1
 
 
+def _cmd_report_plan(gh: GitHub, args: argparse.Namespace) -> None:
+    now = datetime.now(timezone.utc)
+    repo = _repo(args.lock_repo)
+    _lock_holder(gh, repo, args.holder, now)
+    record = tick_step(gh, repo)
+    if record.get("holder") != args.holder:
+        raise ValueError("report planning requires this holder's tick record")
+    print(json.dumps(report_plan(Path(args.state), record, args.owed, now, args.done)))
+
+
 def _cmd_step_budget(gh: GitHub, args: argparse.Namespace) -> None:
     print(tick_clock.budget_status(tick_step(gh, _repo(args.lock_repo)),
                                    datetime.now(timezone.utc)))
@@ -9819,6 +9833,12 @@ def parser() -> argparse.ArgumentParser:
     dn = sub.add_parser("done"); dn.add_argument("item"); dn.add_argument("--stage", choices=handoff.STAGES, required=True); dn.add_argument("--holder", required=True); dn.add_argument("--resolves", help="brief defer key this done finishes")
     sp = sub.add_parser("step-pending", help="exit 0, naming them, while tick steps are not run and the clock is open"); sp.add_argument("--lock-repo", default=lock_repo_default())
     sb = sub.add_parser("step-budget", help="the tick's elapsed minutes and whether a step may be deferred on budget"); sb.add_argument("--lock-repo", default=lock_repo_default())
+    rp = sub.add_parser("report-plan", help="retain owed reports and reserve time for tick work")
+    rp.add_argument("--state", required=True, help="queue file preserved across ticks")
+    rp.add_argument("--holder", required=True)
+    rp.add_argument("--lock-repo", default=lock_repo_default())
+    rp.add_argument("--owed", nargs="*", default=[], help="goal refs newly found owing a report")
+    rp.add_argument("--done", help="goal ref confirmed posted or no longer owing a report")
     rs = sub.add_parser("resume"); rs.add_argument("repos", nargs="+"); rs.add_argument("--holder", required=True); rs.add_argument("--lock-repo", default=lock_repo_default()); rs.add_argument("--repo-budget", type=float, metavar="SECONDS", help="per-repo read budget (default LOOM_REPO_BUDGET, else %g)" % per_repo.DEFAULT_BUDGET); rs.add_argument("--deadline", type=float, metavar="MINUTES", help="stop reading after MINUTES (default %g), name the repos not reached and exit %d" % (RESUME_DEADLINE_MINUTES, RESUME_PARTIAL_EXIT))
     st = sub.add_parser("step"); st.add_argument("name", nargs="?", choices=TICK_STEPS); st.add_argument("--note"); st.add_argument("--holder"); st.add_argument("--lock-repo", default=lock_repo_default()); st.add_argument("--show", action="store_true"); st.add_argument("--tick-minutes", type=int, help="with lock: the tick's own length when shorter than %d minutes (a bounded lane machine tick)" % tick_clock.TICK_MINUTES)
     sw = sub.add_parser("sweep"); sw.add_argument("--file", required=True, help="JSON list of sweep actions (docs/MUSE.md, step 9)"); sw.add_argument("--holder", required=True); sw.add_argument("--lock-repo", default=lock_repo_default())
@@ -9894,7 +9914,7 @@ def _cmd_brief(gh: GitHub, args: argparse.Namespace) -> None:
     _check_brief_difficulty(body, args.lane, args.difficulty)
     # Hand-written briefs only: health and friction intake are verified by
     # the station's own absence tracking, not by a log string.
-    _check_live_criterion(body)
+    _check_live_criterion(body, allow_proof_request=True)
     _check_test_named(body)
     refused = anthropic_floor_refusal(gh, args.lane, getattr(args, "lanes_repo", ""))
     if refused:
@@ -10067,7 +10087,7 @@ COMMANDS = {"status": _cmd_status, "brief": _cmd_brief, "move": _cmd_move,
             "defer": _cmd_defer, "done": _cmd_done, "resume": _cmd_resume,
             "onboard": _cmd_onboard, "escalate": _cmd_escalate, "epic": _cmd_epic,
             "close-epic": _cmd_close_epic, "step-budget": _cmd_step_budget,
-            "step-pending": _cmd_step_pending}
+            "step-pending": _cmd_step_pending, "report-plan": _cmd_report_plan}
 COMMANDS["step"] = _cmd_step
 COMMANDS["sweep"] = _cmd_sweep
 

@@ -183,6 +183,8 @@ class FakeGitHub:
             if number not in self.issues:
                 return Response(404, {"message": "Not Found"})
             return Response(200, self.issues[number])
+        if re.search(r"/pulls\?state=closed&sort=updated&direction=desc&per_page=100$", path):
+            return Response(200, [p for p in self.pulls.values() if p.get("state") == "closed"])
         m = re.search(r"/pulls/(\d+)$", path)
         if m:
             return Response(200, self.pulls[int(m.group(1))])
@@ -2737,7 +2739,7 @@ class ReviewBotThreads(Base):
         self.assertNotIn(("RESOLVE", "PRRT_1", None), self.gh.writes)
         self.assertEqual(self.merged, [])
 
-    def stuck_case(self, author, lane="codex", model=None):
+    def stuck_case(self, author, lane="codex", model=None, new_marking=None):
         """Ticket 5's last round asked about a finding at a.py:3; the open
         thread, under a new id, holds the same rule at a.py:5."""
         self.gh.ticket(5, "pr", lane=lane)
@@ -2749,10 +2751,19 @@ class ReviewBotThreads(Base):
         })
         if author is None:
             self.gh.pull(50, 5, green=False)
+            title = "Elder markings - 1 blocking, 1 total"
+            row = "| high | - | `a.py` | 24 | `%s` | %s |"
+            old_marking = row % ("missing-return", "The empty-input branch returns None.")
+            current = row % ("dropped-result", new_marking) if new_marking else old_marking
             self.gh.runs["sha50"][1].update(conclusion="failure", output={
-                "title": "Elder markings - 1 blocking, 1 total",
+                "title": title,
+                "summary": "## Markings Board\n\n" + current,
             })
-            finding = "### Check: %s\n\n    A blocking finding" % factory.DEFAULT_REVIEW_CHECK
+            finding = ("### Check: %s\n\n    %s\n    ## Markings Board\n\n    %s"
+                       % (factory.DEFAULT_REVIEW_CHECK, title, old_marking))
+            if new_marking is not None:
+                self.gh.runs["sha50"][0].update(name="lint", conclusion="success")
+                finding += "\n\n### Check: lint\n\n    Missing return type."
         else:
             self.gh.pull(50, 5, resolved=False)
             self.thread((author, "high | `rule-x` | quick win"))
@@ -2810,6 +2821,12 @@ class ReviewBotThreads(Base):
         self.run_second_review_rung(author=None)
         self.assertEqual(self.fixed, [])
         self.assertIn("needs-brain", [label["name"] for label in self.gh.issues[5]["labels"]])
+
+    def test_a_new_check_only_review_finding_does_not_climb_the_ladder(self):
+        self.stuck_case(None, new_marking="The new retry branch drops the result.")
+        self.assertEqual(factory.rung_of(self.gh.comments[5]), 0)
+        self.assertEqual(self.lane(5), "codex")
+        self.assertEqual([item[0] for item in self.fixed], [50])
 
     def test_a_stuck_send_back_past_the_last_rung_goes_to_the_hand_off_pool(self):
         self.stuck_case(BOT, lane="claude", model="claude-opus-5-5")

@@ -409,6 +409,64 @@ class StationStep(unittest.TestCase):
 
 
 class ZeroDoneDemotion(unittest.TestCase):
+    def test_unchanged_base_failure_is_recorded_without_demoting_the_lane(self):
+        with tempfile.TemporaryDirectory() as home:
+            root = Path(home)
+            failed = root / "briefs" / "spark" / "failed"
+            logs = root / "logs" / "spark"
+            failed.mkdir(parents=True)
+            logs.mkdir(parents=True)
+            brief = failed / "example-app-1.md"
+            brief.write_text("Model: example-model\n")
+            os.utime(brief, (NOW, NOW))
+            (logs / "example-app-1.log").write_text(
+                "[%s] example-app-1 failed: [factory] setup failed: base check exited 1 "
+                "on the unmodified repo at abc123; the agent did not run\n" % iso(NOW)
+            )
+            state = root / "state" / "station"
+            sc = scorecard.Scorecard(str(state), NOW, {"LOOM_LANE_ZERO_DONE_BRIEFS": "1"})
+            quiet(sc.refresh, None, [], [], BOT)
+            sc.save()
+
+            saved = scorecard.Scorecard(str(state), NOW)
+            self.assertEqual(saved.data["briefs"]["spark/example-app-1"]["outcome"], "env_error")
+            self.assertNotIn("spark", saved.demoted())
+            self.assertEqual(saved.brief_counts("spark"), (0, 0, 0))
+
+            (logs / "example-app-1.log").unlink()
+            saved.scan_briefs()
+            self.assertEqual(saved.data["briefs"]["spark/example-app-1"]["outcome"], "env_error")
+
+    def test_only_model_failures_count_toward_zero_done_demotion(self):
+        with tempfile.TemporaryDirectory() as home:
+            root = Path(home)
+            failed = root / "briefs" / "spark" / "failed"
+            logs = root / "logs" / "spark"
+            failed.mkdir(parents=True)
+            logs.mkdir(parents=True)
+            reasons = {
+                "setup": "[work] setup failed: dependency install exited 1; the agent did not run",
+                "sandbox": "[factory] validation environment unavailable: sandbox refusal",
+                "network": "[transient] clone or branch failed",
+                "quota": "[limit] out of credit",
+                "work": "[work] validation failed: the check exited 1 (base check exited 0)",
+            }
+            for name, reason in reasons.items():
+                brief = failed / (name + ".md")
+                brief.touch()
+                os.utime(brief, (NOW, NOW))
+                (logs / (name + ".log")).write_text("[%s] %s failed: %s\n" % (iso(NOW), name, reason))
+            unknown = failed / "unknown.md"
+            unknown.touch()
+            os.utime(unknown, (NOW, NOW))
+            sc = card(env={"LOOM_LANE_ZERO_DONE_BRIEFS": "2"})
+            sc.scan_briefs(home)
+
+            self.assertEqual(sc.brief_counts("spark"), (1, 0, 1))
+            self.assertNotIn("spark", quiet(sc.demote))
+            self.assertEqual(sc.data["briefs"]["spark/work"]["outcome"], "model_error")
+            self.assertEqual(sc.data["briefs"]["spark/sandbox"]["outcome"], "env_error")
+
     def test_lane_with_20_finished_briefs_and_0_done_is_demoted_and_gets_at_most_one_probe_brief_an_hour(self):
         """A test: a lane with 20 finished briefs and 0 done is demoted and gets at
         most one probe brief an hour; it fails on main."""
@@ -479,11 +537,12 @@ class ZeroDoneDemotion(unittest.TestCase):
         with open(os.path.join(home, "briefs", "zen", "failed", "t2.md"), "w") as fh:
             fh.write("limit\n")
         with open(os.path.join(home, "logs", "zen", "t2.log"), "w") as fh:
-            fh.write("failed: [limit] out of credit\n")
+            fh.write("[%s] t2 failed: [limit] out of credit\n" % iso(NOW))
         with open(os.path.join(home, "briefs", "zen", "failed", "t3.md"), "w") as fh:
             fh.write("work\n")
         with open(os.path.join(home, "logs", "zen", "t3.log"), "w") as fh:
-            fh.write("failed: [work] syntax error\n")
+            fh.write("[%s] t3 failed: [limit] out of credit\n" % iso(NOW - 3600))
+            fh.write("[%s] t3 failed: [work] validation failed: syntax error\n" % iso(NOW))
         sc = scorecard.Scorecard(state, NOW)
         sc.scan_briefs(home)
         total, done, limit = sc.brief_counts("zen")

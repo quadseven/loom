@@ -9,6 +9,7 @@ from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 from bus.github import GitHub, GitHubError
+from dashboard import views
 from dashboard.github import TicketStore
 
 
@@ -114,6 +115,46 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual(first["sources_carried"], [])
         self.assertEqual(set(second["sources_carried"]), set(first["source_read_at"]))
         self.assertIn("request budget ran low", second["dashboard_errors"][0])
+
+    def test_budget_floor_scoreboard_uses_fresh_tickets_with_carried_prs(self):
+        repo = REPOS[0]
+        issue_path = "/repos/%s/issues" % repo
+        difficulty, remaining = "easy", 900
+        calls = []
+
+        def transport(method, url, headers, body):
+            path = urlsplit(url)
+            calls.append(path.path)
+            if path.path == issue_path and parse_qs(path.query).get("labels") == ["loom:ticket"]:
+                issue = {"number": 1, "labels": [{"name": "loom:ticket"}],
+                         "body": "Difficulty: " + difficulty}
+                rate = {"x-ratelimit-remaining": str(remaining), "x-ratelimit-limit": "1000",
+                        "x-ratelimit-reset": str(int(time.time()) + 3600)}
+                return 200, rate, json.dumps([issue]).encode()
+            if path.path == "/repos/%s/pulls" % repo:
+                pr = {"number": 11, "state": "open",
+                      "body": "Loom ticket example-owner.one-1, lane codex, model sample-model.\n"}
+                return 200, {}, json.dumps([pr]).encode()
+            return 200, {}, b"[]"
+
+        with patch.dict(os.environ, {}, clear=True):
+            store = TicketStore([repo], gh=GitHub("", transport=transport), budget_floor=500)
+            store._waits_refreshed_at = float("inf")
+            store.refresh()
+            first = store.response()
+            self.assertEqual(first["scoreboard"]["easy"]["sample-model"]["open"], 1)
+            difficulty, remaining = "hard", 10
+            before = len(calls)
+            store.refresh()
+            second = store.response()
+            self.assertEqual(calls[before:], [issue_path])
+            self.assertIn("pull_requests", second["sources_carried"])
+            self.assertEqual(second["pull_requests"], first["pull_requests"])
+            self.assertEqual(set(second["scoreboard"]), {"hard"})
+            self.assertEqual(second["scoreboard"]["hard"]["sample-model"]["open"], 1)
+            with patch.object(views, "summarize_prs", side_effect=AssertionError("no source changed")):
+                store.refresh()
+            self.assertEqual(store.response()["scoreboard"], second["scoreboard"])
 
     def test_a_first_pass_below_the_floor_records_no_read_time(self):
         gh = HomeGitHub()

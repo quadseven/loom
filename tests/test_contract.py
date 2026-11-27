@@ -120,3 +120,32 @@ class AffectedContractTests(unittest.TestCase):
     def test_a_contract_with_only_an_affected_command_checks_nothing_else(self):
         self.assertEqual(contract.normalize("affected | ./per-dir.sh\n"),
                          "check: true\naffected: ./per-dir.sh\n")
+
+
+class AutoformatContractTests(unittest.TestCase):
+    """loom#3577: an autoformat command runs on the lane's changed files
+    before the final check, so it is kept apart from the check."""
+
+    def test_an_autoformat_line_passes_through_with_the_check(self):
+        text = "check: make test\naffected: scripts/affected.sh\nautoformat: uvx ruff@0.15.10 format\n"
+        self.assertEqual(contract.normalize(text), text)
+        self.assertEqual(contract.fields(text)["autoformat"], "uvx ruff@0.15.10 format")
+
+    def test_an_autoformat_pipe_line_or_table_is_not_joined_into_the_check(self):
+        pipes = ("test | python3 t.py | a.yml | tests\n"
+                 "autoformat | python3 -m black | b.yml | fmt\n")
+        self.assertEqual(contract.normalize(pipes),
+                         "interpreter: python3\ncheck: python3 t.py\nautoformat: python3 -m black\n")
+        tables = ('[test]\ncommand = "make t"\n\n[affected]\ncommand = "make affected"\n\n'
+                  '[autoformat]\ncommand = "make fmt"\n')
+        self.assertEqual(contract.normalize(tables),
+                         "interpreter: make\ncheck: make t\naffected: make affected\nautoformat: make fmt\n")
+
+    def test_a_contract_with_only_an_autoformat_command_checks_nothing_else(self):
+        self.assertEqual(contract.normalize("autoformat | ./fmt.sh\n"),
+                         "check: true\nautoformat: ./fmt.sh\n")
+
+    def test_two_autoformat_commands_join_in_order(self):
+        text = ('[[autoformat]]\ncommand = "a fmt"\n\n[[autoformat]]\ncommand = "b fmt"\n\n'
+                '[test]\ncommand = "make t"\n')
+        self.assertEqual(contract.fields(text)["autoformat"], "a fmt && b fmt")
