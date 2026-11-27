@@ -682,6 +682,131 @@ class Base(unittest.TestCase):
             return []
 
 
+class ReadinessPassTest(Base):
+    def add_ticket(self, number, *extra, state="queued", body=BODY_WITH_CRITERIA):
+        self.fake.add(number, state=state, body=body, created="2020-01-01T00:00:00Z")
+        issue = self.fake.issues[number]
+        issue["labels"] = [label for label in issue["labels"]
+                           if not label["name"].startswith("lane:")]
+        issue["labels"].extend({"name": name} for name in extra)
+        return issue
+
+    def test_a_station_pass_updates_pickability_and_reports_what_it_changed(self):
+        self.settings.claim_idle_hours = 24
+        self.add_ticket(11)
+        self.add_ticket(12, "claim:alice-example", "loom:pickable")
+        self.fake.timelines = {12: [dict(labeled("claim:alice-example", "alice-example"),
+                                        created_at="2020-01-02T00:00:00Z")]}
+        self.add_ticket(13, "loom:pickable")
+        self.fake.pulls = [{"number": 90, "state": "open", "body": "Refs #13",
+                            "head": {"ref": "external-change"}}]
+        self.add_ticket(14, "needs:human", "loom:pickable")
+        self.add_ticket(15, "loom:pickable", state="merged")
+        self.add_ticket(16, "loom:pickable", "wait:blocked")
+        self.add_ticket(17, "loom:pickable",
+                        body=BODY + "\n## Acceptance criteria\n- [ ] Live: Observe a deploy.\n")
+        self.add_ticket(18, "loom:pickable", state="failed")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.run_pass()
+        self.assertIn("loom:pickable", self.fake.names(11))
+        self.assertNotIn("claim:alice-example", self.fake.names(12))
+        self.assertIn("loom:readiness-done", self.fake.names(15))
+        for number in range(12, 19):
+            self.assertNotIn("loom:pickable", self.fake.names(number), number)
+        self.assertIn("%s: 1 ready, 1 claims cleared, 1 flagged done" % REPO,
+                      err.getvalue())
+
+    def test_one_unreadable_ticket_does_not_hide_the_rest_of_the_repo(self):
+        self.add_ticket(11)
+        self.add_ticket(12)
+
+        def transport(method, url, headers, body):
+            if urlsplit(url).path.endswith("/issues/11/timeline"):
+                return reply(404, {"message": "Not Found"})
+            return self.fake(method, url, headers, body)
+
+        runner = station.Station(GitHub("token", transport=transport), self.settings)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            runner.refresh_ticket_readiness()
+        self.assertNotIn("loom:pickable", self.fake.names(11))
+        self.assertIn("loom:pickable", self.fake.names(12))
+        self.assertIn("%s: 1 ready, 0 claims cleared, 0 flagged done" % REPO,
+                      err.getvalue())
+
+    def test_readiness_keeps_separate_counts_and_cadence_for_each_repo(self):
+        second_repo = "example-owner/second-repo"
+        self.settings.repos.append(second_repo)
+        self.add_ticket(11)
+        second = FakeGitHub()
+        second.add(11, state="shipped")
+
+        def transport(method, url, headers, body):
+            if "/repos/" + second_repo + "/" in url:
+                return second(method, url.replace(second_repo, REPO), headers, body)
+            return self.fake(method, url, headers, body)
+
+        now = time.time()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), mock.patch.dict(
+                os.environ, {"LOOM_SHADOW": "1", "LOOM_SHADOW_REPOS": second_repo}):
+            for offset in (0, 60, 3600):
+                runner = station.Station(GitHub("token", transport=transport),
+                                         self.settings, now=now + offset)
+                runner.refresh_ticket_readiness()
+        lines = [line for line in err.getvalue().splitlines() if "readiness: " in line]
+        self.assertEqual(len(lines), 4)
+        self.assertIn("%s: 1 ready, 0 claims cleared, 0 flagged done" % REPO, lines[0])
+        self.assertIn("%s: 0 ready, 0 claims cleared, 1 flagged done" % second_repo, lines[1])
+        self.assertTrue(all("0 ready, 0 claims cleared, 0 flagged done" in line for line in lines[2:]))
+
+    def test_readiness_resumes_after_a_full_batch(self):
+        self.add_ticket(11)
+        self.add_ticket(12)
+        now = time.time()
+        with mock.patch("bus.readiness.PER_REPO", 1):
+            station.Station(GitHub("token", transport=self.fake), self.settings,
+                            now=now).refresh_ticket_readiness()
+            self.assertIn("loom:pickable", self.fake.names(11))
+            self.assertNotIn("loom:pickable", self.fake.names(12))
+            station.Station(GitHub("token", transport=self.fake), self.settings,
+                            now=now + 3600).refresh_ticket_readiness()
+        self.assertIn("loom:pickable", self.fake.names(12))
+
+    def test_a_linked_merge_flags_done_until_the_ticket_is_requeued(self):
+        self.add_ticket(11)
+        self.fake.pulls = [{"number": 90, "state": "closed", "body": "Refs #11",
+                            "head": {"ref": "external-change"}, "base": {"ref": "main"},
+                            "merged_at": "2020-01-02T00:00:00Z", "merge_commit_sha": "a" * 40}]
+        now = time.time()
+        station.Station(GitHub("token", transport=self.fake), self.settings,
+                        now=now).refresh_ticket_readiness()
+        self.assertIn("loom:readiness-done", self.fake.names(11))
+        self.assertNotIn("loom:pickable", self.fake.names(11))
+        self.fake.timelines = {11: [dict(labeled("loom:queued", "alice-example"),
+                                        created_at="2020-01-03T00:00:00Z")]}
+        station.Station(GitHub("token", transport=self.fake), self.settings,
+                        now=now + 3600).refresh_ticket_readiness()
+        self.assertNotIn("loom:readiness-done", self.fake.names(11))
+        self.assertIn("loom:pickable", self.fake.names(11))
+
+    def test_a_timeline_reference_does_not_count_a_merge_to_a_side_branch(self):
+        self.add_ticket(11)
+        stamp = "2020-01-02T00:00:00Z"
+        self.fake.pulls = [{"number": 90, "state": "closed", "body": "Refs #11",
+                            "head": {"ref": "external-change"}, "base": {"ref": "release"},
+                            "merged_at": stamp, "merge_commit_sha": "a" * 40}]
+        self.fake.timelines = {11: [{"event": "cross-referenced", "source": {"issue": {
+            "number": 90, "state": "closed", "body": "Refs #11",
+            "repository_url": "https://api.github.com/repos/" + REPO,
+            "pull_request": {"merged_at": stamp},
+        }}}]}
+        station.Station(GitHub("token", transport=self.fake), self.settings).refresh_ticket_readiness()
+        self.assertNotIn("loom:readiness-done", self.fake.names(11))
+        self.assertIn("loom:pickable", self.fake.names(11))
+
+
 class StrayBriefTriageTest(Base):
     """loom#1821: a ticket the brief parser refuses for a header-like body
     line is moved to loom:triage once per body, with one marker comment
@@ -5184,7 +5309,8 @@ class CorruptStateTest(Base):
         # and stale live checks (loom#3509).
         # The factory release reads the queued wait:incident tickets the hold
         # ledger does not know, once every 15 minutes (loom#3573).
-        self.assertEqual(self.run_pass().requests, 25)
+        # The readiness step lists the repo's open tickets once an hour.
+        self.assertEqual(self.run_pass().requests, 26)
 
 
 class TicketsTest(unittest.TestCase):
@@ -6638,6 +6764,8 @@ class FixTest(Base):
         pulls = [p for p in self.fake.paths("GET") if "/pulls" in p]
         self.assertEqual(pulls, ["/repos/%s/pulls?head=example-owner:loom/12-fix-the-thing&state=all" % REPO,
                                  "/repos/%s/pulls?state=open&per_page=100" % REPO,
+                                 CLOSED_PULLS % REPO,
+                                 "/repos/%s/pulls?state=open&per_page=100" % REPO,
                                  CLOSED_PULLS % REPO])
 
     def failed_fix(self, log_lines, fix_body=FIX_BODY):
@@ -7368,8 +7496,8 @@ class RetryTest(Base):
             dict({"body": claim % "codex"}, **who)]
         self.run_pass()
         self.assertIn("loom:runaway", self.fake.names(12))
-        self.assertIn("Not counted as work attempts: 1 that ended [transient], [limit], [auth] or "
-                      "[factory].", self.bodies()[-1])
+        self.assertIn("Not counted as work attempts: 1 that ended [transient], [limit], [auth], "
+                      "[factory] or [operator].", self.bodies()[-1])
         # Each row says whether it counted: a brain read a limit row in the
         # one table as a counted attempt and filed a factory ticket for a
         # detector that was right (2026-10-21).
@@ -7521,7 +7649,7 @@ class RetryTest(Base):
                            "loom/12-fix-the-thing (CLOSED loom/12-fix-the-thing)",
                     attempt=1, fix=fix)
         self.run_pass()
-        self.assertEqual(self.fake.names(12), ["loom:ticket", "loom:queued"])
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "loom:queued", "loom:pickable"])
 
     def test_a_merged_ticket_is_never_held_as_a_runaway(self):
         self.failed(body=BODY_WITH_CRITERIA, reason="[work] agent made no commit on loom/12-fix-the-thing")
@@ -9841,7 +9969,8 @@ class NoChangeAnswerTest(Base):
         self.no_change(pulls=[{"number": 77, "state": "closed", "merged_at": "2030-01-01T00:00:00Z",
                                "merge_commit_sha": sha, "body": "Refs %s#12" % REPO,
                                "head": {"ref": "a-fix"}, "user": {"login": "carol-example"}}])
-        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:merged"])
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:merged",
+                                              "loom:readiness-done"])
         events = self.events()
         self.assertEqual(len(events), 1)
         self.assertTrue(events[0].startswith(NO_CHANGE_SAID.rstrip("\n")), events[0])
@@ -10286,8 +10415,9 @@ class OutcomeTest(Base):
         pulls = [p for p in self.fake.paths("GET") if "/pulls" in p]
         # Reconciliation reads the open pull requests (shared with PR
         # reviews) and one page of recently closed ones, never all of them.
+        # Readiness reads open and recent closed pull requests on the first pass.
         self.assertEqual(pulls, ["/repos/%s/pulls?head=example-owner:loom/12-fix-the-thing&state=all" % REPO]
-                         + ["/repos/%s/pulls?state=open&per_page=100" % REPO, CLOSED_PULLS % REPO] * 2)
+                         + ["/repos/%s/pulls?state=open&per_page=100" % REPO, CLOSED_PULLS % REPO] * 3)
 
     def test_done_without_a_pull_request_is_retried_not_reported(self):
         self.finished("done")
@@ -10324,6 +10454,18 @@ class OutcomeTest(Base):
         self.assertIn("could not open <path> (in <path> now", body)
         self.assertNotIn("example", body)
         self.assertNotIn("agent exited 1", body)
+
+    def test_an_operator_park_ends_the_claim_and_holds_the_ticket(self):
+        name = self.finished("failed")
+        self.fake.issues[12]["labels"].append({"name": "claim:" + AUTHORS[0]})
+        self.write(os.path.join(self.home, "logs", "codex", name + ".log"),
+                   "[t] %s failed: [operator] Models disagreed. Ask: How should ties be ordered?\n" % name)
+        self.run_pass()
+        self.run_pass()
+        self.assertEqual(set(self.fake.names(12)), {"loom:ticket", "loom:queued", "needs:human"})
+        events = [line for comment in self.fake.comments[12] if status.is_status(comment["body"])
+                  for _, line in status.parse(comment["body"])]
+        self.assertEqual(events, ["Lane codex stopped: [operator] decision needs an operator"])
 
     def limited(self, lane="spark", fix_body=None):
         self.fake.add(12, state="running", lane=lane,

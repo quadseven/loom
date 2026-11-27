@@ -52,7 +52,7 @@ class EndedRunTest(Base):
 
         self.run_pass()
 
-        self.assertEqual(set(self.fake.names(12)), {"loom:ticket", "loom:queued"})
+        self.assertEqual(set(self.fake.names(12)), {"loom:ticket", "loom:queued", "loom:pickable"})
         self.assertEqual(set(self.fake.names(13)),
                          {"loom:ticket", "loom:running", "lane:workersai"})
 

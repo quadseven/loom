@@ -563,7 +563,8 @@ summary_note() {
 # (its AGENTS.md rules), and another redid work its operator notes said had
 # shipped in other repos.
 work_note() {
-  printf '\n\n## How to work\n- Before you change anything, read the repo'"'"'s AGENTS.md and CLAUDE.md and the docs they point to: they state rules its CI enforces, such as which packages a test may import.\n- When the Operator notes or a merged pull request under Linked pull requests show the work is already done or belongs elsewhere, change nothing and say why in the Intent summary.\n- Work test-first, as the implement skill says: write the test the acceptance criteria name, run it and see it fail, make the change, run it and see it pass.\n- Before you finish, run the repo'"'"'s full test suite (or the validation check below) and fix what fails. A pull request with red checks comes straight back.\n- The review bot checks every change: keep each new function small (cyclomatic complexity under 15), never swallow an error, leave no dead code, keep docs and comments in step with the code, and write ASCII only.\n- Write American English spelling: enroll, color, behavior, canceled, organize, not enrol, colour, behaviour, cancelled, organise.\n- Do not poll pull request checks or reviews. Open or update the pull request, then stop; the station reads checks and hands work back.\n- For a public repo, use documentation-range IP addresses (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) in tests. If a range bound must appear deliberately, add leak-guard-allow to that line. In a public repo, never write a reference to another repo'"'"'s issue in the OWNER/NAME#<number> or NAME#<number> shape, not even a made-up one in a test fixture: write NAME#N, or add leak-guard-allow to that line when the shape is what the test is about.\n- Never commit a real person'"'"'s mail or street address, in any repo, private ones included: use example.com and an invented value in tests. The push is refused otherwise.\n- Add new files only where the ticket points: a new file the brief does not name, at the top level or under a new or hidden top-level directory, gets the commit refused and nothing pushed.\n- Commit your work. A run that ends with no commit fails the ticket, unless it says in the Intent summary why there is nothing to change.\n'
+  printf '\n\n## How to work\n- Before you change anything, read the repo'"'"'s AGENTS.md and CLAUDE.md and the docs they point to: they state rules its CI enforces, such as which packages a test may import.\n- If you are choosing a ticket, read its body and explain each skip. Start with loom:pickable when present. Skip goals, epics, trackers and tickets with open pull requests, active claims, person or other waits, or only live checks left. A claim is active if its holder acted in the last 24 hours or a stated wait still holds it.
+- Read the whole ticket first. Check the ticket'"'"'s premise in the current code before building. When the Operator notes or a merged pull request under Linked pull requests show the work is already done or belongs elsewhere, or the current code shows the problem is absent, write "nothing to change" and cite the code you checked in the Intent summary so the station can record the finding on the ticket.\n- Work test-first, as the implement skill says: write the test the acceptance criteria name, run it and see it fail, make the change, run it and see it pass.\n- Before you finish, run the repo'"'"'s full test suite (or the validation check below) and fix what fails. A pull request with red checks comes straight back.\n- The review bot checks every change: keep each new function small (cyclomatic complexity under 15), never swallow an error, leave no dead code, keep docs and comments in step with the code, and write ASCII only.\n- Write American English spelling: enroll, color, behavior, canceled, organize, not enrol, colour, behaviour, cancelled, organise.\n- Do not poll pull request checks or reviews. Open or update the pull request, then stop; the station reads checks and hands work back.\n- For a public repo, use documentation-range IP addresses (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) in tests. If a range bound must appear deliberately, add leak-guard-allow to that line. In a public repo, never write a reference to another repo'"'"'s issue in the OWNER/NAME#<number> or NAME#<number> shape, not even a made-up one in a test fixture: write NAME#N, or add leak-guard-allow to that line when the shape is what the test is about.\n- Never commit a real person'"'"'s mail or street address, in any repo, private ones included: use example.com and an invented value in tests. The push is refused otherwise.\n- Add new files only where the ticket points: a new file the brief does not name, at the top level or under a new or hidden top-level directory, gets the commit refused and nothing pushed.\n- Commit your work. A run that ends with no commit fails the ticket, unless it says in the Intent summary why there is nothing to change.\n'
 }
 
 # Lists the sandbox probes and out-of-path scratch files the agent added
@@ -787,9 +788,7 @@ compose_pr_body() {
   PLAN_GAPS=""
   if [ -f "$BRIEF" ]; then
     compose_pr_body_from "$BRIEF"
-    return
-  fi
-  if [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]] && recovered="$(mktemp "$TMPDIR/pr-brief.XXXXXX")" &&
+  elif [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]] && recovered="$(mktemp "$TMPDIR/pr-brief.XXXXXX")" &&
      timeout "$NET_TIMEOUT" gh api "repos/$REPO/issues/$ISSUE_NUMBER" 2>> "$LOG" |
        PYTHONPATH="$REPO_ROOT" python3 -B -c '
 import json, sys
@@ -805,6 +804,7 @@ print(render_brief(sys.argv[1], issue, sys.argv[2]))
     PR_BODY="$(pr_body /dev/null "$TICKET")" || return 1
   fi
   [ -z "${recovered:-}" ] || rm -f "$recovered"
+  [ -z "${DECISION_AUDIT:-}" ] || PR_BODY="$PR_BODY"$'\n\n## Lane decision\n\n'"$DECISION_AUDIT"
   return "$status"
 }
 
@@ -1408,13 +1408,17 @@ LOG_TAIL_OK=0
 post_park_note() {  # failure class, reason
   [ "${LOOM_LOG_TAIL:-on}" != off ] && [ "$LOG_TAIL_OK" = 1 ] || return 0
   [ -n "${GH_TOKEN:-}" ] || return 0
-  local class="${1:-work}" reason file scan=() rc=0 text
+  local class="${1:-work}" reason file scan=() rc=0 text limit=200 outcome=()
   case "$class" in limit|size|auth) return 0 ;; esac
+  if [ "$class" = operator ]; then
+    limit=1000
+    outcome=(--operator-ask)
+  fi
   [ -n "${ISSUE_NUMBER:-}" ] && [ -n "${REPO:-}" ] || return 0
   fresh_app_token || true
   file="$(mktemp "${TMPDIR:-/tmp}/loom-park-note.XXXXXX")" || return 0
   printf '%s\n' "${2:-}" | tr -d '\r' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' |
-    grep -m1 -v '^[[:space:]]*$' | cut -c1-200 |
+    grep -m1 -v '^[[:space:]]*$' | cut -c1-"$limit" |
     sed -E "s#(^|[[:space:]\"'(=])(~|\\\$HOME)?/[^[:space:]\"'():,]*#\\1<path>#g" > "$file"
   if [ "${REPO_PRIVATE:-}" = true ]; then
     scan=(--personal-data)
@@ -1426,13 +1430,17 @@ post_park_note() {  # failure class, reason
   [ "$rc" -eq 0 ] || echo "[$(date -u +%FT%TZ)] $TICKET: the leak scan refused the park reason or could not run (exit $rc)" >> "$LOG"
   reason="$(cat "$file")"; rm -f "$file"
   if [ "$rc" -eq 0 ] && [ -n "$reason" ]; then
-    text="The $LANE lane parked this ticket after a $class failure: $reason"
+    if [ "$class" = operator ]; then
+      text="$reason"
+    else
+      text="The $LANE lane parked this ticket after a $class failure: $reason"
+    fi
   else
     text="The $LANE lane parked this ticket after a $class failure; the reason was withheld by the leak scan."
   fi
   printf '%s\n' "$text" |
     upsert_sticky_comment "$REPO" "$ISSUE_NUMBER" "$LOG_TAIL_MARKER" outcome \
-      --headline "Outcome of the $LANE lane run for $TICKET" ||
+      --headline "Outcome of the $LANE lane run for $TICKET" ${outcome[@]+"${outcome[@]}"} ||
     echo "[$(date -u +%FT%TZ)] $TICKET: could not post the park note" >> "$LOG"
   return 0
 }
@@ -1454,6 +1462,7 @@ park() {
 # lanes/rewrite_agent.sh.
 # shellcheck source=lanes/agent_sandbox.sh
 . "$LOOM_ROOT/lanes/agent_sandbox.sh"
+. "$LOOM_ROOT/lanes/lane_decision.sh"
 
 # The agy lane's agent runs as the lane user, so that user's home is its real
 # home, not a scratch one. It may write only its tree, its TMPDIR, agy's state
@@ -4933,7 +4942,7 @@ run_agent() {
       workersai_request verify "$1" "$MODEL" "$WORKDIR/$TICKET.verify-response" "$LOOM_HOME"
     return $?
   fi
-  brief_text="$(cat "$1")$(work_note)$(validation_note)$(summary_note)"
+  brief_text="$(cat "$1")$(work_note)$(validation_note)$(summary_note)$(decision_note)${2:-}"
   if [ "$LANE" = spark ]; then
     brief_text="$brief_text
 
@@ -5330,6 +5339,7 @@ for BRIEF in "$INBOX"/*.md; do
   drop_run_scratch
   AGENT_GH_CALLS=""
   PR_BODY=""
+  DECISION_AUDIT=""
   PLAN_GAPS=""
   DROPPED_SCRATCH_FILES=""
   TICKET="$(basename "$BRIEF" .md)"
@@ -5640,6 +5650,19 @@ for BRIEF in "$INBOX"/*.md; do
   # runner is killed (a reinstall's bootout), the agent survives in its group,
   # and the next pass's stale-lock recovery above kills exactly that group.
   LOG_START="$(log_size)"
+  DECISION_FILE=""
+  if ! rm -f "$LOCK/decision-result"; then
+    release_heavy_repo
+    park "$BRIEF" "could not clear the decision result file" transient; continue
+  fi
+  case "$REPO_PRIVATE:$DELIVERABLE:$FIX_PR:$LANE:$MODEL:${LOOM_CLUSTER_RUNNER:-0}" in
+    false:::codex:gpt-*:0|false:::claude:claude-*:0)
+      DECISION_FILE="$TMPDIR/$TICKET.operator.json"
+      if ! rm -f "$DECISION_FILE"; then
+        release_heavy_repo
+        park "$BRIEF" "could not clear the decision scratch file" transient; continue
+      fi ;;
+  esac
   if ! agent_gh_config; then
     release_heavy_repo
     park "$BRIEF" "$AGENT_GH_WHY" transient; continue
@@ -5658,7 +5681,7 @@ for BRIEF in "$INBOX"/*.md; do
      build_jobs_export &&
      cd "$TREE" && unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN "${!LOOM_GITHUB_APP_@}" "${!GIT_CONFIG_@}" &&
       export GH_CONFIG_DIR="$AGENT_GH_CONFIG" && github_auth_agent_path &&
-      run_agent "$RUN_BRIEF") >> "$LOG" 2>&1 &
+      run_agent_with_decision "$RUN_BRIEF") >> "$LOG" 2>&1 &
     agent_pid=$!
     echo $agent_pid > "$LOCK/pgid"
     ( agent_watchdog "$agent_pid" "$LOG_START" "$LOG" ) &
@@ -5725,6 +5748,15 @@ for BRIEF in "$INBOX"/*.md; do
   # pod rather than fail it (keep_drained_run). The loop's next turn sees the
   # drain and ends the pass.
   if [ "$STATUS" -ne 0 ] && pod_draining; then keep_drained_run; continue; fi
+  if [ "$STATUS" -eq 0 ] && [ -s "$LOCK/decision-result" ]; then
+    { IFS= read -r DECISION_STATE; IFS= read -r DECISION_AUDIT; } < "$LOCK/decision-result"
+    case "$DECISION_STATE" in
+      agreed) ;;
+      operator) park "$BRIEF" "$DECISION_AUDIT" operator; continue ;;
+      retry) park "$BRIEF" "$DECISION_AUDIT" transient; continue ;;
+      *) park "$BRIEF" "could not read the lane decision outcome" transient; continue ;;
+    esac
+  fi
   # A spark run that ended because the box went hot is a limit, not a failure.
   if [ "$STATUS" -ne 0 ] && { [ "$LANE" = spark ] || [ "$LANE" = free ]; } && { spark_probe; [ $? -eq 1 ]; }; then
     mark_limit
