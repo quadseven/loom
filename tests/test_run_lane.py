@@ -6139,8 +6139,22 @@ fi
         self.assertTrue((inbox / "failed" / "T043-next.md").exists())
         self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
 
+    def pin_gateway_limit_clock(self):
+        # The shell computes the deadline before Python stamps the heartbeat.
+        # Keep those times apart so a delayed heartbeat cannot hide a bad test.
+        origin = int(time.time()) - 5
+        self.write_tool(self.bin / "date", f"""#!/bin/sh
+if [ "$#" -eq 1 ] && [ "$1" = +%s ]; then
+    printf '%s\\n' {origin}
+else
+    exec /bin/date "$@"
+fi
+""")
+        return origin
+
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_free_gateway_retry_after_sets_the_cluster_slot_hold(self):
+        origin = self.pin_gateway_limit_clock()
         inbox, result = self.api_lane(
             "free-openrouter", FAKE_CURL="503", FAKE_CURL_RETRY_AFTER="43200",
             LOOM_FREE_GATEWAY_URL="http://gateway.example.invalid")
@@ -6148,7 +6162,7 @@ fi
         self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
         beat = json.loads((self.loom / "state" / "usage" / "free-openrouter.json").read_text())
         self.assertFalse(beat["available"])
-        self.assertAlmostEqual(beat["retry_at"] - beat["at"], 43200, delta=2)
+        self.assertEqual(beat["retry_at"], origin + 43200)
         limit = (self.loom / "state" / "usage" / "free-openrouter.limit").read_text().split()
         self.assertEqual(int(limit[0]), beat["retry_at"])
         probes = sum(c.startswith("curl ") for c in self.calls())
@@ -6165,16 +6179,18 @@ fi
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_free_gateway_503_without_retry_after_uses_the_fallback(self):
+        origin = self.pin_gateway_limit_clock()
         _, result = self.api_lane(
             "free-openrouter", FAKE_CURL="503",
             LOOM_FREE_GATEWAY_URL="http://gateway.example.invalid")
         self.assertEqual(result.returncode, 0, result.stderr)
         beat = json.loads((self.loom / "state" / "usage" / "free-openrouter.json").read_text())
         self.assertFalse(beat["available"])
-        self.assertAlmostEqual(beat["retry_at"] - beat["at"], 900, delta=2)
+        self.assertEqual(beat["retry_at"], origin + 900)
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_free_gateway_retry_after_is_capped_at_one_day(self):
+        origin = self.pin_gateway_limit_clock()
         _, result = self.api_lane(
             "free-openrouter",
             FAKE_CURL="503",
@@ -6184,7 +6200,7 @@ fi
         self.assertEqual(result.returncode, 0, result.stderr)
         beat = json.loads((self.loom / "state" / "usage" / "free-openrouter.json").read_text())
         self.assertFalse(beat["available"])
-        self.assertAlmostEqual(beat["retry_at"] - beat["at"], 86400, delta=2)
+        self.assertEqual(beat["retry_at"], origin + 86400)
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_spark_run_cut_off_by_a_503_is_a_limit_not_a_failure(self):
