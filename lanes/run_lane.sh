@@ -3159,6 +3159,22 @@ CHECK_SLOT_HELD=""
 [[ "$CHECK_SLOT_POLL" =~ ^[0-9]+(\.[0-9]+)?$ ]] || CHECK_SLOT_POLL=5
 . "$LOOM_ROOT/lanes/host_load.sh" || exit 1
 
+# Keep the guard outside the slot directory and hold it through the rename.
+# The shell owns fd 9, so the flock survives the Python process taking it.
+reclaim_check_slot() (
+  local slot="$1" pid="$2"
+  python3 -IB -c '
+import fcntl
+try:
+    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    raise SystemExit(1)
+' 2>>"$LOG" || return 1
+  [ "$(cat "$slot/pid" 2>/dev/null)" = "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null && return 1
+  mv "$slot" "$slot.stale.$$" 2>/dev/null
+) 9>>"$CHECK_SLOT_DIR.guard"
+
 # Try each slot once; sets CHECK_SLOT_HELD and returns 0 on a take.
 try_check_slot() {
   local n slot pid
@@ -3174,9 +3190,8 @@ try_check_slot() {
     # A slot with no pid yet is being taken this instant; leave it.
     [[ "$pid" =~ ^[0-9]+$ ]] || continue
     kill -0 "$pid" 2>/dev/null && continue
-    # Stale: move it aside first (atomic), so a slot another waiter has just
-    # re-made is never the directory removed.
-    if mv "$slot" "$slot.stale.$$" 2>/dev/null; then
+    # Recheck under the guard: another waiter may already have reclaimed it.
+    if reclaim_check_slot "$slot" "$pid"; then
       echo "check slot $n was held by pid $pid, which is gone; reclaimed" >> "$LOG"
       rm -rf "$slot.stale.$$"
       if mkdir "$slot" 2>/dev/null; then
