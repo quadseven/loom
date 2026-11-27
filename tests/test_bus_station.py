@@ -16684,6 +16684,40 @@ class PaceTest(Base):
         self.assertIn("| agy | weekly | no reading |", body)
         self.assertIn("| copilot | - | no reading |", body)
 
+    def test_subscription_status_refuses_codex_observations_with_unknown_age(self):
+        from bus import meter
+
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        sessions = Path(self.home) / "sessions"
+        sessions.mkdir()
+        (sessions / "session.jsonl").write_text(json.dumps({
+            "type": "event_msg",
+            "payload": {"rate_limits": {"secondary": {"used_percent": 53,
+                        "window_minutes": 10080, "resets_at": runner.now + 3600}}},
+        }) + "\n")
+        missing_sessions = Path(self.home) / "unused-sessions"
+        forwarded = meter.codex_record(str(sessions), runner.now - 60)
+        meter_path = Path(self.home) / "state" / "usage" / "codex.meter.json"
+        for path in (sessions, missing_sessions):
+            with self.subTest(forwarded=path == missing_sessions):
+                meter.write(str(meter_path), forwarded)
+                rows = station.usage.codex_records(["codex"], path, runner.now, self.home)
+                station.usage.write(self.home, rows)
+                self.assertIn("| codex | weekly | no reading |", runner._lanes_body([]))
+
+        del forwarded["windows"][0]["at"]
+        meter.write(str(meter_path), forwarded)
+        rows = station.usage.codex_records(["codex"], missing_sessions, runner.now, self.home)
+        station.usage.write(self.home, rows)
+        self.assertIn("| codex | weekly | 53% |", runner._lanes_body([]))
+
+    def test_subscription_status_ignores_an_oversized_heartbeat_timestamp(self):
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        self.write(os.path.join(self.home, "state", "usage", "claude.json"),
+                   json.dumps({"at": 10 ** 400}))
+        self.assertIn("| claude | - | no reading | - | - | - | 0 of 1 |",
+                      runner._lanes_body([]))
+
     def test_changed_usage_republishes_inside_the_same_pace_band(self):
         self.settings.status_repo = REPO
         runner = station.Station(GitHub("token", transport=self.fake), self.settings)
