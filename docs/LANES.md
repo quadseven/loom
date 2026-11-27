@@ -2402,6 +2402,39 @@ cannot query the viewer or any other local service.
   --codex-sessions`), so a station that cannot see that Codex home still
   records Codex usage (loom#3630).
 
+### Holding a slot out of dispatch
+
+`LOOM_<SLOT>_HELD` keeps one slot of any lane from taking tickets, so a new
+slot can be deployed and checked before it works:
+
+```sh
+LOOM_CLAUDE_2_HELD=1 lanes/mac/install.sh claude-2
+```
+
+While it holds, every pass of `lanes/run_lane.sh` writes an unavailable
+heartbeat and runs nothing: no brief is read, no agent starts, and a brief
+already in the slot's inbox stays there. The reason names the setting:
+
+```
+held: LOOM_CLAUDE_2_HELD is set; the slot takes no tickets until it is cleared
+```
+
+The station reads a `held:` reason as parked, `Held by the operator
+(LOOM_<SLOT>_HELD)` in the lane status table, so the slot shows as present
+and held, not stale. It routes the slot no ticket and moves a ticket already
+briefed to it to another lane, as for a down lane. A hold is not a limit: it
+has no retry time and raises no lane-held invariant.
+
+Unset, empty, `0`, `false`, `no` or `off` (any case) mean not held; any other
+value holds, so a mistyped value holds rather than releases. To clear it,
+unset the setting or set it to `0` in the slot's environment (reinstall the
+slot's job, or edit the pod's env) and the next pass works as before.
+
+The setting is read for the slot's own name only, with no lane-wide
+fallback: `LOOM_CLAUDE_HELD` holds the `claude` slot alone, never
+`claude-2`, and `LOOM_CLAUDE_2_HELD` never holds `claude`. To hold every
+slot of a lane, set each slot's own name.
+
 ### One slot on opencode 2.0
 
 opencode 2.0's installer overwrites the one binary every opencode lane runs,
