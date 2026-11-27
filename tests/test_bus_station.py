@@ -16563,8 +16563,9 @@ class PaceTest(Base):
     the lane status shows used, elapsed and verdict per subscription."""
 
     def test_usage_upload_carries_one_summary_per_subscription(self):
-        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
-        now = runner.now
+        # The serialized same-tick observation rounds up to a microsecond.
+        now = 1_800_000_000.000_000_8
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings, now=now)
         base = {"provider": "codex", "lanes": ["codex"], "source": "lane meter",
                 "resets_at": station.usage._iso(now + 1000),
                 "as_of": station.usage._iso(now), "used_pct": 0}

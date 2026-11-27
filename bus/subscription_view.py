@@ -37,6 +37,8 @@ def _longest(records):
 
 
 def _reading(record, now, points):
+    # Meter timestamps are stored as ISO datetimes with microsecond precision.
+    now = round(now, 6)
     observed = usage._parse(record.get("observed_at") or record.get("as_of"))
     reset = usage._parse(record.get("resets_at"))
     elapsed = pace.elapsed_pct(reset, record.get("window_minutes"), now)
