@@ -1578,13 +1578,18 @@ WAITING_BRAIN_HEADING = "### Waiting on the brain"
 
 
 def _waiting_brain_lines(tickets: List[Dict[str, Any]], pr_of: Dict[int, Dict[str, Any]],
-                         data: Dict[str, Any], now: datetime, bot: str) -> List[str]:
+                         data: Dict[str, Any], now: datetime, bot: str,
+                         repo: str = "", authors: Optional[Sequence[str]] = None) -> List[str]:
     """Every open lane pull request whose ticket carries needs-brain, oldest
     first, with how long it has been open and what blocks its merge. The
     factory marks a ticket needs-brain when its fix rounds run out or a
     change is sensitive; a pull request that is neither sensitive nor green
     appears in no other section, so it sat until the lane-pr-stalled
-    invariant filed it (loom#1411)."""
+    invariant filed it (loom#1411).
+
+    A pull request whose head merge would refuse (a worker/ head by an
+    untrusted lane author) shows blocked instead of READY, using the same
+    _loom_head_ok rule merge applies."""
     rows = []
     for issue in tickets:
         pr = pr_of.get(int(issue["number"]))
@@ -1592,11 +1597,15 @@ def _waiting_brain_lines(tickets: List[Dict[str, Any]], pr_of: Dict[int, Dict[st
             continue
         rows.append((str(pr.get("created_at") or ""), issue, pr))
     lines = [WAITING_BRAIN_HEADING]
+    trusted_env = {"LOOM_BRIEF_AUTHORS": " ".join(authors or ())}
     for _, issue, pr in sorted(rows, key=lambda r: (r[0], int(r[2]["number"]))):
         old = "%dh old" % _age(pr, now) if _stamp(str(pr.get("created_at") or "")) else "age unknown"
+        node = data["prs"].get(int(pr["number"]))
+        text = merge_ready(node, bot)
+        if text == "READY" and not _loom_head_ok(repo, pr, node, trusted_env):
+            text = "blocked: pull request head is not a loom branch"
         lines.append("- #%s %s - ticket #%s - %s - %s" % (
-            pr["number"], pr.get("title", ""), issue["number"], old,
-            merge_ready(data["prs"].get(int(pr["number"])), bot)))
+            pr["number"], pr.get("title", ""), issue["number"], old, text))
     return lines if rows else lines + ["- none"]
 
 
@@ -1678,7 +1687,7 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     lines += [""] + _pull_request_lines(gh, repo, prs, data, bot, authors or (), check, caps,
                                         now, hold)
     lines += [""] + _sensitive_pr_lines(prs, gh, repo)
-    lines += [""] + _waiting_brain_lines(tickets, pr_of, data, now, bot)
+    lines += [""] + _waiting_brain_lines(tickets, pr_of, data, now, bot, repo, authors)
     lines += [""] + _past_rung_lines(past, pr_of, data, bot)
     lines += _claimed_pr_lines(repo, tickets, prs)
     lines += ["", ADOPT_HEADING]
