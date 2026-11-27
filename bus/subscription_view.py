@@ -3,7 +3,7 @@
 import json
 import math
 import re
-from collections.abc import Callable
+from typing import Callable, Optional
 
 from . import labels, pace, usage
 
@@ -96,7 +96,7 @@ def dashboard_records(home, records, now, *, persist=False):
     return result
 
 
-def read(home, now, env, records=None, *, slot_running_until: Callable[[str], float | None]):
+def read(home, now, env, records=None, *, slot_running_until: Callable[[str], Optional[float]]):
     """One row per subscription, including providers without a current meter."""
     groups = _subscription_groups()
     if records is None:
