@@ -542,13 +542,13 @@ def _resource_meter(w: dict[str, Any], now: datetime) -> str:
 def _unknown_meter(w: dict[str, Any], now: datetime) -> str:
     if w["kind"] == "run" and w.get("peak_mem_mib") is not None:
         return _resource_meter(w, now)
-    figure, detail = "Unknown", _unknown_note(w, now)
-    if w["used"] is not None and w["stale"]:
-        figure, detail = "No reading", _meter_detail(w, now)
+    # AI-REVIEW 2026-11-27 [nemotron-3.5-super-vl] PRRT_kwDOVESCW8683UZG (Elder, PR #3668):
+    # Missing and stale readings use the same label and keep their own explanations.
+    detail = _meter_detail(w, now) if w["used"] is not None and w["stale"] else _unknown_note(w, now)
     return ('<div class="um um-none"><span class="um-name">%s</span>'
             '<div class="um-bar um-unknown" aria-hidden="true"></div>'
-            '<p class="um-fig">%s</p><p class="um-detail">%s</p></div>'
-            % (html.escape(w["name"]), figure, html.escape(detail)))
+            '<p class="um-fig">No reading</p><p class="um-detail">%s</p></div>'
+            % (html.escape(w["name"]), html.escape(detail)))
 
 
 def _meter_detail(w: dict[str, Any], now: datetime) -> str:
