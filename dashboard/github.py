@@ -11,7 +11,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlsplit
 
@@ -31,6 +31,8 @@ GOAL_INFO_MAX = 200
 # Every pull request is read again this often (seconds); between those full
 # reads a pass reads only the pull requests updated since the last one (#686).
 PR_FULL_READ_SECONDS = 3600
+# Reconcile deletions and transfers once an hour. Other ticket reads use since.
+TICKET_FULL_READ_SECONDS = 3600
 # Every repo's open issues are read for the /free page this often (seconds):
 # one paginated list per repo (loom#685).
 FREE_ISSUES_SECONDS = 3600
@@ -331,6 +333,9 @@ class TicketStore:
         # updated_at read, "full_at": when every page was last read}.
         self._kept_prs: Dict[str, Dict[str, Any]] = {}
         self._kept_lock = threading.Lock()
+        # Each repo worker owns its cursor and source rows. Snapshot joins
+        # enrich copies, so a failed join cannot change the next read's input.
+        self._kept_tickets: Dict[str, Dict[str, Any]] = {}
         self._request_mark: Optional[Tuple[float, Dict[str, int], int]] = None
         # The backlog source reader, set by make_server (dashboard/server.py
         # _backlog_bytes): None reads nothing. (source, bytes or None, when).
@@ -481,11 +486,44 @@ class TicketStore:
         return reason
 
     def _read_repo(self, repo: str) -> List[Dict[str, Any]]:
-        # Every request goes through bus.github's transport, which applies its TIMEOUT.
-        issues = self.gh.paginate("/repos/%s/issues?labels=loom%%3Aticket&state=all" % quote(repo, safe="/"))
-        return [ticket_record(repo, item) for item in issues
-                if isinstance(item, dict) and "pull_request" not in item
-                and "loom:ticket" in _label_names(item)]
+        path = "/repos/%s/issues" % quote(repo, safe="/")
+        now = time.time()
+        started = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        kept = self._kept_tickets.get(repo)
+        if kept is None or now - kept["full_at"] >= TICKET_FULL_READ_SECONDS:
+            issues = self.gh.paginate(path + "?labels=loom%3Aticket&state=all")
+            rows = self._merge_ticket_issues(repo, {}, issues)
+            kept = {"rows": rows, "cursor": started, "full_at": now}
+        else:
+            # Include updates at the cursor's exact second. An unchanged
+            # cursor repeats the URL so the transport can reuse its ETag.
+            cursor = kept["cursor"]
+            since = (datetime.fromisoformat(cursor) - timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            # The unfiltered feed also reports a ticket losing loom:ticket.
+            issues = self.gh.paginate(path + "?state=all&sort=updated&direction=desc&since=" + since)
+            issues = [item for item in issues if isinstance(item, dict)]
+            newest = _newest_update(issues, cursor)
+            # An issue that moves to an earlier page during this read must
+            # remain in range on the next pass.
+            cursor = max(cursor, min(newest, started))
+            rows = self._merge_ticket_issues(repo, kept["rows"], issues)
+            kept = dict(kept, rows=rows, cursor=cursor)
+        self._kept_tickets[repo] = kept
+        ordered = sorted(rows.values(), key=lambda row: (row["created_at"] or "", row["number"]), reverse=True)
+        return [dict(row) for row in ordered]
+
+    @staticmethod
+    def _merge_ticket_issues(repo, previous, issues):
+        rows = dict(previous)
+        for item in issues:
+            if not isinstance(item, dict) or not isinstance(item.get("number"), int):
+                continue
+            number = item["number"]
+            if "pull_request" not in item and "loom:ticket" in _label_names(item):
+                rows[number] = ticket_record(repo, item)
+            else:
+                rows.pop(number, None)
+        return rows
 
     def _read_operator_items(self):
         items, human_counts = [], {}

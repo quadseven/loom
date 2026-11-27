@@ -9447,7 +9447,7 @@ echo fixed > fix.txt
         self.assertTrue(any(c.startswith("codex") for c in self.calls()))
         self.assertFalse(list((self.loom / "state" / "incidents").glob("*base-check")))
 
-    def slot_script(self, body, **env):
+    def slot_script(self, body, *, setup="", **env):
         """Run the runner's check-slot functions, as written in run_lane.sh,
         in a bash of their own with LOG and LOOM_HOME set. The load limits
         are off unless a test sets them, so the load of the machine running
@@ -9456,7 +9456,7 @@ echo fixed > fix.txt
         funcs = re.search(r"^CHECK_SLOTS=.*?^release_check_slot\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
         tmp = Path(self._tmp.name)
         return subprocess.Popen(
-            ["bash", "-c", "LOG=\"$SLOT_LOG\"\n" + funcs + body],
+            ["bash", "-c", "LOG=\"$SLOT_LOG\"\n" + funcs + setup + body],
             env={"PATH": "/usr/bin:/bin", "LOOM_ROOT": str(RUNNER.parent.parent), "LOOM_HOME": str(self.loom), "SLOT_LOG": str(tmp / "slots.log"),
                  "LOOM_CHECK_LOAD_1M": "0", "LOOM_CHECK_LOAD_5M": "0", **env},
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -9766,17 +9766,56 @@ echo fixed > fix.txt
     def test_two_checks_at_once_run_one_at_a_time_with_one_slot(self):
         # Fifteen lanes each started a full suite at once and drove the host
         # to load 130 (2026-11-07). One slot makes two checks take turns.
+        # A clean acquisition on macOS must also work without Python.
+        setup = "python3() { return 1; }\n" if sys.platform == "darwin" else ""
+        self.assert_check_slots_serialize(setup=setup)
+
+    def test_check_slots_serialize_when_mkdir_reports_a_false_success(self):
+        # Affected uutils mkdir: both callers see an absent slot, then the
+        # loser of mkdir(2) reports success because the directory now exists.
+        race = Path(self._tmp.name) / "mkdir-race"
+        race.mkdir()
+        self.assert_check_slots_serialize(
+            setup=r"""
+CHECK_SLOT_SYSTEM=Linux
+OSTYPE=darwin
+mkdir() {
+    if [ "$#" -ne 1 ] || [ "$1" != "$CHECK_SLOT_DIR/slot-1" ]; then
+        command mkdir "$@"
+        return
+    fi
+    [ ! -d "$1" ] || return 1
+    touch "$MKDIR_RACE/$$"
+    while [ "$(find "$MKDIR_RACE" -type f | wc -l)" -lt 2 ]; do sleep 0.01; done
+    command mkdir "$1" 2>/dev/null || [ -d "$1" ]
+}
+""",
+            MKDIR_RACE=str(race),
+        )
+
+    def assert_check_slots_serialize(self, *, setup="", **extra_env):
         tmp = Path(self._tmp.name)
         marks = tmp / "marks"
         body = ('acquire_check_slot || exit 3\n'
-                'echo "start" >> "$MARKS"\nsleep 1\n'
+                'echo "start" >> "$MARKS"\n'
+                'deadline=$((SECONDS + 10))\n'
+                'while [ "$SECONDS" -lt "$deadline" ] && '
+                '! grep -q "waiting for a check slot" "$LOG" 2>/dev/null && '
+                '[ "$(wc -l < "$MARKS")" -lt 2 ]; do sleep 0.02; done\n'
                 'echo "end" >> "$MARKS"\nrelease_check_slot\n')
-        env = {"LOOM_CHECK_SLOTS": "1", "LOOM_CHECK_SLOT_POLL": "0.1", "MARKS": str(marks)}
-        procs = [self.slot_script(body, **env) for _ in range(2)]
+        env = {"LOOM_CHECK_SLOTS": "1", "LOOM_CHECK_SLOT_POLL": "0.1",
+               "LOOM_CHECK_SLOT_WAIT": "15", "MARKS": str(marks)}
+        procs = [self.slot_script(body, setup=setup, **env, **extra_env) for _ in range(2)]
         outcomes = []
-        for proc in procs:
-            _, err = proc.communicate(timeout=60)
-            outcomes.append((proc.pid, proc.returncode, err))
+        try:
+            for proc in procs:
+                _, err = proc.communicate(timeout=30)
+                outcomes.append((proc.pid, proc.returncode, err))
+        finally:
+            for proc in procs:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.communicate()
         log_path = tmp / "slots.log"
         slot_log = log_path.read_text() if log_path.exists() else ""
         detail = f"Processes (PID, exit, stderr): {outcomes!r}\nSlot log:\n{slot_log}"
