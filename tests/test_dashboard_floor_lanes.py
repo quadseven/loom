@@ -130,6 +130,20 @@ class FloorGitHub:
         self.calls = []
         self.fail_delta = False
 
+    def _ticket_page(self, url, query):
+        label, since = query.get("labels"), query.get("since")
+        records = [row for row in reversed(self.issues.values())
+                   if (not since or row["updated_at"] > since)
+                   and (not label or {"name": label} in row["labels"])]
+        if query.get("sort") == "updated":
+            records.sort(key=lambda row: row["updated_at"], reverse=query.get("direction") == "desc")
+        size, page = int(query["per_page"]), int(query.get("page", 1))
+        response_headers = {}
+        if len(records) > page * size:
+            next_url = url.split("&page=", 1)[0] + "&page=%d" % (page + 1)
+            response_headers["Link"] = '<%s>; rel="next"' % next_url
+        return records[(page - 1) * size:page * size], response_headers
+
     def __call__(self, method, url, headers, body):
         parsed = urlsplit(url)
         query = {key: values[0] for key, values in parse_qs(parsed.query).items()}
@@ -143,16 +157,7 @@ class FloorGitHub:
             elif query.get("state") == "all" and label in (None, "loom:ticket"):
                 if since and not label and self.fail_delta:
                     return 403, {}, b'{"message":"fixture read failure"}'
-                records = [row for row in reversed(self.issues.values())
-                           if (not since or row["updated_at"] > since)
-                           and (not label or {"name": label} in row["labels"])]
-                if query.get("sort") == "updated":
-                    records.sort(key=lambda row: row["updated_at"], reverse=query.get("direction") == "desc")
-                size, page = int(query["per_page"]), int(query.get("page", 1))
-                if len(records) > page * size:
-                    next_url = url.split("&page=", 1)[0] + "&page=%d" % (page + 1)
-                    response_headers["Link"] = '<%s>; rel="next"' % next_url
-                records = records[(page - 1) * size:page * size]
+                records, response_headers = self._ticket_page(url, query)
                 if not since or label is None:
                     self.calls.append((since, headers.get("If-None-Match")))
         payload = json.dumps(records).encode()
