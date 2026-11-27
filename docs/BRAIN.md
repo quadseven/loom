@@ -1159,7 +1159,10 @@ pushes fixes to the existing branch. Before each round after the first, the
 station asks whether the last one moved anything (`bus/converge.py`): the same
 check names still failing, or a review-bot finding at the same path within 10
 lines under the same rule (a new thread id or check run id does not make it
-new), is a stuck round. A stuck round climbs the model ladder at once
+new), is a stuck round. For high or critical findings reported only in
+Elder's Markings Board, the factory and station compare the file, line and
+rule columns using the same matching rule as inline findings. A stuck round
+climbs the model ladder at once
 (`factory.Factory._climb`, which keeps the model and private-repo rules); a
 new finding is progress and stays on its lane. `LOOM_FIX_ROUNDS` caps the
 rounds per rung (default 3). With no rung left above a stuck round, or the cap

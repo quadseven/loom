@@ -4522,6 +4522,34 @@ class StuckFixRoundTest(unittest.TestCase):
         self.assertNotIn("lane:claude", self.names())
         self.assertIn("loom:briefed", self.names())
 
+    def test_a_new_check_only_review_finding_stays_on_its_lane(self):
+        self.last_round("### Check: Grug - Elder\n\n"
+                        "    Elder markings - 1 blocking, 1 total\n"
+                        "    ## Markings Board\n\n"
+                        "    | high | - | `bus/a.py` | 24 | `missing-return` | Returns None. |")
+        finding = "| high | - | `bus/a.py` | 24 | `dropped-result` | The new retry drops the result. |"
+        self.run_hand_back(checks=[(factory.DEFAULT_REVIEW_CHECK,
+                                   "Elder markings - 1 blocking, 1 total\n\n"
+                                   "## Markings Board\n\n" + finding)])
+        self.assertIn("lane:spark", self.names())
+        self.assertIn("loom:briefed", self.names())
+        self.assertEqual(len(self.rounds()), 2)
+        self.assertIn(finding, self.rounds()[-1]["body"])
+
+    def test_a_check_only_review_finding_can_survive_alongside_a_new_thread(self):
+        self.last_round("### Check: Grug - Elder\n\n"
+                        "    Elder markings - 1 blocking, 1 total\n"
+                        "    ## Markings Board\n\n"
+                        "    | \U0001f525 high | - | `bus/a.py` | 24 | `missing-return` | Returns None. |")
+        finding = "| \U0001f525 high | - | `bus/a.py` | 27 | `missing-return` | Empty input returns None. |"
+        self.run_hand_back(checks=[(factory.DEFAULT_REVIEW_CHECK,
+                                   "Elder markings - 2 blocking, 2 total\n\n"
+                                   "## Markings Board\n\n" + finding)],
+                           threads=[self.thread("PRRT_new", 59, "resource-leak")])
+        self.assertIn("lane:claude", self.names())
+        self.assertIn("loom:briefed", self.names())
+        self.assertIn(finding, self.rounds()[-1]["body"])
+
     def test_a_plan_check_only_failure_is_left_for_the_factorys_body_repair(self):
         # The factory rebuilds the body for a plan-check-only failure
         # (loom#1837); the hand-back sends no round and judges nothing stuck.
