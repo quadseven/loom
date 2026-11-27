@@ -16656,10 +16656,15 @@ class PaceTest(Base):
 
     def test_subscription_status_ignores_an_oversized_heartbeat_timestamp(self):
         runner = station.Station(GitHub("token", transport=self.fake), self.settings)
-        self.write(os.path.join(self.home, "state", "usage", "claude.json"),
+        station.usage.write(self.home, [
+            {"provider": "codex", "lanes": ["codex", "codex-2"], "window": "weekly",
+             "window_minutes": 10080},
+        ])
+        self.write(os.path.join(self.home, "state", "usage", "codex-2.json"),
                    json.dumps({"at": 10 ** 400}))
-        self.assertIn("| claude | - | no reading | - | - | - | 0 of 1 |",
-                      runner._lanes_body([]))
+        with mock.patch.dict(os.environ, {"LOOM_PACE_MAX_CODEX": ""}):
+            self.assertIn("| codex | weekly | no reading | - | - | - | 1 of 2 |",
+                          runner._lanes_body([]))
 
     def test_changed_usage_republishes_inside_the_same_pace_band(self):
         self.settings.status_repo = REPO
