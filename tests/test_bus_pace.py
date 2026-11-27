@@ -46,6 +46,12 @@ class VerdictTest(unittest.TestCase):
         self.assertIsNone(pace.elapsed_pct(NOW + 2 * WEEK * 60, WEEK, NOW))
         self.assertIsNone(pace.elapsed_pct(reset, None, NOW))
 
+    def test_elapsed_share_rejects_unrepresentable_window_lengths(self):
+        reset = NOW + WEEK * 60
+        for minutes in (10 ** 400, 1e308, float("inf")):
+            with self.subTest(minutes=minutes):
+                self.assertIsNone(pace.elapsed_pct(reset, minutes, NOW))
+
     def test_slack_setting(self):
         self.assertEqual(pace.slack({}), 10.0)
         self.assertEqual(pace.slack({"LOOM_PACE_SLACK": "5"}), 5.0)
