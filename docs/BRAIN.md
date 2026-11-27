@@ -80,6 +80,8 @@ decides who acts:
 | `loom:goal` | The goal's home issue. |
 | `loom:backlog` | With `loom:goal`: the goal home that holds the repo's whole backlog (docs/NAMING.md). |
 | `loom:ticket` | Every ticket issue. |
+| `loom:pickable` | The station found a candidate for a worker to read and check in the code. |
+| `loom:readiness-done` | The station found merged work or a completed state. Review the ticket for verification. |
 | `loom:queued` | Ready ticket with no lane yet. After claims, the station gives it a free lane of its Difficulty tier, by priority then oldest; a future `Not before:` or missing Difficulty keeps it queued. |
 | `loom:briefed` | Assigned to the lane named by its single `lane:<name>` label; waiting for the station. An `After:` line holds it there until the tickets it names are merged. |
 | `loom:running` | A lane has claimed the ticket. The station clears a local run's running label when it reports the outcome, and its lane label too when the ticket goes back to the queue; a ticket at `loom:pr` or `loom:failed` keeps its lane label for fix rounds and the model ladder. Each pass requeues stale running tickets with no local brief or pending outcome. |
@@ -1825,26 +1827,35 @@ no-lane reasons and dropped when a lane takes it), and the factory acts on it:
 
 ## Picking a ticket to work
 
-A worker told to take a ready ticket reads the tickets and decides by
-reading. It does not trust a label, because the same label means different
-things in different repos, and some repos carry no ready label at all (a
-Loom ticket waiting for a lane carries `loom:queued`, not a ready marker).
+A worker told to take a ready ticket starts with `loom:pickable` candidates
+when available, and also reads the open tickets when the marker is missing
+or the candidates are unsuitable. Repos may use different queue labels.
 The rule for any session that picks work, in the order it applies:
 
-1. List the open issues and read their bodies, not only their labels.
-2. Skip, and say why in the report, a ticket that: has an open pull request
-   naming it; is an epic, goal or tracker; carries `needs:human` or
-   `wait:blocked`; has a claim label whose holder acted in the last 24 hours
-   (a claim whose holder has been silent longer is stale and may be taken);
-   has only live or production boxes left; or needs a person, a credential
-   or a purchase.
+1. List the open issues and read their bodies.
+2. Skip epics, goals, trackers and tickets with an open pull request,
+   `needs:human`, `wait:blocked`, or only live or production boxes left.
+   Skip any ticket that needs a person, a credential or a purchase.
+   Respect a claim while its holder has acted in the past 24 hours or a
+   stated wait still holds it. Give the reason for each skip in the report.
 3. Check the ticket's premise in the code before building. If the described
-   problem is not there, or the work already merged, write that finding in
-   the report and take the next ticket. No pull request is opened for it.
+   problem is absent or the work already merged, record the finding on the
+   ticket with the code you checked, include it in the report, and take the
+   next ticket. An assigned lane records the finding through its no-change
+   Intent summary, which the station reports on the ticket.
 4. Build the smallest change that meets the code boxes, with a test that
    fails before the change.
 
-This rule lives here so it does not depend on any one session's prompt.
+The station's `refresh_ticket_readiness` step scans the open Loom tickets
+in each configured repo, up to 40 per repo per hour, resuming by issue number
+on a larger backlog. It checks for open pull requests, claims, person waits,
+and work already merged. It removes stale pickability labels and clears this
+Loom's inactive claims using `LOOM_CLAIM_IDLE_HOURS` (24 by default). It
+checks a released ticket again on a later pass. Tickets with only live
+checks left stay off the build list. Each repo's log line counts newly
+marked candidates, cleared claims, and newly flagged done tickets. Both
+labels are advisory. The worker still checks the code, and verification
+still follows the ticket's existing lifecycle.
 
 ## needs-brain holds nothing answers
 

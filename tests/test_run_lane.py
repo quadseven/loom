@@ -1665,6 +1665,14 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         prompt = "\n".join(self.calls())
         self.assertIn("real person's mail or street address", prompt)
 
+    def test_the_build_prompt_checks_the_ticket_premise_before_editing(self):
+        self.drop_brief()
+        self.run_lane()
+        prompt = "\n".join(self.calls())
+        self.assertIn("If you are choosing a ticket, read its body and explain each skip", prompt)
+        self.assertIn("Check the ticket's premise in the current code before building", prompt)
+        self.assertIn("cite the code you checked in the Intent summary", prompt)
+
     def test_files_the_brief_names_commit_and_push_normally(self):
         self.drop_brief(text=BRIEF.replace(
             "Make the thing work.",

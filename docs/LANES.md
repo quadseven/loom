@@ -36,7 +36,9 @@ never merges. Heartbeats usage + model catalog to `state/usage/<lane>.json`.
 ## How a lane is told to work
 
 After its brief, every agent gets a "How to work" note (lanes/run_lane.sh
-`work_note`): work test-first (write the failing test, see it fail, fix,
+`work_note`): read the ticket, check its premise in the current code, and
+cite what it read in the Intent summary if there is no change to make.
+Then work test-first (write the failing test, see it fail, fix,
 see it pass), run the full suite or the validation check before finishing,
 follow the review bot's checklist (new functions under cyclomatic
 complexity 15, no swallowed errors, no dead code, docs in step, ASCII
