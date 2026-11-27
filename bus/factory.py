@@ -386,8 +386,9 @@ ANTHROPIC = ("anthropic",) + tuple("anthropic-%d" % n for n in range(2, 9))
 # waited "no free lane in tier" (tests/test_bus_codex_slots.py).
 CODEX = ("codex",) + tuple("codex-%d" % n for n in range(2, 17))
 # The claude lane and claude-2, a second subscription on its own sign-in
-# (labels.SLOTS). Every list and rung that names claude names both, for the
-# reason CODEX does (tests/test_bus_claude_slots.py).
+# (labels.SLOTS). LANE_ORDER names both, so a queued ticket reaches either; the
+# LADDER rungs still name claude alone, so a climbing ticket keeps the rung
+# rules the factory tests pin (tests/test_bus_claude_slots.py).
 CLAUDE = ("claude", "claude-2")
 # The slots that draw on one API credit: an empty credit holds all of them.
 # run_lane.sh reads this set (`python3 -m bus.factory credit-slots`).
@@ -406,9 +407,9 @@ SHARED_CREDIT = ANTHROPIC
 # (docs/USAGE_ROUTING.md, "October 2026 price changes"); it is not a rung,
 # because a climb is the work that most needs the strong model.
 LADDER: Tuple[Tuple[Tuple[str, ...], str], ...] = (
-    (CLAUDE, "claude-sonnet-5-5"),
+    (("claude",), "claude-sonnet-5-5"),
     (CODEX, "gpt-6-luna"),
-    (CLAUDE + ANTHROPIC, "claude-opus-5-5"),
+    (("claude",) + ANTHROPIC, "claude-opus-5-5"),
 )
 # Every lane may try every ticket (operator, 2026-11-24, loom#3550): one list
 # for all work, cheapest first (docs/MUSE.md, Lane choice; the doc test reads

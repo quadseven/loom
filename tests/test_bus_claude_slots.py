@@ -19,11 +19,17 @@ class ClaudeSlotsTest(unittest.TestCase):
         self.assertEqual(factory.CLAUDE, ("claude", "claude-2"))
         for slot in slots:
             self.assertIn(slot, factory.LANE_ORDER)
-            for model in ("claude-sonnet-5-5", "claude-opus-5-5"):
-                rung = next(lanes for lanes, m in factory.LADDER if m == model)
-                self.assertIn(slot, rung, model)
         order = factory.LANE_ORDER
         self.assertEqual(order.index("claude-2"), order.index("claude") + 1)
+
+    def test_the_ladder_rungs_still_name_claude_alone(self):
+        # A ticket climbing the ladder stays on claude: claude-2 takes queued
+        # work by LANE_ORDER only, so the rung behaviour the factory tests pin
+        # (a one-lane rung at its limit waits or climbs) does not change.
+        for model in ("claude-sonnet-5-5", "claude-opus-5-5"):
+            rung = next(lanes for lanes, m in factory.LADDER if m == model)
+            self.assertIn("claude", rung, model)
+            self.assertNotIn("claude-2", rung, model)
 
     def test_claude_2_runs_the_claude_models_and_never_a_retry(self):
         self.assertTrue(station.lane_takes_model("claude-2", "claude-opus-5-5"))
@@ -31,6 +37,7 @@ class ClaudeSlotsTest(unittest.TestCase):
         # claude is never chosen to retry: it spends a subscription.
         self.assertNotIn("claude-2", station.RETRY_ORDER)
         self.assertIn("claude-2", station.model_lanes("claude-opus-5-5"))
+        self.assertIn("claude-2", station.model_lanes("claude-sonnet-5-5"))
 
 
 if __name__ == "__main__":
