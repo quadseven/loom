@@ -159,9 +159,6 @@ ISSUE_LINE_RE = re.compile(r"^Issue: ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+)[
 # planned and stopped holding it.
 AFTER_RELEASE_RE = re.compile(r"^<!-- loom:after-release ([0-9]+) -->")
 FAILED_RE = re.compile(r"\bfailed: (.*)$")
-# The line lanes/run_lane.sh park writes: "[time] <ticket> failed: [class] reason".
-# _failure_reason prefers it to any other line that merely holds "failed: ".
-LANE_FAILED_RE = re.compile(r"^\[[^\]]*\] \S+ failed: (\[[A-Za-z-]+\] .*)$")
 # The runner's reason when a lane run ends with nothing committed.
 NO_COMMIT = "agent made no commit"
 # Elder review check output parsing: individual markings like "removed-guarded-path"
@@ -11279,9 +11276,9 @@ class Station:
         try:
             with open(log, encoding="utf-8", errors="replace") as fh:
                 for line in fh:
-                    m = LANE_FAILED_RE.match(line.rstrip("\r\n"))
-                    if m:
-                        own = m.group(1)
+                    m = scorecard.LANE_FAILED_RE.match(line.rstrip("\r\n"))
+                    if m and m[1] == name:
+                        own = m[2]
                     m = FAILED_RE.search(line)
                     if m:
                         reason = m.group(1)

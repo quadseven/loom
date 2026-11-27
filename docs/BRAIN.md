@@ -2771,6 +2771,14 @@ repo that cannot be read keeps its records, and nothing is cleared by an
 error. The table goes on the lane status comment, and the dashboard's Lanes
 page shows it as Scorecard.
 
+The hourly refresh also reads the finished briefs and their runner logs.
+Each failed brief's final park line determines whether it was a `model_error`
+or an `env_error`. A red check on the unchanged base, a setup failure,
+or a runner interruption is excluded from zero-done demotion. Provider
+limits are counted separately. A missing park line leaves the outcome
+unknown unless the scorecard already recorded it. Only recorded work
+failures count toward the zero-done threshold.
+
 Each merged record also gets a settled difficulty (`bus/difficulty.py`),
 scored blind from the merged work alone: the diff's changed lines and files,
 the fix rounds sent back and the review findings, never the ticket's
