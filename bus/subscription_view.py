@@ -88,10 +88,66 @@ def _account_records(home, provider, now, *, persist):
     return records
 
 
+def _codex_meter_windows(home, slots, now):
+    for slot in slots:
+        try:
+            yield from usage._meter_records("codex", home, [slot], now)
+        except (TypeError, ValueError, OverflowError, OSError):
+            continue
+
+
+def _with_forwarded_codex(home, records, slots, now):
+    """Supply the display's missing or unusable Codex windows from the lane meters."""
+    if not slots:
+        return records
+    missing = dict.fromkeys(window for _, window in usage._CODEX_WINDOWS)
+    for index, row in enumerate(records):
+        window = row.get("window")
+        if row.get("provider") != "codex" or not isinstance(window, str) or window not in missing:
+            continue
+        if _reading(row, now, 0)["used_pct"] is None:
+            missing[window] = index
+        else:
+            del missing[window]
+    if not missing:
+        return records
+    available = {}
+    for row in _codex_meter_windows(home, slots, now):
+        window = row["window"]
+        if window not in missing or _reading(row, now, 0)["used_pct"] is None:
+            continue
+        index = missing[window]
+        if index is not None:
+            minutes = pace._number(records[index].get("window_minutes"))
+            if minutes is not None and minutes > 0 and minutes != row["window_minutes"]:
+                continue
+        observed = usage.observation_time(row)
+        if window not in available or observed > available[window][0]:
+            available[window] = (observed, row)
+    if not available:
+        return records
+    result = list(records)
+    for window, (_, row) in available.items():
+        index = missing[window]
+        fields = {key: row[key] for key in ("used_pct", "resets_at", "observed_at", "window_minutes")}
+        if index is None:
+            template = usage._record("codex", slots, window, None, None, "percent", None,
+                                     "codex lane meter", now)
+            template.update(host=usage.this_host(), holds=usage.lane_holds(home, slots))
+            result.append({**template, **fields})
+        else:
+            result[index] = {**records[index], **fields, "source": "codex lane meter", "note": None}
+    return [row for row in result
+            if (row.get("provider"), row.get("window")) != ("codex", "all")]
+
+
 def dashboard_records(home, records, now, *, persist=False):
     """Read account windows separately, saving limit history only during collection."""
-    result = [record for record in records if record.get("provider") != "claude"]
-    for slot in usage._provider_groups(labels.LANES).get("claude", []):
+    groups = usage._provider_groups(labels.LANES)
+    result = _with_forwarded_codex(
+        home, [record for record in records if record.get("provider") != "claude"],
+        groups.get("codex", []), now)
+    for slot in groups.get("claude", []):
         result.extend(_account_records(home, slot, now, persist=persist))
     return result
 
