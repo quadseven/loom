@@ -25,6 +25,12 @@ import subprocess
 import sys
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
+# The leak scanner's cross-repo reference shape: [owner/]name#N. It lives here,
+# not in bus/factory.py, so bus.pr_repair.public_refs (one runner call a pass)
+# and bus.journal read it without importing the factory (#3662).
+SCAN_REF_RE = re.compile(r"(?<![\w/-])(?:([a-z0-9][a-z0-9._-]*)/)?"
+                         r"([a-z][a-z0-9_]*(?:-[a-z0-9]+)*[a-z0-9])#(\d+)\b", re.I)
+
 # The section heading a body carries, and the spellings a lane may use.
 HEADING = "Bugs discovered"
 _HEADINGS = ("bugs discovered", "bugs found", "found bugs", "discovered bugs")
