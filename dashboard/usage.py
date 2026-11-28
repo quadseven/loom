@@ -452,18 +452,19 @@ def _daily_rows(by_name: dict[str, list[dict[str, Any]]], now: datetime) -> list
     for provider in daily_allowance.PROVIDER_UNITS:
         for reading in by_name.get(provider, []):
             saved = reading.get("daily_allowance")
-            if not isinstance(saved, dict) or saved.get("provider") != provider:
-                continue
-            row = daily_allowance.refresh(provider, saved, now.timestamp())
-            label, amount, reset, pacing = daily_allowance.cells(row)
-            detail = "No reading."
-            if reset is not None:
-                reset_text = datetime.fromisoformat(reset).strftime("%Y-%m-%d %H:%M UTC")
-                detail = "%s used. Resets %s." % (amount, reset_text)
-                if pacing is not None:
-                    detail += " " + _sentence(pacing)
-            out.append((label, detail))
-            break
+            if isinstance(saved, dict) and saved.get("provider") == provider:
+                break
+        else:
+            saved = {}
+        row = daily_allowance.refresh(provider, saved, now.timestamp())
+        label, amount, reset, pacing = daily_allowance.cells(row)
+        detail = "No reading."
+        if reset is not None:
+            reset_text = datetime.fromisoformat(reset).strftime("%Y-%m-%d %H:%M UTC")
+            detail = "%s used. Resets %s." % (amount, reset_text)
+            if pacing is not None:
+                detail += " " + _sentence(pacing)
+        out.append((label, detail))
     return out
 
 

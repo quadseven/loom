@@ -1232,29 +1232,45 @@ class GitHub:
             raise GitHubOutage("%s %s: GitHub outage flag is set" % (method, path),
                                0, "", int(time.time()))
 
+    def download_actions_log(self, url: str) -> Tuple[int, str]:
+        """Read a signed Actions log without sending the API credential."""
+        if not url.startswith("https://"):
+            raise GitHubError("Actions log download needs an HTTPS URL")
+        try:
+            status, _, text = self._send(
+                "GET", url, {"User-Agent": "loom-bus"}, None, signed_log=True)
+        except ValueError:
+            raise GitHubError("Actions log download has an invalid URL") from None
+        return status, text
+
     def _send(self, method: str, url: str, headers: Dict[str, str],
               payload: Optional[bytes], *,
-              app_kind: Optional[str] = None) -> Tuple[int, Dict[str, str], str]:
+              app_kind: Optional[str] = None,
+              signed_log: bool = False) -> Tuple[int, Dict[str, str], str]:
         """One request on the wire, counted: status, lower-cased headers, text.
         REST and GraphQL budget refusals stop those requests until the
-        window resets. App JWT requests have their own budget and counts."""
-        path = urlsplit(url).path
+        window resets. JWTs and signed log downloads are outside that budget."""
+        path = "Actions log download" if signed_log else urlsplit(url).path
+        track_rate = app_kind is None and not signed_log
         self._check_outage(method, path)
-        if app_kind is None and self.limited_until is not None and time.time() < self.limited_until:
+        if track_rate and self.limited_until is not None and time.time() < self.limited_until:
             raise RateLimited("%s %s: GitHub budget exhausted until %s" % (
                 method, path, _utc(self.limited_until)), 403, "", self.limited_until)
         try:
             status, raw_headers, raw = self._transport_with_retry(
-                method, url, headers, payload, track_rate=app_kind is None)
+                method, url, headers, payload, track_rate=track_rate)
         except GitHubError as err:
             if (self.outage_aware and err.status == 0
                     and not isinstance(err, (RateLimited, ShadowHeld))):
-                raise GitHubOutage("%s %s: GitHub unreachable: %s" % (method, path, err),
+                detail = "" if signed_log else ": %s" % err
+                raise GitHubOutage("%s %s: GitHub unreachable%s" % (method, path, detail),
                                    0, "", int(time.time())) from None
+            if signed_log and not isinstance(err, (RateLimited, ShadowHeld)):
+                raise GitHubError("Actions log download failed", err.status) from None
             raise
-        if app_kind is None:
+        if track_rate:
             self._count(method, url, status)
-        else:
+        elif app_kind is not None:
             with self._count_lock:
                 self.kinds[app_kind] = self.kinds.get(app_kind, 0) + 1
         if self.outage_aware and status >= 500:
@@ -1262,7 +1278,7 @@ class GitHub:
                                status, "", int(time.time()))
         resp_headers = {str(k).lower(): v for k, v in (raw_headers or {}).items()}
         text = (raw or b"").decode("utf-8", "replace")
-        if app_kind is not None:
+        if not track_rate:
             return status, resp_headers, text
         # Read before any error is raised: a 403 at the limit carries them.
         self._note_rate(resp_headers)

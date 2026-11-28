@@ -12,7 +12,7 @@ from unittest import mock
 from shadow_env import setUpModule, tearDownModule  # noqa: F401
 
 from bus import brain, claimed, comment_findings, factory, hunt_plan, labels, merge_tier, pr_repair, station, status, tickets
-from bus.github import GitHubError, RateLimited, Response, ShadowHeld
+from bus.github import GitHub, GitHubError, GitHubOutage, RateLimited, Response, ShadowHeld
 from bus.tickets import FIX_MARKER
 
 REPO = "example-org/example-repo"
@@ -163,6 +163,18 @@ class FakeGitHub:
         if method == "GET":
             return self._get(path)
         return self._write(method, path, body)
+
+    def fail_request(self, suffix, status_code):
+        rest = self.rest
+        client = GitHub("test", transport=lambda *_: (status_code, {}, b"{}"))
+        client.outage_aware = True
+
+        def route(method, path, body=None, etag=None, ok=()):
+            if path.endswith(suffix):
+                return client.rest(method, path, body, etag=etag, ok=ok)
+            return rest(method, path, body, etag=etag, ok=ok)
+
+        self.rest = route
 
     def _get(self, path):
         if "/rules/branches/main" in path:
@@ -1856,15 +1868,55 @@ class PullRequests(Base):
 
     def test_a_refused_rerun_of_an_infra_timeout_is_judged_as_usual(self):
         self.flaky_head(self.INSTALL_TIMEOUT)
-        write = self.gh._write
-
-        def refuse(method, path, body):
-            if path.endswith("/rerun-failed-jobs"):
-                raise GitHubError("POST %s -> 500" % path, 500)
-            return write(method, path, body)
-        self.gh._write = refuse
+        self.gh.fail_request("/rerun-failed-jobs", 403)
         self.go()
         self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+
+    def test_an_outage_rerunning_an_infra_timeout_does_not_send_back_the_ticket(self):
+        self.flaky_head(self.INSTALL_TIMEOUT)
+        self.gh.fail_request("/rerun-failed-jobs", 500)
+        with self.assertRaises(GitHubOutage):
+            self.go()
+        self.assertEqual(self.fixed, [])
+
+    def test_an_outage_reading_a_failed_job_log_does_not_send_back_the_ticket(self):
+        self.flaky_head(self.INSTALL_TIMEOUT)
+        self.gh.fail_request("/actions/jobs/501/logs", 500)
+        with self.assertRaises(GitHubOutage):
+            self.go()
+        self.assertEqual(self.fixed, [])
+
+    def test_an_outage_downloading_signed_logs_does_not_send_back_the_ticket(self):
+        self.flaky_head(self.INSTALL_TIMEOUT)
+        url = "https://logs.example.com/job?signature=fixture"
+        transport = mock.Mock(side_effect=[
+            (302, {"Location": url}, b""),
+            (500, {}, b"synthetic download body"),
+        ])
+        client = GitHub("test", transport=transport)
+        client.outage_aware = True
+        rest = self.gh.rest
+
+        def route(method, path, body=None, etag=None, ok=()):
+            if path.endswith("/actions/jobs/501/logs"):
+                return client.rest(method, path, body, etag=etag, ok=ok)
+            return rest(method, path, body, etag=etag, ok=ok)
+
+        self.gh.rest = route
+        self.gh.transport = transport
+        self.gh.download_actions_log = lambda target: client.download_actions_log(target)
+        with self.assertRaises(GitHubOutage) as raised:
+            self.go()
+        self.assertEqual(transport.call_count, 2)
+        self.assertEqual(client.requests, 2)
+        self.assertEqual(transport.call_args_list[0].args[2]["Authorization"], "Bearer test")
+        method, target, headers, body = transport.call_args.args
+        self.assertEqual((method, target, body), ("GET", url, None))
+        self.assertNotIn("authorization", {name.lower() for name in headers})
+        self.assertNotIn("signature", str(raised.exception))
+        self.assertNotIn("synthetic download body", str(raised.exception))
+        self.assertEqual(self.gh.writes, [])
+        self.assertEqual(self.fixed, [])
 
     def test_a_real_test_failure_beside_a_failed_review_is_not_run_again(self):
         self.flaky_head("FAILED tests/test_a.py::test_x - assert 1 == 2\n##[error]Process completed "
@@ -3363,6 +3415,14 @@ class Queued(Base):
                                  limited=limited, available=available)
         worker.assign_queued()
         return worker
+
+    def test_an_outage_assigning_a_queued_ticket_stops_before_the_next(self):
+        self.queued(7, age=60)
+        self.queued(8)
+        self.gh.fail_request("/issues/7/labels", 500)
+        with self.assertRaises(GitHubOutage):
+            self.assign(available=["codex"])
+        self.assertEqual(self.gh.writes, [])
 
     def test_a_queued_ticket_that_waits_says_why_in_waits(self):
         # The factory's reason for leaving a ticket where it is reached only

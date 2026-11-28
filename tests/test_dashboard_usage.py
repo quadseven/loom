@@ -155,6 +155,18 @@ class UsageDashboardTests(unittest.TestCase):
         self.assertIn("2999.50 of 10000 Neurons used", summary)
         self.assertEqual(summary.count("target 90%"), 1)
 
+    def test_daily_allowances_include_missing_providers_in_partial_uploads(self):
+        legacy = reading("openrouter", ["openrouter"], "daily", 0)
+        for row, expected in ((legacy, "No reading."),
+                              (allowance_reading(), "0 of 1000 requests used")):
+            with self.subTest(row=row):
+                store = Store()
+                store.upload([row], now=NOW)
+                page = usage.render(usage.build(store.snapshot()["readings"], NOW))
+                daily = section(page, "usage-daily-allowances")
+                self.assertIn(expected, provider_row(daily, "OpenRouter"))
+                self.assertIn("No reading.", provider_row(daily, "Workers AI"))
+
     def test_daily_allowance_is_reaged_on_read(self):
         near_midnight = NOW.replace(hour=23, minute=59)
         cases = (
@@ -414,6 +426,7 @@ class UsageDashboardTests(unittest.TestCase):
         self.assertIn('class="empty-state"', body)
         self.assertIn("No usage snapshot has arrived since the dashboard started", body)
         self.assertIn("after its next pass", body)
+        self.assertNotIn('aria-labelledby="usage-daily-allowances"', body)
 
     def test_nothing_to_ask_says_so(self):
         rows = [reading("codex", ["codex"], "weekly", 10, (NOW + timedelta(days=1)).isoformat())]

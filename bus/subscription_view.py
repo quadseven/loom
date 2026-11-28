@@ -38,16 +38,10 @@ def _longest(records, providers):
 
 
 def _reading(record, now, points):
-    # Meter timestamps are stored as ISO datetimes with microsecond precision.
-    now = round(now, 6)
-    observed = usage.observation_time(record)
-    reset = usage._parse(record.get("resets_at"))
-    elapsed = pace.elapsed_pct(reset, record.get("window_minutes"), now)
-    used = pace._number(record.get("used_pct"))
-    if (used is None or not 0 <= used <= 100 or elapsed is None or observed is None
-            or not max(reset - record["window_minutes"] * 60, now - usage.STALE_AFTER)
-            <= observed <= now):
+    reading = usage.current_window_reading(record, now)
+    if reading is None:
         return dict.fromkeys(("used_pct", "elapsed_pct", "observed_at", "resets_at", "verdict"))
+    used, observed, reset, elapsed = reading
     return {"used_pct": used, "elapsed_pct": elapsed, "observed_at": usage._iso(observed),
             "resets_at": usage._iso(reset), "verdict": pace.verdict(used, elapsed, points)}
 
@@ -90,8 +84,12 @@ def _account_records(home, provider, now, *, persist):
 
 def dashboard_records(home, records, now, *, persist=False):
     """Read account windows separately, saving limit history only during collection."""
-    result = [record for record in records if record.get("provider") != "claude"]
-    for slot in usage._provider_groups(labels.LANES).get("claude", []):
+    groups = usage._provider_groups(labels.LANES)
+    # Older snapshots may need the same per-window fallback used by collection.
+    result = usage.with_forwarded_codex(
+        home, [record for record in records if record.get("provider") != "claude"],
+        groups.get("codex", []), now)
+    for slot in groups.get("claude", []):
         result.extend(_account_records(home, slot, now, persist=persist))
     return result
 

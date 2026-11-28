@@ -1,5 +1,7 @@
 """No-change outcomes share a bounded budget across build and fix runs."""
 import os
+from contextlib import redirect_stderr
+from io import StringIO
 from unittest import mock
 
 from bus import factory, station
@@ -715,6 +717,37 @@ class NoChangeWaitingReportTest(Base):
         with mock.patch.object(self.runner, "_no_change_plan", return_value=None) as planner:
             self.runner.report_outcomes()
         planner.assert_not_called()
+
+    def test_waiting_retry_recovers_on_the_first_healthy_station_pass(self):
+        self.assertTrue(self.report(None))
+        ticket, run = "%s#12" % REPO, "codex/" + self.name
+        original = self.runner._no_change_data()[ticket]["runs"][run]
+        due = original["tried_at"] + station.NO_CHANGE_RETRY_EVERY
+        failed = False
+
+        def transport(method, url, headers, body):
+            nonlocal failed
+            if not failed and method == "GET" and url.endswith("/repos/%s/issues/12" % REPO):
+                failed = True
+                return 500, {}, b"{}"
+            return self.fake(method, url, headers, body)
+
+        gh = GitHub("token", transport=transport)
+        plan = {"lane": "claude", "model": "model-next", "rung": 2}
+        errors = StringIO()
+        with mock.patch.object(station.time, "time", return_value=due) as clock, \
+                mock.patch.object(station.Station, "_no_change_plan", return_value=plan), \
+                redirect_stderr(errors):
+            self.assertEqual(station.run(self.settings, gh), 0)
+            after_outage = self.runner._no_change_data()[ticket]["runs"][run]
+            clock.return_value += 60
+            self.assertEqual(station.run(self.settings, gh), 0)
+        after_recovery = self.runner._no_change_data()[ticket]["runs"][run]
+        self.assertTrue(after_recovery["done"])
+        self.assertEqual(after_recovery["plan"], plan)
+        self.assertIn("Model: model-next", self.fake.issues[12]["body"])
+        self.assertEqual(after_outage, original)
+        self.assertEqual(errors.getvalue().count("GitHub outage:"), 1)
 
     def test_retry_hands_the_briefs_model_back_to_the_budget(self):
         self.write(self.brief, "Repo: %s\nIssue: %s#12\nLane: codex\nModel: model-x\n" % (REPO, REPO))

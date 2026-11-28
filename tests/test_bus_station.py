@@ -16692,6 +16692,111 @@ class PaceTest(Base):
         self.assertEqual(missing["running_until"], station.usage._iso(now - 5 + station.ALIVE_MAX_AGE))
         self.assertEqual(station.usage.read_snapshot(self.home), records)
 
+    def test_real_codex_collection_uses_current_forwarded_weekly_for_pace(self):
+        from bus import pace
+
+        now = 1_800_000_000
+        reset = now + 6 * 86400
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings, now=now)
+        sessions = Path(self.home) / "codex-sessions"
+
+        def event(key, used, minutes, resets_at, observed):
+            return json.dumps({"type": "event_msg", "timestamp": station.usage._iso(observed),
+                               "payload": {"rate_limits": {key: {"used_percent": used,
+                                            "window_minutes": minutes, "resets_at": resets_at}}}})
+
+        self.write(str(sessions / "session.jsonl"), "\n".join([
+            event("secondary", 7, 10080, reset, now - station.usage.STALE_AFTER - 1),
+            event("primary", 18, 300, now + 3600, now - 5),
+        ]) + "\n")
+        meters = Path(self.home) / "state" / "usage"
+        self.write(str(meters / "codex.meter.json"), json.dumps({"at": now - 10, "windows": [
+            {"window": "5-hour", "window_minutes": 300, "used_pct": 33, "resets_at": now + 3600},
+        ]}))
+        self.write(str(meters / "codex-2.meter.json"), json.dumps({"at": now - 15, "windows": [
+            {"window": "weekly", "window_minutes": 10080, "used_pct": 42,
+             "resets_at": reset, "at": now - 20},
+        ]}))
+        self.write(str(meters / "codex-9.meter.json"), json.dumps({"at": now - 1, "windows": [
+            {"window": "weekly", "window_minutes": 10080, "used_pct": 99, "resets_at": reset},
+        ]}))
+        with mock.patch.object(station.labels, "LANES", ["codex", "codex-2"]), \
+                mock.patch.dict(os.environ, {"LOOM_CODEX_SESSIONS": str(sessions),
+                                             "LOOM_PACE_MAX_CODEX": "2"}), \
+                mock.patch.object(runner, "_refresh_model_catalogue"), \
+                mock.patch.object(runner, "post_chain"), \
+                mock.patch.object(runner, "upload_usage_limits"):
+            runner._tend_usage()
+
+        rows = {row["window"]: row for row in station.usage.read_snapshot(self.home)}
+        self.assertEqual(rows["5-hour"]["used_pct"], 18)
+        self.assertEqual(rows["weekly"]["used_pct"], 42)
+        self.assertEqual(rows["weekly"]["observed_at"], station.usage._iso(now - 20))
+        self.assertEqual(rows["weekly"]["resets_at"], station.usage._iso(reset))
+        self.assertEqual(rows["weekly"]["lanes"], ["codex", "codex-2"])
+        planned = pace.read(self.home)["providers"]["codex"]
+        self.assertEqual((planned["window"], planned["used"], planned["max"]), ("weekly", 42, 2))
+
+    def test_codex_displays_use_a_current_forwarded_reading_for_an_unusable_weekly_window(self):
+        from bus import pace
+        from dashboard import usage as usage_page
+
+        now = 1_800_000_000
+        reset = now + 6 * 86400
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings, now=now)
+        base = {"provider": "codex", "lanes": ["codex", "codex-2"],
+                "source": "codex session logs", "as_of": station.usage._iso(now)}
+        short = dict(base, window="5-hour", window_minutes=300, used_pct=18,
+                     resets_at=station.usage._iso(now + 3600),
+                     observed_at=station.usage._iso(now - 5))
+        latest = dict(base, window="weekly", window_minutes=10080, used_pct=7,
+                      resets_at=station.usage._iso(reset),
+                      observed_at=station.usage._iso(now - 60))
+        stale_at = station.usage._iso(now - station.usage.STALE_AFTER - 1)
+        stale = dict(latest, observed_at=stale_at)
+        forwarded = {"window": "weekly", "window_minutes": 10080, "used_pct": 42,
+                     "resets_at": reset, "at": now - 20}
+        self.write(os.path.join(self.home, "state", "usage", "codex.meter.json"),
+                   json.dumps({"at": now - 10, "windows": [
+                       {"window": "5-hour", "window_minutes": 300, "used_pct": 33,
+                        "resets_at": now + 3600}]}))
+        cases = (
+            (stale, forwarded, 42),
+            (None, forwarded, 42),
+            (dict(latest, window_minutes=None), forwarded, 42),
+            (stale, dict(forwarded, used_pct=0), 0),
+            (dict(latest, resets_at=station.usage._iso(now - 1)), forwarded, 42),
+            (dict(latest, observed_at=None), forwarded, 42),
+            (latest, forwarded, 7),
+            (stale, dict(forwarded, at=stale_at), None),
+            (stale, dict(forwarded, window_minutes=300, resets_at=now + 3600), None),
+        )
+        for weekly, meter_window, expected in cases:
+            with self.subTest(weekly=weekly, meter=meter_window):
+                self.write(os.path.join(self.home, "state", "usage", "codex-2.meter.json"),
+                           json.dumps({"at": now - 15, "windows": [meter_window]}))
+                records = [short] if weekly is None else [short, weekly]
+                with mock.patch.object(station.labels, "LANES", ["codex", "codex-2"]), \
+                        mock.patch.dict(os.environ, {"LOOM_PACE_MAX_CODEX": "2"}), \
+                        mock.patch.object(station.usage, "collect", return_value=records), \
+                        mock.patch.object(runner, "_refresh_model_catalogue"), \
+                        mock.patch.object(runner, "post_chain"), \
+                        mock.patch.object(runner, "upload_usage_limits") as upload:
+                    runner._tend_usage()
+                    body = runner._lanes_body([])
+
+                store = usage_page.Store()
+                store.upload(upload.call_args.args[0])
+                uploaded, = [row["subscription_pace"] for row in store.snapshot()["readings"]
+                             if row.get("provider") == "codex" and "subscription_pace" in row]
+                self.assertEqual((uploaded["window"], uploaded["used_pct"]), ("weekly", expected))
+                self.assertEqual(uploaded["allowed"], 2)
+                shown = "no reading" if expected is None else "%d%%" % expected
+                self.assertIn(f"| codex | weekly | {shown} |", body)
+                self.assertEqual(station.usage.read_snapshot(self.home), records)
+                planned = "weekly" if expected == 7 else "5-hour"
+                self.assertEqual(pace.read(self.home)["providers"]["codex"]["window"], planned)
+
     def daily_reading(self, now, age=60):
         return station.usage._record(
             "openrouter", ["openrouter"], "daily", 0, 1000, "requests",
