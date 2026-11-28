@@ -22,7 +22,7 @@ import sys
 import tempfile
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from . import bug_refs, criteria_gate, hunt_plan, signature, text, tickets
+from . import bug_refs, hunt_plan, signature, text, tickets
 
 # Headings the runner injects into the PR body, in order.
 GENERATED_HEADINGS = ("## Why", "## Summary", "## Acceptance criteria",
@@ -189,6 +189,9 @@ def build_checklist(brief: str, checklist: str) -> str:
     """Carry each deferred live criterion into the PR using the ticket's wording."""
     if not tickets.needs_buildable_deliverable(brief):
         return checklist
+    # Imported here: the lane runner calls this module once a pass for other
+    # commands, and the close gate's import graph is most of its start time.
+    from . import criteria_gate
     live = set(criteria_gate.live_criteria(brief))
     out = []
     for line in _lane_ticks(_brief_criteria(brief), checklist).splitlines():

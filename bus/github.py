@@ -39,6 +39,7 @@ from contextlib import contextmanager
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 from . import fixrounds, notify, proof, shadow, status, text as _text
+from .github_lite import GitHubError, rest_login  # noqa: F401 - re-exported: callers import them from here
 
 DEFAULT_API = "https://api.github.com"
 TIMEOUT = 30
@@ -73,15 +74,6 @@ _NEW_COMMENT = re.compile(r"^/repos/[^/]+/[^/]+/(?:issues|pulls)/[0-9]+/comments
 # Labels that let an issue close as completed with unchecked boxes, mirroring
 # the close-completeness guard's escape hatches.
 _FORCE_CLOSE_LABELS = ("force-close", "wontfix")
-
-
-class GitHubError(Exception):
-    """A failed GitHub call: the HTTP status and the response body text."""
-
-    def __init__(self, message: str, status: int = 0, body: str = "") -> None:
-        super().__init__(message)
-        self.status = status
-        self.body = body
 
 
 class TargetReached(Exception):
@@ -217,18 +209,6 @@ class Response:
         self.data = data
         self.etag = etag
         self.headers = headers if headers is not None else {}
-
-
-def rest_login(author: Optional[Dict[str, Any]]) -> str:
-    """A GraphQL author's login in the form REST, and so LOOM_BRIEF_AUTHORS,
-    uses: GraphQL names a GitHub App "<slug>" and REST "<slug>[bot]". Only an
-    author whose __typename is Bot gains the suffix, so a person who takes the
-    bare slug as a user login is never read as the App."""
-    author = author or {}
-    login = str(author.get("login") or "")
-    if login and author.get("__typename") == "Bot" and not login.lower().endswith("[bot]"):
-        login += "[bot]"
-    return login
 
 
 def unreadable(err: GitHubError) -> Optional[str]:

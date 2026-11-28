@@ -81,7 +81,7 @@ from typing import Any, Callable, Container, List, Mapping, Optional, Sequence, 
 from urllib.parse import quote
 
 from . import change_class, history, status
-from .github import GitHubError
+from .github_lite import GitHubError
 
 DOCS_TESTS = "docs-tests"
 APP_CODE = "app-code"
