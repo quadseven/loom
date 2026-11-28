@@ -34,10 +34,7 @@ import sys
 from typing import Any, Dict, Iterable, List, NamedTuple, Optional
 
 from . import claim_referee, criteria_gate, human_claims, proof, stale_claims
-
-# loom:ready is taken: it marks a pull request ready to merge (bus/labels.py).
-READY_MARKER = "loom:pickable"
-DONE_MARKER = "loom:readiness-done"
+from .labels import DONE_MARKER, READY_MARKER  # noqa: F401 - bus.station reads both here
 EVERY = 3600
 PER_REPO = 40
 STATE_FILE = "ticket-readiness.json"

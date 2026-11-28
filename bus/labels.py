@@ -4,13 +4,13 @@ from __future__ import annotations
 import os
 import re
 import sys
-from typing import Collection, Dict, Iterable, List
+from typing import TYPE_CHECKING, Collection, Dict, Iterable, List
 from urllib.parse import quote
 
-from .github import GitHub
-from .readiness import DONE_MARKER, READY_MARKER
 from .stale_claims import OVERFLOW_CLAIM
-from .tickets import VERIFY_HANDOFF_LABEL
+
+if TYPE_CHECKING:
+    from .github import GitHub
 
 # The hand-off pool: a ticket no lane of this Loom takes (bus/factory.py
 # NO_LANE_HANDOFF) carries it, leaves its goal's in-flight count, and waits
@@ -18,6 +18,14 @@ from .tickets import VERIFY_HANDOFF_LABEL
 HANDOFF = "handoff:claude"
 
 RUN_OUTCOME_HOLDS = frozenset(("wait:incident", "wait:no-change"))
+
+# The readiness pass's markers (bus/readiness.py). loom:ready is taken: it
+# marks a pull request ready to merge. They live here, not in readiness, so a
+# lane process that reads the label set never imports the readiness gates.
+READY_MARKER = "loom:pickable"
+DONE_MARKER = "loom:readiness-done"
+# The label on a lane verify ticket for an older shipped ticket (bus/tickets.py).
+VERIFY_HANDOFF_LABEL = "loom:verify-handoff"
 
 LANES = ["codex", "claude", "openrouter", "opencode-go", "anthropic", "zen",
          "zai", "workersai", "agy", "spark", "copilot", "tinker"]

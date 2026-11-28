@@ -76,7 +76,7 @@ from typing import Any, Callable, Iterable, List, Mapping, NamedTuple, Optional,
 from urllib.parse import quote
 
 from . import answer, criteria_gate, decision_claim, proof, status, tickets
-from .github import GitHubError
+from .github_lite import GitHubError
 
 STALE = "stale"
 HEALTH = "health"

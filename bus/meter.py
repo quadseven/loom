@@ -30,11 +30,14 @@ from pathlib import Path
 import re
 import sys
 import time
-import urllib.error
-import urllib.request
-from typing import Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from . import usage
+
+# urllib loads only when a meter reads its provider: the lane runner's local
+# reads (--codex-sessions, --claude-stream) run on every pass and send nothing.
+if TYPE_CHECKING:
+    import urllib.request
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/key"
 CLOUDFLARE_GRAPHQL_URL = "https://api.cloudflare.com/client/v4/graphql"
@@ -47,7 +50,7 @@ NEURONS_QUERY = (
     "query($account: string!, $date: Date!) { viewer { accounts(filter: {accountTag: $account}) {"
     " aiInferenceAdaptiveGroups(filter: {date: $date}, limit: 1) { sum { totalNeurons } } } } }")
 
-Fetch = Callable[[urllib.request.Request], Any]
+Fetch = Callable[["urllib.request.Request"], Any]
 
 
 class MeterError(Exception):
@@ -145,6 +148,7 @@ def workersai_windows(payload: Any, now: float, allowance: float) -> List[Dict[s
 
 
 def _send(fetch: Fetch, request: urllib.request.Request) -> Any:
+    import urllib.error
     try:
         with fetch(request) as response:
             body = response.read()
@@ -161,6 +165,7 @@ def _send(fetch: Fetch, request: urllib.request.Request) -> Any:
 
 
 def _urlopen(request: urllib.request.Request) -> Any:
+    import urllib.request
     return urllib.request.urlopen(request, timeout=TIMEOUT)  # noqa: S310 - _request allows http(s) only
 
 
@@ -172,6 +177,7 @@ def _request(url: str, key: str, body: Optional[bytes] = None) -> urllib.request
     headers = {"Authorization": "Bearer " + key, "Accept": "application/json"}
     if body is not None:
         headers["Content-Type"] = "application/json"
+    import urllib.request
     return urllib.request.Request(url, data=body, method="POST" if body is not None else "GET",  # noqa: S310 - scheme checked above
                                   headers=headers)
 
