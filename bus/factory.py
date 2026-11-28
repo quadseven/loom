@@ -2290,6 +2290,60 @@ class Factory:
         return found + vacuous.base_run_findings(repo, base, sha, modules,
                                                  self.base_clone)
 
+    def _prior_vacuous_fixture_findings(
+            self, issue: Dict[str, Any], comments: Sequence[Dict[str, Any]]) -> List[Tuple[int, str]]:
+        """Fixture findings from fix comments, attributed to the run's model rung."""
+        claim_models_by_comment = {id(comment): model for comment, model in
+                                   claim_models(issue, comments) if comment is not None}
+        prior: List[Tuple[int, str]] = []
+        current_model = None
+        for comment in comments:
+            body = str(comment.get("body") or "")
+            if any(int(match.group(1)) == 0 for match in RUNG_RE.finditer(body)):
+                prior.clear()
+                current_model = None
+            if id(comment) in claim_models_by_comment:
+                current_model = claim_models_by_comment[id(comment)]
+            if not body.startswith(FIX_MARKER) or not current_model:
+                continue
+            rung = next((rung_number for rung_number, (_, model) in enumerate(CLIMB, 1)
+                         if model == current_model), 0)
+            if not rung:
+                continue
+            for match in re.finditer(r"^Factory finding: (.+)$", body, re.M):
+                prior.extend((rung, item.strip()) for item in match.group(1).split("; ")
+                             if item.strip().startswith(vacuous.FIXTURE_FINDING_PREFIX))
+        return prior
+
+    def _repeated_vacuous_findings(
+            self, repo: str, full: Dict[str, Any], issue: Dict[str, Any],
+            comments: Sequence[Dict[str, Any]], findings: Sequence[str]) -> List[str]:
+        """Fixture findings repeated on a previous, lower ladder rung."""
+        footer = self._footer(repo, full)
+        model = footer[1] if footer else issue_model(issue)
+        rung = next((rung_number for rung_number, (_, name) in enumerate(CLIMB, 1)
+                     if name == model), 0)
+        return vacuous.repeated_fixture_findings(
+            findings, self._prior_vacuous_fixture_findings(issue, comments), rung)
+
+    def _hold_repeated_vacuous_findings(self, repo: str, issue: Dict[str, Any],
+                                        findings: Sequence[str]) -> None:
+        """Hold a repeated fixture gate finding for the brain, without a rung."""
+        names = _labels(issue)
+        if "needs-brain" in names:
+            return
+        finding = "; ".join(findings)
+        self._status_note(repo, int(issue["number"]),
+                          "Not climbing the model ladder: the vacuous-test gate found the same "
+                          "fixture finding on two rungs. The repeated finding is quoted here: "
+                          '"%s". The brain decides whether the ticket needs a fixture exemption.'
+                          % finding)
+        labels = names + ["needs-brain"]
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, int(issue["number"])),
+                     {"labels": labels})
+        issue["labels"] = [{"name": label} for label in labels]
+        self.actions += 1
+
     def _needs_test(self, repo: str, number: int, issue: Dict[str, Any]) -> bool:
         """Does this pull request change code and no test, in a repo and on a
         ticket that ask for tests?"""
@@ -3397,6 +3451,11 @@ class Factory:
         faults = pr_faults(details, full, runs)
         vacuity = self._vacuous_findings(repo, number, full, issue)
         if vacuity:
+            repeated = self._repeated_vacuous_findings(
+                repo, full, issue, comments, vacuity)
+            if repeated:
+                self._hold_repeated_vacuous_findings(repo, issue, repeated)
+                return
             finding = "; ".join(vacuity)
             self._send_back(repo, full, issue, comments,
                             "vacuous-test gate: " + finding, finding=finding)
