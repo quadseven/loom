@@ -266,6 +266,17 @@ unset variables.
   repo's other tickets stay held. The factory repo is public, so only
   comments by a `LOOM_BRIEF_AUTHORS` login count, for the fix and for the
   last repeat alike: a stranger's comment lifts no hold.
+- An incident nobody owns is escalated once (loom#3538). When that hourly
+  read finds a held incident filed by a `LOOM_BRIEF_AUTHORS` login at least
+  12 hours ago (`incident_probe.ESCALATE_AFTER`), with no `claim:` label,
+  no `Escalated:` line, and no commit on the held repo's default branch for
+  12 hours, the station files a `Difficulty: hard` fix ticket under the
+  held repo's goal home when the incident names no cause (so the lane runs
+  its strongest model), writes the `Cause:` line and an `Escalated:` line
+  with the held count on the incident, and pages the operator once with
+  the incident, its age and the held count. A private repo is named in
+  words on both. A page that did not go out waits in the probe ledger for
+  the next read.
 - A base check red only on the lane host is not a broken default branch.
   The runner treats a fresh red base run (exit 1 to 123, after its second
   run) as host-only red when all of these hold: GitHub's own check runs on
