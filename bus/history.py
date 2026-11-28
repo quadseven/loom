@@ -28,7 +28,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
-from .github import rest_login
+from .github_lite import rest_login
 
 # The marker formats this module owns: it writes them and parses them.
 RUNG_MARKER = "<!-- loom:rung %d -->"

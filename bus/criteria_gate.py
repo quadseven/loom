@@ -51,12 +51,11 @@ import json
 import re
 import shlex
 import subprocess
-import http.client
 import urllib.parse
 from typing import Any, Callable, List, NamedTuple, Optional, Sequence, Tuple
 
 from . import claimed, operator_hold, proof, tickets
-from .github import GitHubError
+from .github_lite import GitHubError
 
 CODE = "code"
 LIVE = "live"
@@ -266,6 +265,7 @@ def _fetch(url: str, timeout: int) -> Tuple[int, str, str]:
     if parts.scheme.lower() != "https" or not parts.hostname:
         raise ValueError("a live check fetches https URLs only")
     path = (parts.path or "/") + ("?" + parts.query if parts.query else "")
+    import http.client  # here, not at the top: a lane imports this module and fetches nothing
     conn = http.client.HTTPSConnection(parts.hostname, parts.port, timeout=timeout)
     try:
         conn.request("GET", path, headers={"User-Agent": "loom-live-check"})
@@ -303,6 +303,7 @@ def run(check: Check, gh: Any,
     """(passed, what was seen) for one check. What was seen names the status
     or exit code and the strings found or missing, never the answer itself:
     it is written to the ticket."""
+    import http.client
     fetch = fetch or _fetch
     runner = runner or subprocess.run
     try:

@@ -19,7 +19,7 @@ from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from . import answer
-from .github import GitHubError
+from .github_lite import GitHubError
 
 # Who a claim names as having decided: the operator or the owner. "The user"
 # or "a person" is as often a reporter or an upstream author, so it is not.

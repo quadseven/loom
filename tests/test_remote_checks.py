@@ -5,11 +5,13 @@ import io
 import json
 import re
 import tempfile
+import threading
 import time
 import types
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 from bus import remote_checks
 from bus.github import Response
@@ -152,6 +154,95 @@ class TickerLifecycle(unittest.TestCase):
             bare = types.SimpleNamespace(s=types.SimpleNamespace(home=home, self_repo="o/r"))
             station.Station.start_remote_check_ticker(bare)
             self.assertFalse(hasattr(bare, "_remote_ticker"))
+
+
+class StationPass(unittest.TestCase):
+    def test_a_check_filed_during_a_claim_step_reaches_the_lane_before_the_step_ends(self):
+        from bus import github, station
+
+        dispatched = threading.Event()
+        completed = threading.Event()
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("result.json", json.dumps({"exit": 0, "failing": []}))
+        artifact = buf.getvalue()
+
+        class GitHub:
+            def __init__(self, auth=None):
+                self.request_id = None
+
+            def app_login(self):
+                return "loom[bot]"
+
+            def rest(self, method, path, body=None, ok=None):
+                if method == "POST" and path.endswith("/workflows/remote-check.yml/dispatches"):
+                    self.request_id = body["inputs"]["run_id"]
+                    dispatched.set()
+                    return Response(200, {"workflow_run_id": 7})
+                if path.endswith("/runs/7"):
+                    return Response(200, {
+                        "head_branch": "main", "path": ".github/workflows/remote-check.yml",
+                        "event": "workflow_dispatch", "triggering_actor": {"login": "loom[bot]"},
+                        "status": "completed" if completed.is_set() else "queued",
+                        "conclusion": "success",
+                    })
+                if path.endswith("/artifacts"):
+                    name = "remote-check-result-" + self.request_id
+                    return Response(200, {"artifacts": [{"id": 9, "name": name}]})
+                if path.endswith("/artifacts/9/zip"):
+                    return Response(302, {}, headers={"location": "https://example.com/result"})
+                if path == "/repos/example/repo":
+                    return Response(200, {"private": False})
+                raise AssertionError((method, path))
+
+        class EndClaimStep(Exception):
+            pass
+
+        ticker_type = getattr(remote_checks, "Ticker", None)
+        tickers = []
+
+        def fast_ticker(make, say):
+            # Let the real thread schedule its ticks without a minute-long wait.
+            ticker = ticker_type(make, say, interval=0.01)
+            tickers.append(ticker)
+            return ticker
+
+        with tempfile.TemporaryDirectory() as home:
+            Path(home, "state", "remote-checks", "req").mkdir(parents=True)
+            st = object.__new__(station.Station)
+            st.s = station.Settings(home=home, repos=[], authors=[], owners=[], self_repo="example/loom")
+            st.gh = GitHub()
+            st.capture_pod_logs = st.sample_operator_budget = lambda: None
+            st._budget_exhausted = lambda: False
+            st.check_repo_access = lambda: True
+            st.ask_operator_login = st._publish_lanes_when_old = st.sync_labels = lambda: None
+            st._end_pass_locally = lambda: None
+
+            def claim_step():
+                rid = remote_checks.submit(home, "example/repo", SHA, "", "no", "", "true")
+                self.assertTrue(dispatched.wait(5), "the request waited for the claim step to finish")
+                completed.set()
+                deadline = time.monotonic() + 5
+                result = remote_checks.read_result(home, rid)
+                while result is None and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                    result = remote_checks.read_result(home, rid)
+                self.assertEqual(result, {"state": "done", "exit": 0, "failing": [], "sha": SHA},
+                                 "the result waited for the claim step to finish")
+                raise EndClaimStep
+
+            st.finish_claims = claim_step
+            with (mock.patch.object(station, "GitHub", GitHub),
+                  mock.patch.object(github, "auth_from_env"),
+                  mock.patch.object(github.urllib.request, "urlopen", side_effect=lambda *a, **kw: io.BytesIO(artifact)),
+                  mock.patch.object(remote_checks, "Ticker", fast_ticker, create=True)):
+                try:
+                    with self.assertRaises(EndClaimStep):
+                        st.run_pass()
+                finally:
+                    for ticker in tickers:
+                        ticker.stop()
+                        ticker.join(timeout=5)
 
 
 class Workflow(unittest.TestCase):
