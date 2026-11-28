@@ -46,7 +46,11 @@ import re
 from typing import Any, Callable, Dict, List, Optional, Sequence
 from urllib.parse import quote
 
-from . import brief_check, proof, ship_paths, tickets
+# bus.brief_check and bus.tickets load in the two functions that read them:
+# the merge gate and bus.risk_line import this module for its step and
+# network checks, and those two pull in the close gate (bus/criteria_gate.py)
+# and the ticket reader, most of this module's start time (#3662).
+from . import proof, ship_paths
 from .github_lite import GitHubError
 
 SECTION = "Operator steps before merge"
@@ -299,6 +303,7 @@ def host_check(criterion: str) -> bool:
 def host_only(body: str) -> List[str]:
     """The ticket's criteria when every one is a host check; [] when any is
     something a pull request can meet, or it has none."""
+    from . import tickets
     found = [text for _, text in proof.criteria(_prose(body))]
     if tickets.has_proof_request(body) and tickets.needs_buildable_deliverable(body):
         return []
@@ -436,6 +441,7 @@ def measurement_reason(gh: Any, repo: str, pr: Dict[str, Any], ticket_body: str,
     or a bound (bus/brief_check.py), or its file list cannot be read in
     full; "" otherwise. The patches decide a bound, so a list read without
     them is read again."""
+    from . import brief_check
     if not brief_check.is_health(ticket_body):
         return ""
     try:
