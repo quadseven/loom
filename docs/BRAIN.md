@@ -1136,8 +1136,9 @@ exempt, as at the runner.
 
 A queued build ticket whose acceptance criteria all require live evidence
 stays unassigned. The station records one status event for the hold. A brief
-revision that adds a code acceptance criterion makes the ticket eligible for
-assignment on the next pass.
+revision that adds a code acceptance criterion, or a `Proof:` request under
+`## What` (which makes the brief a buildable deliverable), makes the ticket
+eligible for assignment on the next pass.
 
 In a repo that files its tickets by area of play (it defines at least one
 `area:` label), a ticket carrying no `area:` label gets no lane either: every

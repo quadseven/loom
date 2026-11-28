@@ -260,10 +260,14 @@ def live_only_hold(body: str) -> str:
     """Why a build brief whose acceptance criteria are all live waits in the
     queue, or empty. The hold lifts once the brief gains a criterion a lane
     can meet in code (the fix's regression test that the briefing adds,
-    docs/BRIEF_FORMAT.md), or when the brief is an answer brief."""
+    docs/BRIEF_FORMAT.md), when its What carries a `Proof:` request, which
+    makes the rendered brief a buildable deliverable (the fix, a regression
+    test, the proof request), or when the brief is an answer brief."""
     body = brief_text(body)
     live = criteria_gate.live_criteria(body)
     if not live or len(live) != len(tickets._criteria_texts(body)):
+        return ""
+    if tickets.has_proof_request(body):
         return ""
     try:
         headers, _ = tickets.parse(body)
