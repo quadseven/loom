@@ -7607,12 +7607,17 @@ def _job_log(gh: GitHub, repo: str, job_id: int) -> Optional[List[str]]:
     where = resp.headers.get("location", "")
     if resp.status != 302 or not where.startswith("https://"):
         return None
-    gh.requests += 1
-    status, _, raw = gh.transport("GET", where, {"User-Agent": "loom-bus"}, None)
+    download = getattr(gh, "download_actions_log", None)
+    if download is None:
+        gh.requests += 1
+        status, _, raw = gh.transport("GET", where, {"User-Agent": "loom-bus"}, None)
+        text = (raw or b"").decode("utf-8", "replace") if status == 200 else ""
+    else:
+        status, text = download(where)
     if status != 200:
         return None
     return [_LOG_STAMP.sub("", _ANSI.sub("", l))
-            for l in (raw or b"").decode("utf-8", "replace").splitlines()]
+            for l in text.splitlines()]
 
 
 # A line that says what failed: a test runner's failure summary, an
