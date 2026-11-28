@@ -46,7 +46,10 @@ as a local one's does; the offer is then withdrawn and a late report ignored.
 
 The station's offer writes are fenced by its lease (bus/station_lease.py):
 on Postgres the write is one statement that needs the lease row to hold the
-station's epoch. Pod clocks are trusted as cluster runner clocks are.
+station's epoch. An offer records that epoch; a station that takes the lease
+after another (two replicas, one holder) finds the brief missing from its own
+inbox and writes it back from the offer row instead of withdrawing the offer,
+so a run in flight survives the handover. Pod clocks are trusted as cluster runner clocks are.
 
 On the file backend the rows are JSON files below the station's loom home and
 a writer names itself; there is no authorization, so it serves one host and
@@ -396,7 +399,30 @@ class Feed:
         if self.lease is not None:
             self.lease.check()
             epoch = self.lease.epoch
-        self.rows.write(slot, "offer", offer, epoch)
+        self.rows.write(slot, "offer", dict(offer, epoch=epoch) if epoch is not None else offer,
+                        epoch)
+
+    def _handed_over(self, slot: str, offer: Dict[str, Any]) -> bool:
+        """Whether this station took the lease after the one that wrote the
+        offer, so a brief missing from its inbox never was here. An offer
+        with no recorded epoch, or a station with no lease, is not one."""
+        if self.lease is None:
+            return False
+        written = offer.get("epoch")
+        if isinstance(written, bool) or not isinstance(written, int):
+            return False
+        return written != self.lease.epoch
+
+    def _rebuild(self, slot: str, offer: Dict[str, Any]) -> bool:
+        """Write the offered brief back into this station's inbox from the
+        offer row, which carries the whole brief. False when the row's brief
+        or ticket cannot be trusted as one."""
+        ticket = str(offer.get("ticket") or "")
+        brief = offer.get("brief")
+        if not runners.TICKET_RE.fullmatch(ticket) or not isinstance(brief, str):
+            return False
+        _write(os.path.join(self.inbox(slot), ticket + ".md"), brief.encode("utf-8"))
+        return True
 
     def tend(self) -> None:
         slots = feed_slots(self.env)
@@ -449,6 +475,15 @@ class Feed:
             report = self._pod_row(slot, "report", pod) or {}
             self._apply(slot, ticket, str(offer.get("id")), report)
             state = "done"
+        elif (not os.path.exists(os.path.join(self.inbox(slot), ticket + ".md"))
+              and self._handed_over(slot, offer) and self._rebuild(slot, offer)):
+            # The lease changed hands: the brief sat in the old holder's
+            # inbox, so it is rebuilt here and the offer stays the pod's.
+            self.say("lane pod %s: took over the offer of %s; its brief is back in the inbox"
+                     % (slot, ticket))
+            offer = dict(offer, state="offered")
+            self._put_offer(slot, offer)
+            return offer
         elif not os.path.exists(os.path.join(self.inbox(slot), ticket + ".md")):
             self.say("lane pod %s: %s left the inbox before its report; offer withdrawn"
                      % (slot, ticket))

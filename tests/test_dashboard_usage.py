@@ -41,6 +41,16 @@ def subscription_reading(**changes):
                    subscription_pace=pace)
 
 
+
+def allowance_reading(provider="openrouter", **changes):
+    reset = "2026-10-19T00:00:00+00:00"
+    allowance = {"provider": provider, "unit": "requests" if provider == "openrouter" else "neurons",
+                 "used": 0, "limit": 1000, "resets_at": reset,
+                 "observed_at": (NOW - timedelta(minutes=8)).isoformat(),
+                 "target_hour": 18, "target_share": 90, "slack": 10}
+    allowance.update(changes)
+    return reading(provider, [provider], "daily", 0, reset, daily_allowance=allowance)
+
 def section(body, heading_id):
     """The markup of one section of the Usage view, by its heading id."""
     # AI-REVIEW 2026-11-27 [nemotron-3.5-super-vl] PRRT_kwDOVESCW8683UZU (Elder, PR #3668):
@@ -132,6 +142,36 @@ class UsageDashboardTests(unittest.TestCase):
         page = usage.render(usage.build(rows, NOW))
         self.assertNotIn('aria-labelledby="usage-subscriptions"', page)
         self.assertIn("15% used", provider_row(page, "example-service"))
+
+    def test_daily_allowance_shows_zero_and_keeps_counts_without_a_target(self):
+        rows = [allowance_reading(), allowance_reading("workersai", used=2999.5, limit=10000,
+                                                       target_hour=None, target_share=None)]
+        summary = section(usage.render(usage.build(rows, NOW)), "usage-daily-allowances")
+        self.assertIn("OpenRouter", summary)
+        self.assertIn("0 of 1000 requests used", summary)
+        self.assertIn("Resets 2026-10-19 00:00 UTC", summary)
+        self.assertIn("Behind pace, target 90% by 18:00 UTC", summary)
+        self.assertIn("Workers AI", summary)
+        self.assertIn("2999.50 of 10000 Neurons used", summary)
+        self.assertEqual(summary.count("target 90%"), 1)
+
+    def test_daily_allowance_is_reaged_on_read(self):
+        near_midnight = NOW.replace(hour=23, minute=59)
+        cases = (
+            (allowance_reading(), NOW + timedelta(hours=3)),
+            (allowance_reading(observed_at=near_midnight.isoformat()), near_midnight + timedelta(minutes=1)),
+            (allowance_reading(used=None), NOW),
+            (allowance_reading(used=True), NOW),
+        )
+        for row, now in cases:
+            with self.subTest(row=row, now=now):
+                store = Store()
+                store.upload([row], now=NOW)
+                summary = section(usage.render(usage.build(store.snapshot()["readings"], now)),
+                                  "usage-daily-allowances")
+                self.assertIn("No reading", summary)
+                self.assertNotIn("requests used", summary)
+                self.assertNotIn("90%", summary)
 
     def test_unknown_usage_with_an_old_observation_is_labeled_stale(self):
         row = reading("claude", ["claude"], "all", age=timedelta(minutes=5),
