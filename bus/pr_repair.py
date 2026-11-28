@@ -22,7 +22,7 @@ import sys
 import tempfile
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from . import bug_refs, hunt_plan, signature, text, tickets
+from . import bug_refs, hunt_plan, signature, text
 
 # Headings the runner injects into the PR body, in order.
 GENERATED_HEADINGS = ("## Why", "## Summary", "## Acceptance criteria",
@@ -187,6 +187,9 @@ def _checklist(brief: str, current_body: str, summary: str) -> str:
 
 def build_checklist(brief: str, checklist: str) -> str:
     """Carry each deferred live criterion into the PR using the ticket's wording."""
+    # The ticket reader loads here, not at import: bus.risk_line and the
+    # runner's public_refs and --apply calls never read it (#3662).
+    from . import tickets
     if not tickets.needs_buildable_deliverable(brief):
         return checklist
     # Imported here: the lane runner calls this module once a pass for other
