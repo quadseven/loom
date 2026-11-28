@@ -34,10 +34,43 @@ never merges. Heartbeats usage + model catalog to `state/usage/<lane>.json`.
 - Each pass writes `state/usage/<lane>.json` with the lane state, runner
   readiness, and time. A lane whose CLI or key is missing reports unavailable
   and leaves its briefs alone. The station routes only to serving lanes.
+- A claude slot keeps to a share of its weekly allowance (`bus/usage_cap.py`).
+  On each pass and before each run it reads its own meter,
+  `state/usage/<slot>.meter.json`, which every run writes from the CLI's
+  rate-limit events. It holds at `LOOM_<SLOT>_USAGE_STOP` percent of the
+  weekly window (default 90), and while its use is ahead of an even pace to
+  that stop by the reset: the stop times the share of the week gone, plus
+  `LOOM_<SLOT>_USAGE_SLACK` points (default 5). Each setting falls back to
+  `LOOM_CLAUDE_USAGE_STOP` and `LOOM_CLAUDE_USAGE_SLACK`. This is the rule
+  the OpenCode Go plan keeps (`plan_stop` in `bus/model_pick.py`). A hold is a
+  `limit:` heartbeat with a retry time, at the reset for the stop and at the
+  time the pace allows the reading for the pace, so the station sends the
+  slot nothing and the lane status names why. A serving slot's heartbeat
+  reason names its pace. No reading (no meter, or one from a week that has
+  reset) holds nothing: the run goes and records one. Use within a week never
+  falls, so an older reading of the current week still holds as a floor, and
+  every hold ends by the reset. A setting that is not a number holds the slot
+  until it is fixed.
 - Each claude slot signs in with `LOOM_<SLOT>_AUTH_FILE`, else
   `LOOM_CLAUDE_AUTH_FILE` (a file holding a `claude setup-token` OAuth
-  token). A slot with its own file is another account: it has its own meter,
-  and the pod's sign-in probe checks it alone.
+  token). A slot with its own file is another account: it has its own meter
+  and cap, and the pod's sign-in probe checks it alone.
+
+### A second Claude account
+
+A second operator's subscription runs as another claude slot with its own
+token and a lower stop, so the account's owner keeps the rest of the week:
+
+1. The account's owner runs `claude setup-token` and stores the token as a
+   SecureString in SSM, beside the first one (for example
+   `<your-ssm-prefix>/llm/claude_code_oauth_token_2`).
+2. The lane container syncs that parameter to a file, as it does the first
+   token, and the deployment adds the slot and its settings, for example
+   `LOOM_POD_SLOTS=claude claude-2`,
+   `LOOM_CLAUDE_2_AUTH_FILE=<path of the synced file>` and
+   `LOOM_CLAUDE_2_USAGE_STOP=60`.
+3. After the first run on the slot, `state/usage/claude-2.meter.json` holds
+   that account's reading, and `state/usage/claude-2.json` names its pace.
 
 ## How a lane is told to work
 

@@ -313,7 +313,8 @@ def plan_stop(usage: Optional[Mapping[str, Tuple[float, float]]], now: float,
     """When paid runs may start again and why, or None while the plan has room.
     Unreadable usage stops them. `stops` names the windows to check and each
     one's stop (default USAGE_STOP, the Go plan's); a PACED window also keeps
-    under stop * gone + `slack` (default PACE_SLACK)."""
+    under stop * gone + `slack` (default PACE_SLACK). The Claude lane's cap
+    (bus/usage_cap.py) passes its own weekly stop and slack."""
     if usage is None:
         return now + RETRY_NOTHING, "plan usage could not be read"
     for name, stop in (USAGE_STOP if stops is None else stops).items():
