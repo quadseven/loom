@@ -17,12 +17,31 @@ KEPT_OUT = {
 }
 
 
+def run(code: str) -> str:
+    """Run `code` in a fresh interpreter; the child's stderr is the failure."""
+    out = subprocess.run([sys.executable, "-B", "-c", code], cwd=ROOT,
+                         capture_output=True, text=True, timeout=60)
+    if out.returncode != 0:
+        raise AssertionError("child exited %d: %s" % (out.returncode, out.stderr.strip()))
+    return out.stdout
+
+
 def loaded(module: str) -> set:
-    code = ("import sys, %s; print('\\n'.join(m for m in sys.modules if m.startswith('bus.')))"
-            % module)
-    out = subprocess.run([sys.executable, "-B", "-c", code], cwd=ROOT, check=True,
-                         capture_output=True, text=True, timeout=60).stdout
-    return set(out.split())
+    return set(run("import sys, %s; print('\\n'.join(m for m in sys.modules "
+                   "if m.startswith('bus.')))" % module).split())
+
+
+# Each call reaches one lazy import from a fresh interpreter, so a lazy import
+# that no longer resolves fails here and not first in a lane pass.
+CALLS = (
+    "from bus import operator_hold; print(operator_hold.host_only('## Acceptance criteria\\n'"
+    "'- [ ] `pytest` passes'))",
+    "from bus import operator_hold; print(repr(operator_hold.measurement_reason("
+    "None, 'o/r', {}, 'A plain ticket.', [])))",
+    "from bus import pr_repair; print(pr_repair.build_checklist('A plain ticket.', '- [ ] x'))",
+    "import pathlib; from bus import evidence; print(evidence.lines_since("
+    "pathlib.Path('/nonexistent/capture'), 'ready', 0.0, 1.0, 1.0))",
+)
 
 
 class ImportGraphTest(unittest.TestCase):
@@ -32,6 +51,11 @@ class ImportGraphTest(unittest.TestCase):
                 found = loaded(module)
                 self.assertIn(module, found)
                 self.assertEqual([m for m in absent if m in found], [])
+
+    def test_lazy_imports_resolve_when_called(self):
+        for code in CALLS:
+            with self.subTest(code=code):
+                run(code)
 
 
 if __name__ == "__main__":
