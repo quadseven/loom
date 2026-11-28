@@ -161,14 +161,12 @@ def codex_records(lanes: List[str], sessions: Path, now: float,
         record["window_minutes"] = data["minutes"]
         record["observed_at"] = data["observed"]
         records.append(record)
-    # Lane sessions can live outside the station's Codex home. Forwarded
-    # readings fill windows the station did not find in its local logs.
-    if len(found) < len(_CODEX_WINDOWS) and home is not None and _newest_meter(home, lanes) is not None:
-        forwarded = _meter_records("codex", home, lanes, now)
-        if not sessions_dir_exists:
-            return forwarded
-        records.extend(row for row in forwarded
-                       if row["used_pct"] is not None and row["window"] not in found)
+    # Lane sessions can live outside the station's Codex home. Use the
+    # forwarded reading for each window without a current local reading.
+    if home is not None:
+        records = with_forwarded_codex(home, records, lanes, now)
+        if not sessions_dir_exists and len(records) < len(_CODEX_WINDOWS):
+            records.extend(_unavailable_codex_meter_rows(home, records, lanes, now))
     note = ("rate-limit fields not found" if sessions_dir_exists
             else "no codex session logs on this machine")
     return records or [_record("codex", lanes, "all", None, None, None, None,
@@ -400,6 +398,11 @@ def _meter_records(provider: str, home: str, slots: List[str], now: float) -> Li
     if row is None:
         return [_record(provider, slots, "all", None, None, None, None, "lane meter", now,
                         "no meter reading yet: the lane reads it with its key on its next pass")]
+    return _records_from_meter(provider, slots, now, row)
+
+
+def _records_from_meter(provider: str, slots: List[str], now: float,
+                        row: Dict[str, Any]) -> List[Dict[str, Any]]:
     source = str(row.get("source") or "lane meter")
     observed = datetime.fromtimestamp(row["at"], timezone.utc).isoformat()
     records = []
@@ -422,6 +425,86 @@ def _meter_records(provider: str, home: str, slots: List[str], now: float) -> Li
     error = row.get("error") if isinstance(row.get("error"), str) else None
     return [_record(provider, slots, "all", None, None, None, None, source, now,
                     "meter read failed: %s" % (error or "the answer had no meter"))]
+
+
+def _unavailable_codex_meter_rows(home: str, records: List[Dict[str, Any]], slots: List[str],
+                                  now: float) -> List[Dict[str, Any]]:
+    """Keep known windows and meter errors visible on a station without session logs."""
+    meter = _newest_meter(home, slots)
+    if meter is None:
+        return []
+    try:
+        candidates = _records_from_meter("codex", slots, now, meter)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return []
+    missing = {window for _, window in _CODEX_WINDOWS} - {row["window"] for row in records}
+    if not records:
+        missing.add("all")
+    return [{**row, "used_pct": None} for row in candidates if row["window"] in missing]
+
+
+def _codex_windows_needing_meter(records: List[Dict[str, Any]], now: float) -> Dict[str, Optional[int]]:
+    missing: Dict[str, Optional[int]] = dict.fromkeys(window for _, window in _CODEX_WINDOWS)
+    for index, row in enumerate(records):
+        window = row.get("window")
+        if row.get("provider") != "codex" or not isinstance(window, str) or window not in missing:
+            continue
+        if current_window_reading(row, now) is None:
+            missing[window] = index
+        else:
+            del missing[window]
+    return missing
+
+
+def _matching_codex_meters(home: str, records: List[Dict[str, Any]], slots: List[str], now: float,
+                           missing: Dict[str, Optional[int]]) -> Dict[str, tuple[float, Dict[str, Any]]]:
+    available: Dict[str, tuple[float, Dict[str, Any]]] = {}
+    for slot in slots:
+        try:
+            meter_rows = _meter_records("codex", home, [slot], now)
+        except (TypeError, ValueError, OverflowError, OSError):
+            continue
+        for row in meter_rows:
+            window = row["window"]
+            if window not in missing:
+                continue
+            reading = current_window_reading(row, now)
+            if reading is None:
+                continue
+            index = missing[window]
+            if index is not None:
+                minutes = _daily_amount(records[index].get("window_minutes"))
+                if minutes and minutes != row["window_minutes"]:
+                    continue
+            _, observed, _, _ = reading
+            if window not in available or observed > available[window][0]:
+                available[window] = (observed, row)
+    return available
+
+
+def with_forwarded_codex(home: str, records: List[Dict[str, Any]], slots: List[str],
+                         now: float) -> List[Dict[str, Any]]:
+    """Fill missing or unusable Codex windows from the configured lane meters."""
+    if not slots:
+        return records
+    missing = _codex_windows_needing_meter(records, now)
+    if not missing:
+        return records
+    available = _matching_codex_meters(home, records, slots, now, missing)
+    if not available:
+        return records
+    result = list(records)
+    for window, (_, row) in available.items():
+        index = missing[window]
+        fields = {key: row[key] for key in ("used_pct", "resets_at", "observed_at", "window_minutes")}
+        if index is None:
+            template = _record("codex", slots, window, None, None, "percent", None,
+                               "codex lane meter", now)
+            template.update(host=this_host(), holds=lane_holds(home, slots))
+            result.append({**template, **fields})
+        else:
+            result[index] = {**records[index], **fields, "source": "codex lane meter", "note": None}
+    return [row for row in result if (row.get("provider"), row.get("window")) != ("codex", "all")]
 
 
 def _amount(value: float) -> str:
@@ -643,6 +726,25 @@ def _parse(value: Any) -> Optional[float]:
 def observation_time(row: Dict[str, Any]) -> Optional[float]:
     """Use the collection time only for legacy rows with no observation field."""
     return _parse(row.get("observed_at", row.get("as_of")))
+
+
+def current_window_reading(row: Dict[str, Any], now: float) -> Optional[tuple[float, float, float, float]]:
+    """Return used share, observation, reset, and elapsed share for a current window."""
+    # Meter timestamps are stored as ISO datetimes with microsecond precision.
+    now = round(now, 6)
+    used = _daily_amount(row.get("used_pct"))
+    minutes = _daily_amount(row.get("window_minutes"))
+    observed = observation_time(row)
+    reset = _parse(row.get("resets_at"))
+    if used is None or used > 100 or not minutes or observed is None or reset is None:
+        return None
+    length = minutes * 60
+    if not math.isfinite(length):
+        return None
+    start = reset - length
+    if now >= reset or not max(start, now - STALE_AFTER) <= observed <= now:
+        return None
+    return used, observed, reset, (now - start) / length * 100
 
 
 def stale_reason(row: Dict[str, Any], now: float) -> Optional[str]:
