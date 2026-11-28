@@ -27,6 +27,7 @@ from bus.github import GitHubError, RateLimited, Response  # noqa: E402
 REPO = "owner/loom"
 APP = "loom-station[bot]"
 TICKET = "owner.app-7"
+CODEX_SLOTS = ["codex-%d" % n for n in range(2, 9)]
 BRIEF = ("# Ticket\n\nRepo: owner/app\nBranch: loom/owner.app-7\n"
          "Lane: opencode-go\n\nDo the thing.\n")
 
@@ -143,14 +144,14 @@ class RunnersTest(unittest.TestCase):
                          ["claude", "zen", "free-kilo", "free-openrouter", "zai", "workersai",
                           "opencode-go-1", "opencode-go-2", "opencode-go-3", "opencode-go-4",
                           "anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5",
-                          "anthropic-6", "anthropic-7", "anthropic-8"])
+                          "anthropic-6", "anthropic-7", "anthropic-8"] + CODEX_SLOTS)
 
     def test_copilot_can_be_configured_as_a_runner_slot(self):
         self.assertEqual(runners.runner_slots({"LOOM_RUNNER_SLOTS": "copilot"}),
                          ["copilot", "free-openrouter", "zai", "zen", "workersai", "opencode-go-1",
                           "opencode-go-2", "opencode-go-3", "opencode-go-4",
                           "anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5",
-                          "anthropic-6", "anthropic-7", "anthropic-8"])
+                          "anthropic-6", "anthropic-7", "anthropic-8"] + CODEX_SLOTS)
 
     def test_a_station_with_runner_slots_also_runs_the_tracked_slots(self):
         # A plist changes only by reinstalling, which also replaces every
@@ -160,12 +161,12 @@ class RunnersTest(unittest.TestCase):
                          ["free-gemma", "free-openrouter", "zai", "zen", "workersai", "opencode-go-1",
                           "opencode-go-2", "opencode-go-3", "opencode-go-4",
                           "anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5",
-                          "anthropic-6", "anthropic-7", "anthropic-8"])
+                          "anthropic-6", "anthropic-7", "anthropic-8"] + CODEX_SLOTS)
 
     def test_the_base_anthropic_slot_can_be_selected_explicitly(self):
         slots = runners.runner_slots({"LOOM_RUNNER_SLOTS": "anthropic, free-gemma"})
         self.assertEqual(slots[:2], ["anthropic", "free-gemma"])
-        self.assertEqual(slots[-7:], ["anthropic-%d" % n for n in range(2, 9)])
+        self.assertEqual(slots[-14:-7], ["anthropic-%d" % n for n in range(2, 9)])
 
     def test_workersai_is_a_tracked_slot_with_its_account_parameter(self):
         settings = runners.lane_settings("workersai", {
@@ -258,6 +259,60 @@ class RunnersTest(unittest.TestCase):
         self.assertEqual(inputs["slot"], "workersai")
         self.assertIn("LOOM_WORKERSAI_KEY_SSM=/example/provider-setting", inputs["settings"])
         self.assertIn("LOOM_WORKERSAI_ACCOUNT_SSM=/example/provider-setting", inputs["settings"])
+
+    def codex_runner(self, home, env):
+        return runners.Runners(self.gh, str(home), REPO, runners.runner_slots(env), env,
+                               lambda repo: self.public.get(repo, False), self.said.append,
+                               actor=APP, now=self.now, fetch=self.fetch)
+
+    def test_codex_2_to_8_are_tracked_runner_slots_and_9_to_16_are_not(self):
+        slots = runners.runner_slots({"LOOM_RUNNER_SLOTS": "free-gemma"})
+        self.assertEqual([s for s in slots if s.startswith("codex")],
+                         ["codex-%d" % n for n in range(2, 9)])
+        self.assertNotIn("codex", slots)
+        with mock.patch.dict(os.environ, {"LOOM_RUNNER_SLOTS": "free-gemma"}):
+            self.assertTrue(station.needs_public_repo("codex-2", "gpt-test"))
+
+    def test_a_codex_slot_dispatches_a_public_repo_and_refuses_a_private_one(self):
+        env = dict(self.env, LOOM_CODEX_SESSION_SSM="/example/codex/session",
+                   LOOM_CODEX_MODEL="gpt-test")
+        brief = BRIEF.replace("Lane: opencode-go", "Lane: codex")
+        inbox = self.home / "briefs" / "codex-2"
+        inbox.mkdir(parents=True)
+        (inbox / (TICKET + ".md")).write_text(brief)
+        self.codex_runner(self.home, env).tend()
+        posts = self.gh.posts("/dispatches")
+        self.assertEqual([p[2]["inputs"]["slot"] for p in posts], ["codex-2"])
+        settings = posts[0][2]["inputs"]["settings"]
+        self.assertIn("LOOM_CODEX_SESSION_SSM=/example/codex/session\n", settings)
+        self.assertIn("LOOM_CODEX_MODEL=gpt-test\n", settings)
+
+        self.gh.calls.clear()
+        self.public["owner/app"] = False
+        home = self.root / "private-loom"
+        inbox = home / "briefs" / "codex-2"
+        inbox.mkdir(parents=True)
+        (inbox / (TICKET + ".md")).write_text(brief)
+        self.codex_runner(home, env).tend()
+        self.assertEqual(self.gh.posts("/dispatches"), [])
+        self.assertTrue((inbox / "failed" / (TICKET + ".md")).exists())
+        log = (home / "logs" / "codex-2" / (TICKET + ".log")).read_text()
+        self.assertIn("runner slots take public repos only", log)
+
+    def test_a_codex_slot_waits_for_the_broker_session_parameter(self):
+        env = dict(self.env, LOOM_RUNNER_SLOTS="codex-2")
+        inbox = self.home / "briefs" / "codex-2"
+        inbox.mkdir(parents=True)
+        (inbox / (TICKET + ".md")).write_text(BRIEF)
+        runner = self.codex_runner(self.home, env)
+        runner.tend()
+        self.assertEqual(self.gh.posts("/dispatches"), [])
+        self.assertEqual(runner.load()["holds"]["codex-2"]["needs"], "LOOM_CODEX_SESSION_SSM")
+        runner.env["LOOM_CODEX_SESSION_SSM"] = "/example/codex/session"
+        (inbox / "ticket-ready.md").write_text(BRIEF)
+        runner.tend()
+        self.assertEqual([p[2]["inputs"]["ticket"] for p in self.gh.posts("/dispatches")],
+                         ["ticket-ready"])
 
     def test_a_brief_is_dispatched_once_with_its_inputs(self):
         self.env["LOOM_EGRESS_RECHECK_SECONDS"] = "15"

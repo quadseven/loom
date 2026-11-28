@@ -98,10 +98,15 @@ TRACKED_SLOTS = {
     "opencode-go-3": {"LOOM_OPENCODE_GO_3_MODEL": "opencode-go/deepseek-v4.1-flash"},
     "opencode-go-4": {"LOOM_OPENCODE_GO_4_MODEL": "opencode-go/muse-spark-1.3-contributor"},
     **{"anthropic-%d" % n: {} for n in range(2, 9)},
+    # Luna: the codex slots sign in with the broker's session copy
+    # (LOOM_CODEX_SESSION_SSM) and take the station's LOOM_CODEX_MODEL.
+    # codex-9 to codex-16 wait for the pool sizing.
+    **{"codex-%d" % n: {} for n in range(2, 9)},
 }
 OPENCODE_GO_SLOTS = tuple("opencode-go-%d" % n for n in range(1, 5))
 OPENCODE_GO_KEY_SSM = "LOOM_OPENCODE_GO_KEY_SSM"
 ANTHROPIC_KEY_SSM = "LOOM_ANTHROPIC_KEY_SSM"
+CODEX_SESSION_SSM = "LOOM_CODEX_SESSION_SSM"
 # A run no runner has taken after this many seconds is cancelled and parked:
 # the runner set may be scaled to zero.
 QUEUE_MAX = 1800
@@ -244,6 +249,17 @@ def _api_key_setting(slot: str) -> str:
     if slot in OPENCODE_GO_SLOTS:
         return OPENCODE_GO_KEY_SSM
     return ANTHROPIC_KEY_SSM if provider(slot) == "anthropic" else ""
+
+
+def required_settings(slot: str) -> Tuple[str, ...]:
+    """The settings a dispatch for `slot` must carry: its API key, the
+    Workers AI account, or a codex slot's broker session parameter."""
+    if slot == "workersai":
+        return ("LOOM_WORKERSAI_KEY_SSM", "LOOM_WORKERSAI_ACCOUNT_SSM")
+    if provider(slot) == "codex":
+        return (CODEX_SESSION_SSM,)
+    key = _api_key_setting(slot)
+    return (key,) if key else ()
 
 
 def lane_settings(slot: str, env: Dict[str, str]) -> Dict[str, str]:
@@ -563,11 +579,8 @@ class Runners:
             self._refuse(ledger, entry, red_reason(repo, red))
             return
         settings = self._dispatch_settings(slot)
-        api_key_setting = _api_key_setting(slot)
-        required = (api_key_setting,) if api_key_setting else ()
-        if slot == "workersai":
-            required = ("LOOM_WORKERSAI_KEY_SSM", "LOOM_WORKERSAI_ACCOUNT_SSM")
-        missing = next((name for name in required if not settings.get(name, "").strip()), None)
+        missing = next((name for name in required_settings(slot)
+                        if not settings.get(name, "").strip()), None)
         if missing:
             why = "missing required runner setting %s" % missing
             self._refuse(ledger, entry, why)

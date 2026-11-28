@@ -3190,12 +3190,22 @@ long-lived OAuth token copied from SSM into a mode-600 file under the job home
 and exported only to the Claude CLI process. The Claude lane runs with
 `--permission-mode acceptEdits --allowedTools Bash` because a pod has no
 settings file allowing edits and print mode cannot answer a prompt. Codex
-uses its broker session file. API lanes include anthropic, opencode-go, zen,
+uses its broker session file: the job copies the parameter
+`LOOM_CODEX_SESSION_SSM` names into `run/codex-auth.json` under the job home
+(mode 600, no refresh token, refused when older than six hours), and the run
+copies it into the run's own Codex home as `auth.json`. The station holds a
+codex slot, and dispatches nothing to it, until that setting is present.
+Codex runs as on a Mac, `codex exec --sandbox workspace-write`, outside
+bwrap: its own Linux sandbox needs the user namespaces that the pod's
+`sandbox_ready` proof starts, so a pod that passes the proof can run it.
+API lanes include anthropic, opencode-go, zen,
 openrouter, zai, workersai, the free provider slots and spark (both through
 the gateway). The agy lane stays local.
 
 Enabling cluster runners also includes the tracked slots `anthropic-2`
-through `anthropic-8`. To move the base `anthropic` slot as well, include it
+through `anthropic-8` and the Luna slots `codex-2` through `codex-8` (public
+repos only, like every runner slot; `codex-9` to `codex-16` stay local until
+the pool is sized for them). The runner image needs the Codex CLI for them. To move the base `anthropic` slot as well, include it
 in `LOOM_RUNNER_SLOTS`. Stop any local runner for a slot before taking its
 briefs on the cluster, and include the moved slots in `LOOM_RUNNER_SLOTS`
 when reinstalling to keep those local jobs disabled. The pods need the
