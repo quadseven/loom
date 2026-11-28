@@ -6,8 +6,10 @@ import json
 import os
 import io
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from email.message import Message
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -18,6 +20,47 @@ from dashboard.server import _dispatch_get, _handler_for
 
 
 class TicketRenderingTests(unittest.TestCase):
+    def test_transcript_coverage_only_returns_recent_finished_lane_slots(self):
+        state = SimpleNamespace(transcripts=transcripts.Store(transcripts.MemoryBackend()),
+                                _station_state_bg=True)
+        handler_type = _handler_for(state)
+        now = datetime.now(timezone.utc)
+
+        def request(method, path, token=None, payload=None):
+            handler = handler_type.__new__(handler_type)
+            handler.path = path
+            handler.headers = Message()
+            if token:
+                handler.headers["Authorization"] = "Bearer " + token
+            raw = json.dumps(payload).encode()
+            handler.headers["Content-Length"] = str(len(raw))
+            handler.rfile = io.BytesIO(raw)
+            handler.send_json = handler.send_text = lambda code, value: (code, value)
+            return getattr(handler, "do_" + method)()
+
+        def upload(slot, ticket, hours_ago, outcome):
+            return request("POST", "/api/transcripts", "upload-example", {
+                "ticket": ticket, "slot": slot, "model": "example-model", "outcome": outcome,
+                "started_at": (now - timedelta(hours=hours_ago + 25)).isoformat(),
+                "finished_at": (now - timedelta(hours=hours_ago)).isoformat(), "events": [
+                    {"ts": now.isoformat(), "role": "assistant", "kind": "text", "text": "example event"},
+                ],
+            })
+
+        with patch.dict(os.environ, {"LOOM_UPLOAD_TOKEN": "upload-example",
+                                     "LOOM_HANDOFF_TOKEN": "read-example"}):
+            self.assertEqual(request("GET", "/api/transcripts/coverage")[0], 401)
+            self.assertEqual(upload("spark-2", "example-owner/sample" "#12", 1, "done")[0], 201)
+            self.assertEqual(upload("spark-2", "example-owner/sample" "#13", 2, "failed")[0], 201)
+            self.assertEqual(upload("spark-3", "example-owner/sample" "#14", 25, "done")[0], 201)
+            self.assertEqual(upload("spark-4", "example-owner/sample" "#15", 1, "running")[0], 201)
+            self.assertEqual(upload("brain", "brain/2026-10-13T09:00:00Z", 1, "failed")[0], 201)
+            self.assertEqual(request("GET", "/api/transcripts/coverage", "read-example"),
+                             (200, {"slots": ["spark-2"]}))
+            with patch.object(state.transcripts, "covered_slots", side_effect=OSError("example storage detail")):
+                self.assertEqual(request("GET", "/api/transcripts/coverage", "upload-example"),
+                                 (503, {"error": "transcript storage unavailable"}))
+
     def test_review_threads_interleave_with_events_by_timestamp(self):
         rows = interleave_activity(
             [{"ts": "2026-10-14T10:00:02Z", "role": "assistant", "kind": "text", "text": "continued"}],
