@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Iterable, List, Union
 
-from . import log_capture, text
+from . import text
 
 LogSource = Union[str, Path]
 
@@ -234,6 +234,7 @@ def lines_since(command: LogSource, literal: str, since: float, now: float,
     deploy is never taken as its evidence. A capture must cover the window
     from since through now without a gap."""
     if isinstance(command, Path):
+        from . import log_capture  # only a capture file reads it (#3662)
         try:
             captured = log_capture.read(command, literal, since)
         except (OSError, ValueError, OverflowError):
@@ -266,6 +267,7 @@ def _quote(command: LogSource, needle: str, windows: Optional[List[float]] = Non
         return ("- `%s`: too general to search (its longest fixed text is under %d "
                 "characters); no lines quoted." % (needle, MIN_LITERAL)), None
     if isinstance(command, Path):
+        from . import log_capture  # only a capture file reads it (#3662)
         try:
             captured = log_capture.read(command, literal, since)
         except (OSError, ValueError, OverflowError):
