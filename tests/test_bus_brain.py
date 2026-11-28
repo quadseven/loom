@@ -1109,6 +1109,61 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertLess(puts[0], polled[0])
         self.assertLess(polled[0], deleted[0])
 
+    def test_merge_of_a_stacked_pull_request_settles_from_the_pull_request_when_merge_async_cannot_be_polled(self):
+        # loom#3674: the merge-async PUT carries no id, so the bare poll path
+        # answers 404; fall back to the pull request's merged field.
+        body = self._criteria_pr("built")
+        pr, query = self._merge_replies({"pr": {
+            "body": body, "stack": {"id": 3},
+            "base": {"ref": "main", "repo": {"full_name": REPO}}}})
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"},
+                                             {"name": "loom:pr"}]}
+        fake = Fake(pr, query, reply(200, issue),
+                    reply(200, {"behind_by": 0}),
+                    reply(202, {"status": "pending"}),
+                    reply(404),
+                    reply(200, {"merged": True}),
+                    reply(204), reply(200, []), reply(200, issue), reply(200, {}))
+        with unittest.mock.patch.object(brain, "_sleep", lambda seconds: None):
+            result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+        self.assertTrue(result["merged"])
+        puts = [i for i, c in enumerate(fake.calls)
+                if c[0] == "PUT" and "/pulls/8/" in c[1]]
+        self.assertEqual(len(puts), 1)
+        self.assertTrue(fake.calls[puts[0]][1].endswith("/pulls/8/merge-async"))
+        polled = [i for i, c in enumerate(fake.calls)
+                  if c[0] == "GET" and "/pulls/8/merge-async" in c[1]
+                  and "/merge-async/" not in c[1]]
+        self.assertTrue(polled)
+        fell_back = [i for i, c in enumerate(fake.calls)
+                     if i > puts[0] and c[0] == "GET"
+                     and c[1].endswith("/repos/%s/pulls/8" % REPO)]
+        self.assertTrue(fell_back)
+        self.assertLess(puts[0], polled[0])
+        self.assertLess(polled[0], fell_back[0])
+
+    def test_merge_of_a_stacked_pull_request_still_raises_when_it_does_not_finish(self):
+        # loom#3674: an unmerged pull request past the deadline still raises.
+        body = self._criteria_pr("built")
+        pr, query = self._merge_replies({"pr": {
+            "body": body, "stack": {"id": 3},
+            "base": {"ref": "main", "repo": {"full_name": REPO}}}})
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"},
+                                             {"name": "loom:pr"}]}
+        clock = [0.0]
+        with unittest.mock.patch.object(brain, "_clock", lambda: clock[0]), \
+                unittest.mock.patch.object(brain, "_sleep",
+                                           lambda s: clock.__setitem__(0, clock[0] + s)):
+            fake = Fake(pr, query, reply(200, issue),
+                        reply(200, {"behind_by": 0}),
+                        reply(202, {"status": "pending"}),
+                        reply(404),
+                        reply(200, {"merged": False}))
+            with self.assertRaisesRegex(ValueError, "did not finish"):
+                brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9),
+                            env={"LOOM_MERGE_ASYNC_SECONDS": "5"})
+        self.assertEqual(clock[0], 5.0)
+
     def test_merge_refuses_an_open_stacked_base_with_the_status_blocker(self):
         pr, _ = self._merge_replies({"pr": {
             "body": self._criteria_pr("built"),
