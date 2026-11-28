@@ -373,6 +373,83 @@ class RemoteLaneGoesSilentTest(FeedBase):
         self.assertTrue(os.path.exists(self.pod_path("briefs", SLOT, "returned", name + ".md")))
 
 
+class LeaseHandoverTest(FeedBase):
+    """Two station replicas, one lease holder: a fed slot's brief sits in the
+    holder's own inbox, so a new holder rebuilds it from the offer row."""
+
+    def replica(self, name, epoch):
+        home = os.path.join(self._tmp.name, name)
+        return home, FakeLease(epoch=epoch)
+
+    def tend_as(self, home, lease, now):
+        lane_feed.Feed(home, self.env, self.station_rows, self.said.append, now=now,
+                       lease=lease).tend()
+
+    def test_a_fed_run_in_flight_survives_a_change_of_holder(self):
+        name = self.queue()
+        now = time.time()
+        holder_a = FakeLease(epoch=3)
+        self.lease = holder_a
+        self.tend(now)
+        offered = self.row("offer")
+        self.assertEqual(offered["epoch"], 3)
+        self.sync(now + 1)
+        self.pod_beat(at=now, alive=now)
+        self.sync(now + 2)
+
+        # The standby takes the lease at a higher epoch; its inbox is empty.
+        home_b, holder_b = self.replica("replica-b", 4)
+        self.tend_as(home_b, holder_b, now + 3)
+        offer = self.row("offer")
+        self.assertEqual((offer["id"], offer["state"], offer["epoch"]),
+                         (offered["id"], "offered", 4))
+        with open(os.path.join(home_b, "briefs", SLOT, name + ".md")) as fh:
+            self.assertEqual(fh.read(), brief_text())
+        # Nothing else is offered over the run in flight.
+        self.tend_as(home_b, holder_b, now + 4)
+        self.assertEqual(self.row("offer")["id"], offered["id"])
+
+        # The run finishes and its outcome lands on the new holder's ticket.
+        self.pod_finish(name)
+        self.pod_beat(at=now + 5)
+        self.sync(now + 6)
+        self.tend_as(home_b, holder_b, now + 7)
+        self.assertTrue(os.path.exists(os.path.join(home_b, "briefs", SLOT, "done", name + ".md")))
+        self.assertFalse(os.path.exists(os.path.join(home_b, "briefs", SLOT, name + ".md")))
+        self.assertEqual(self.row("offer")["state"], "done")
+
+    def test_a_brief_that_left_the_inbox_under_the_same_holder_is_still_withdrawn(self):
+        name = self.queue()
+        now = time.time()
+        self.lease = FakeLease(epoch=3)
+        self.tend(now)
+        os.remove(self.inbox(SLOT, name + ".md"))
+        self.tend(now + 1)
+        self.assertEqual(self.row("offer")["state"], "withdrawn")
+
+    def test_an_offer_with_no_epoch_is_withdrawn_when_its_brief_is_missing(self):
+        name = self.queue()
+        now = time.time()
+        self.tend(now)
+        self.assertNotIn("epoch", self.row("offer"))
+        os.remove(self.inbox(SLOT, name + ".md"))
+        self.lease = FakeLease(epoch=4)
+        self.tend(now + 1)
+        self.assertEqual(self.row("offer")["state"], "withdrawn")
+
+    def test_an_offer_whose_brief_is_not_text_is_withdrawn_not_rebuilt(self):
+        name = self.queue()
+        now = time.time()
+        self.lease = FakeLease(epoch=3)
+        self.tend(now)
+        offer = self.row("offer")
+        self.station_rows.write(SLOT, "offer", dict(offer, brief=None))
+        home_b, holder_b = self.replica("replica-b", 4)
+        self.tend_as(home_b, holder_b, now + 1)
+        self.assertEqual(self.row("offer")["state"], "withdrawn")
+        self.assertFalse(os.path.exists(os.path.join(home_b, "briefs", SLOT, name + ".md")))
+
+
 class OnlyTheSlotsPodIsBelievedTest(FeedBase):
     """The station believes a row only from the pod its setting names for
     the slot, and applies a report only when that pod also claimed the offer."""
