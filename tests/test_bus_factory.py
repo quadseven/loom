@@ -3797,6 +3797,42 @@ class EveryLaneTriesEveryTicket(Base):
         self.assign(available=["anthropic", "codex", "spark", "free-ollama"])
         self.assertEqual([self.lane(n) for n in (7, 8, 9)], ["spark", "free-ollama", "codex"])
 
+    def test_a_plain_queued_ticket_takes_the_cheapest_free_serving_lane_without_a_model(self):
+        # loom#3594: the station briefs a plain queued ticket itself. The Sparks
+        # first, then the free providers, then opencode-go, never a lane that is
+        # not serving; no brain tick is involved.
+        body = "Priority: P2\n\n## Why\nx\n"
+        for available, expected in ((["opencode-go", "free-ollama", "codex"], "free-ollama"),
+                                    (["opencode-go", "codex", "spark-2"], "spark-2"),
+                                    (["opencode-go", "codex"], "opencode-go")):
+            self.setUp()
+            self.queued(7, body=body)
+            self.assign(available=available)
+            self.assertEqual(self.lane(7), expected)
+
+    def test_a_queued_ticket_with_no_acceptance_box_is_left_for_the_brain(self):
+        self.queued(7, body="Priority: P2\n\n## Why\nx\n", boxes=False)
+        self.assign(available=["spark", "free-ollama"])
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+
+    def test_a_queued_ticket_never_goes_to_an_anthropic_slot_under_the_spend_floor(self):
+        # lane_state parks an anthropic slot under the floor, the station leaves
+        # a parked slot out of `available`, and the factory then has no lane to
+        # give the ticket: it stays queued rather than reach an anthropic slot.
+        from bus import lane_state, spend
+        under = spend.Summary([], spend.Budget(usd=3.0, floor=5.0), NOW)
+        self.assertTrue(under.under_floor())
+        beat = {"at": NOW, "available": True}
+        serving = [lane for lane in factory.LANE_ORDER
+                   if lane_state.evaluate(beat, NOW, credit=under if lane in factory.ANTHROPIC else None).available]
+        self.assertIn("spark", serving)
+        self.assertFalse(set(serving) & set(factory.ANTHROPIC))
+        self.queued(7, body="Priority: P2\n\n## Why\nx\n")
+        self.assign(available=[])
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+        self.assign(available=serving)
+        self.assertEqual(self.lane(7), "spark")
+
     def test_a_private_ticket_never_gets_a_public_only_lane(self):
         self.gh.private = True
         self.queued(7, body="Difficulty: hard\n\n## Why\nx\n")

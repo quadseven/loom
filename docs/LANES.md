@@ -1377,6 +1377,8 @@ tick about every 30 minutes), so a large intake drains at about 15 issues an
 hour, not at the intake's rate; those two caps bound it. A repo with a backlog goal home also has `triage_backlogs` (25 a run,
 before this intake in the pass), which queues a ready issue with no model.
 
+The station takes the plain cases without a model call: a ready issue with every brief section becomes a `loom:queued` ticket under its goal's intake epic, and `assign_queued` briefs a queued ticket to the first free serving lane by cost (Sparks, free providers, opencode-go, then the rest of `LANE_ORDER`), leaving an anthropic slot parked under the spend floor out. The brain keeps what fails a check: an incomplete issue stays at `loom:triage`, and a queued ticket with a hard pin, a hold or no acceptance box is briefed or rewritten at the brain's step.
+
 Each Loom sets these for itself when it installs; a second operator running
 from a clone of another operator's checkout must not inherit them:
 

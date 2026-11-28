@@ -519,8 +519,12 @@ One still not ready is left as it is, with no write, and does not count
 against `--limit`. So an issue an intake labelled without reading it
 (`ready-for-agent`, or any unseen issue, docs/LANES.md), or one whose body
 was completed later, becomes a ticket at the station's hourly triage with
-no model call, and the station gives the queued ticket the first free lane
-of its tier, cheapest first. On 2026-11-25 brain ticks recorded "no
+no model call, and the station gives the queued ticket the first free
+serving lane, cheapest first (the Sparks, then the free providers, then
+opencode-go, as in docs/MUSE.md, Lane choice), never an anthropic slot that
+is parked under the spend floor. A ticket with no acceptance box, or any
+issue that fails a brief check, is not taken: it stays for the brain's triage
+and brief steps. On 2026-11-25 brain ticks recorded "no
 rewrites this tick, the hourly station triage covers intake" while ready
 `loom:triage` issues waited: this makes that true for the plain case.
 
