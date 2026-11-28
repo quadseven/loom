@@ -30,6 +30,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from functools import partial
 from pathlib import Path
 from urllib.parse import quote
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
@@ -2554,6 +2555,8 @@ class Station:
         self.post = post or post_webhook
         self.upload = upload or post_transcript
         self.fetch = fetch or brain_memory.fetch_handoff
+        self.fetch_transcript_coverage = fetch or partial(
+            brain_memory.fetch_json, what="transcript coverage", timeout=6, retry_delays=())
         self.ancestor = ancestor or _is_ancestor
         self.head = head or _checkout_head
         # Where Claude Code and codex keep their sessions (the claude lane's
@@ -15523,6 +15526,7 @@ class Station:
                                       "filing and the rest of the settle step")
             raise
         self._read_facts = facts
+        self._report_transcript_coverage(facts.runs)
         self._unstick_lane_pulls(facts)
         self._create_verify_handoffs(facts)
         breaches = invariants.check(facts, _say)
@@ -16273,6 +16277,28 @@ class Station:
             _say("could not read the transcript token parameter (%s); next pass"
                  % secret_read_reason(err))
             return None
+
+    def _report_transcript_coverage(self, runs: Optional[List[invariants.Run]]) -> None:
+        if not runs:
+            return
+        if not (self.s.transcript_url and self.s.transcript_token_ssm):
+            _say("transcript coverage: dashboard upload settings are missing")
+            return
+        token = self._transcript_token()
+        if token is None:
+            return
+        try:
+            url = brain_memory.dashboard_url(self.s.transcript_url, transcripts.COVERAGE_PATH)
+            slots = self.fetch_transcript_coverage(url, token).get("slots")
+        except (OSError, ValueError):
+            _say("transcript coverage: dashboard read unavailable")
+            return
+        if not isinstance(slots, list) or not all(isinstance(slot, str) for slot in slots):
+            _say("transcript coverage: dashboard sent an invalid slot list")
+            return
+        missing = {run.lane for run in runs}.difference(slots)
+        if missing:
+            _say("transcript coverage: no stored run in the last 24 hours for " + ", ".join(sorted(missing)))
 
     def upload_transcripts(self) -> None:
         """Upload each finished run's transcript to the dashboard once. A
