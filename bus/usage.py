@@ -47,6 +47,9 @@ def _utc_epoch(value: Any, now: float, relative: bool = True) -> Optional[str]:
     return None
 
 
+_CODEX_WINDOWS = (("primary", "5-hour"), ("secondary", "weekly"))
+
+
 def _codex_limits(item: Any, now: float) -> Dict[str, Dict[str, Any]]:
     payload = item.get("payload", item) if isinstance(item, dict) else {}
     # The current codex CLI puts rate_limits beside payload.info (token
@@ -62,7 +65,7 @@ def _codex_limits(item: Any, now: float) -> Dict[str, Dict[str, Any]]:
     observed_at = _parse(observed)
     anchor = now if observed_at is None else observed_at
     found = {}
-    for key, label in (("primary", "5-hour"), ("secondary", "weekly")):
+    for key, label in _CODEX_WINDOWS:
         window = limits.get(key)
         if not isinstance(window, dict):
             continue
@@ -142,23 +145,15 @@ def _read_codex_sessions(sessions: Path, now: float) -> Dict[str, Dict[str, Any]
                 continue
             for window, reading in found.items():
                 readings.setdefault(window, reading)
-            if len(readings) == 2:
+            if len(readings) == len(_CODEX_WINDOWS):
                 return readings
     return readings
 
 
 def codex_records(lanes: List[str], sessions: Path, now: float,
                   home: Optional[str] = None) -> List[Dict[str, Any]]:
-    if not sessions.is_dir():
-        # The collector reads the session logs of the machine it runs on. In
-        # the cluster they live in the codex lane's own Codex home, which the
-        # station does not mount, so the lane writes them to the shared Loom
-        # home as state/usage/<slot>.meter.json (bus/meter.py codex_record).
-        if home is not None and _newest_meter(home, lanes) is not None:
-            return _meter_records("codex", home, lanes, now)
-        return [_record("codex", lanes, "all", None, None, None, None, "codex session logs", now,
-                        "no codex session logs on this machine")]
-    found = _read_codex_sessions(sessions, now)
+    sessions_dir_exists = sessions.is_dir()
+    found = _read_codex_sessions(sessions, now) if sessions_dir_exists else {}
     records = []
     for window, data in found.items():
         record = _record("codex", lanes, window, data["used"], None, "percent", data["reset"],
@@ -166,9 +161,18 @@ def codex_records(lanes: List[str], sessions: Path, now: float,
         record["window_minutes"] = data["minutes"]
         record["observed_at"] = data["observed"]
         records.append(record)
-    return records or [
-        _record("codex", lanes, "all", None, None, None, None, "codex session logs", now,
-                "rate-limit fields not found")]
+    # Lane sessions can live outside the station's Codex home. Forwarded
+    # readings fill windows the station did not find in its local logs.
+    if len(found) < len(_CODEX_WINDOWS) and home is not None and _newest_meter(home, lanes) is not None:
+        forwarded = _meter_records("codex", home, lanes, now)
+        if not sessions_dir_exists:
+            return forwarded
+        records.extend(row for row in forwarded
+                       if row["used_pct"] is not None and row["window"] not in found)
+    note = ("rate-limit fields not found" if sessions_dir_exists
+            else "no codex session logs on this machine")
+    return records or [_record("codex", lanes, "all", None, None, None, None,
+                               "codex session logs", now, note)]
 
 
 # No Anthropic API reads the remaining prepaid credit: the Admin API's usage
