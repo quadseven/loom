@@ -1651,6 +1651,12 @@ name only their type, never the URL or the token. The first pass after
 uploads are turned on records the runs already finished without sending
 them, and one pass sends at most 10 and stops at its first failure.
 
+The invariant pass compares its finished lane runs in the last 24 hours with
+the dashboard's authenticated transcript coverage read. `station.log` names
+the slots with recent runs and no stored transcript. An unavailable read or
+missing upload configuration is reported separately. The read has one attempt
+with a six-second socket timeout.
+
 A brain tick is finished when `state/brain.json` has `outcome` `ok` or
 `failed` and a numeric `started` (when `lanes/mac/brain.sh` started the
 agent; a skipped tick has none) and `at` (when it ended). It uploads as slot

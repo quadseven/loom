@@ -267,7 +267,9 @@ def opener_for(proxy: str = "") -> urllib.request.OpenerDirector:
         _NoRedirect, urllib.request.ProxyHandler({"https": proxy, "http": proxy}))
 
 
-def fetch_json(url: str, token: str, what: str = "handoff", proxy: str = "") -> Dict[str, Any]:
+def fetch_json(url: str, token: str, what: str = "handoff", proxy: str = "", *,
+               timeout: float = FETCH_TIMEOUT, retry_delays: Tuple[float, ...] = FETCH_RETRY_DELAYS
+               ) -> Dict[str, Any]:
     """GET one of the dashboard's bearer-token reads (the handoff packet, the
     usage snapshot) as a JSON object, through proxy when one is given. Errors
     never carry the URL, the proxy or the token. Retries on connection
@@ -277,20 +279,20 @@ def fetch_json(url: str, token: str, what: str = "handoff", proxy: str = "") -> 
     opener = opener_for(proxy)
     req = urllib.request.Request(  # noqa: S310 - https only, checked above
         url, method="GET", headers={"User-Agent": "loom-brain", "Authorization": "Bearer " + token})
-    for attempt in range(len(FETCH_RETRY_DELAYS) + 1):
+    for attempt in range(len(retry_delays) + 1):
         try:
-            with opener.open(req, timeout=FETCH_TIMEOUT) as resp:  # noqa: S310
+            with opener.open(req, timeout=timeout) as resp:  # noqa: S310
                 status, raw = resp.status, resp.read(FETCH_MAX)
         except urllib.error.HTTPError as err:
             status, raw = err.code, b""
             err.close()
         except (urllib.error.URLError, OSError):
-            if attempt == len(FETCH_RETRY_DELAYS):
+            if attempt == len(retry_delays):
                 raise OSError("the %s read failed to connect" % what) from None
-            time.sleep(FETCH_RETRY_DELAYS[attempt])
+            time.sleep(retry_delays[attempt])
             continue
-        if status in FETCH_RETRY_STATUSES and attempt < len(FETCH_RETRY_DELAYS):
-            time.sleep(FETCH_RETRY_DELAYS[attempt])
+        if status in FETCH_RETRY_STATUSES and attempt < len(retry_delays):
+            time.sleep(retry_delays[attempt])
             continue
         break
     if status != 200:

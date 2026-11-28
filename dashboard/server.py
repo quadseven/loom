@@ -31,6 +31,7 @@ from bus import tickets as bus_tickets
 from bus import metrics as bus_metrics
 from bus import scorecard
 from bus.naming import strip_kind
+from bus.transcripts import COVERAGE_PATH
 
 from .github import TicketStore
 from .shell import page
@@ -1120,6 +1121,19 @@ def _handle_transcript_post(handler, state):
         return handler.send_json(503, {"error": "transcript storage unavailable"})
 
 
+def _handle_transcript_coverage(handler, state):
+    if not _authorized(handler, BRAIN_READERS):
+        return handler.send_json(401, {"error": "unauthorized"})
+    try:
+        store = _transcript_store(state)
+        slots = store.covered_slots() if store is not None else None
+    except transcript_store.storage_errors():
+        slots = None
+    if slots is None:
+        return handler.send_json(503, {"error": "transcript storage unavailable"})
+    return handler.send_json(200, {"slots": slots})
+
+
 def _handle_usage_get(handler, state):
     """The station's live usage readings, for a brain off the lane machine
     (`python3 -m bus.usage --live`): the read-only brain token or the
@@ -1577,6 +1591,8 @@ def _dispatch_basic(handler, state, path):
         return handler.send_json(200, _floor_live(state))
     if path == "/api/brain/handoff":
         return _handle_brain(handler, state)
+    if path == COVERAGE_PATH:
+        return _handle_transcript_coverage(handler, state)
     if path == "/api/usage":
         return _handle_usage_get(handler, state)
     if path == "/api/bench":

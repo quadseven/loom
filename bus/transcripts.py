@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional
 from . import sessions
 from . import text as _text
 
+COVERAGE_PATH = "/api/transcripts/coverage"
 EVENT_MAX = 20000
 BODY_MAX = 8 * 1024 * 1024
 CUT = "\n[cut]"
