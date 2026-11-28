@@ -47,7 +47,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 from urllib.parse import quote
 
 from . import brief_check, proof, ship_paths, tickets
-from .github import GitHubError
+from .github_lite import GitHubError
 
 SECTION = "Operator steps before merge"
 _HEADING = re.compile(r"^#{2,3}\s*(.+?)\s*#*\s*$")

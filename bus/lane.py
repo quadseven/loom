@@ -11,8 +11,8 @@ import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import (brain, brief_check, change_class, hunt_plan, lane_markers, notify, pr_repair,
-               risk_line, signature, tickets)
+from . import (brain, brief_check, change_class, factory, hunt_plan, lane_markers, notify, pr_repair,
+               revert, risk_line, signature, tickets)
 from .github import GitHub, GitHubError, RateLimited, auth_from_env
 from .labels import REMOTE_LANES
 
@@ -194,33 +194,35 @@ def _recover_and_count(gh: GitHub, repos: Sequence[str], lane: str,
     return active
 
 
-def _candidates(gh: GitHub, repos: Sequence[str], lane: str) -> List[Tuple[str, Dict[str, Any]]]:
-    """(repo, issue) for each public queued ticket assigned to the lane in one
-    of its tiers, oldest first. A ticket that matches the claim label query
+def _candidates(gh: GitHub, repos: Sequence[str], lane: str
+                ) -> List[Tuple[str, Dict[str, Any], str]]:
+    """(repo, issue, default branch) for each eligible ticket, oldest first.
+    A ticket that matches the claim label query
     (loom:queued plus the lane's own label) but is rejected gets one stderr
     line naming the repo, the ticket number and the reason: a routed but
     unclaimable ticket must not vanish silently while the lane looks idle."""
-    found: List[Tuple[str, str, Dict[str, Any]]] = []
+    found: List[Tuple[str, str, Dict[str, Any], str]] = []
     for repo in repos:
         if not tickets.REPO_RE.fullmatch(repo):
             raise ValueError("expected OWNER/NAME, got %r" % repo)
         info = gh.rest("GET", "/repos/%s" % repo).data
         if not isinstance(info, dict) or info.get("private") is not False:
             continue
+        base = str(info.get("default_branch") or "main")
         for item in gh.paginate("/repos/%s/issues?state=open&labels=loom:queued,lane:%s"
                                 % (repo, quote(lane, safe=""))):
             reason = _rejection_reason(item, lane)
             if reason is None and brain.has_open_rewrite(gh, repo, item):
                 reason = "has an open rewrite ticket"
             if reason is None:
-                found.append((str(item.get("created_at") or ""), repo, item))
+                found.append((str(item.get("created_at") or ""), repo, item, base))
             elif isinstance(item, dict) and isinstance(item.get("number"), int):
                 names = _names(item)
                 if "loom:queued" in names and "lane:" + lane in names:
                     print("%s rejected: %s" % ("%s#%d" % (repo, item["number"]), reason),
                           file=sys.stderr)
     found.sort(key=lambda row: (row[0], row[1], int(row[2]["number"])))
-    return [(repo, item) for _, repo, item in found]
+    return [(repo, item, base) for _, repo, item, base in found]
 
 
 def _rejection_reason(item: Any, lane: str) -> Optional[str]:
@@ -244,6 +246,10 @@ def _rejection_reason(item: Any, lane: str) -> Optional[str]:
     # unrun by the runner (loom#2249).
     if brief_check.criteria_verdict(str(item.get("body") or "")) is not None:
         return "no acceptance criteria"
+    # The same reading as the factory's hold and the station's claim, so a
+    # ticket they hold is not one this lane takes.
+    if brief_check.hand_filed_verdict(item) is not None:
+        return "no acceptance box names a test"
     split = brief_check.split_verdict(str(item.get("body") or ""))
     if split is not None:
         return split.reason
@@ -253,15 +259,60 @@ def _rejection_reason(item: Any, lane: str) -> Optional[str]:
 
 
 def _take(gh: GitHub, repo: str, issue: Dict[str, Any], lane: str,
-          now: float) -> Dict[str, Any]:
+          base: str, now: float) -> Dict[str, Any]:
     number = int(issue["number"])
     labels = [x for x in _names(issue) if x != "loom:queued"] + ["loom:running"]
     gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": labels})
     notify.post(gh, repo, number, _claim_body(lane, number, now), notify.RECORD)
-    info = gh.rest("GET", "/repos/%s" % repo).data
-    default = str((info.get("default_branch") if isinstance(info, dict) else "") or "main")
-    return {"repo": repo, "number": number, "base": default,
+    return {"repo": repo, "number": number, "base": base,
             "brief": tickets.render_brief(repo, issue, lane)}
+
+
+def _settle_queued_merge(gh: GitHub, repo: str, issue: Dict[str, Any],
+                         closed: Sequence[Dict[str, Any]], comments: Sequence[Dict[str, Any]]) -> bool:
+    """Settle a queued ticket already delivered by a pull request on the default branch."""
+    number = int(issue["number"])
+    rejected = tickets.rejected_pulls(c.get("body") for c in comments)
+    pulls = [p for p in closed if p.get("number") not in rejected]
+    pr = _merged_pull_naming(repo, number, pulls)
+    if pr is None or factory.unbuilt_criteria(
+            issue.get("body") or "", [pr.get("body") or ""], allow_unreported=True):
+        return False
+    if "loom:regression" in _names(issue):
+        events = gh.paginate("/repos/%s/issues/%d/events" % (repo, number))
+        if tickets.merged_before_requeue(pr.get("merged_at"), events):
+            return False
+    gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+            {"labels": brain._moved_labels(_names(issue), "merged", "")})
+    print("%s#%d: pull request #%d merged, moved queued ticket to loom:merged"
+          % (repo, number, int(pr["number"])), file=sys.stderr)
+    return True
+
+
+def _claim_candidate(gh: GitHub, repo: str, issue: Dict[str, Any], lane: str, now: float,
+                     base: str, closed: Dict[str, List[Dict[str, Any]]]
+                     ) -> Tuple[Optional[Dict[str, Any]], str]:
+    number = int(issue["number"])
+    branch = tickets.branch_for(number, str(issue.get("title") or ""))
+    pr = _open_or_merged_pull(gh, repo, branch)
+    comments = _comments(gh, repo, number)
+    if repo not in closed:
+        closed[repo] = [p for p in _closed_pulls(gh, repo)
+                        if (p.get("base") or {}).get("ref") == base and not revert.looks_like_revert(p)]
+    fresh = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
+    if not isinstance(fresh, dict) or fresh.get("state") != "open":
+        return None, "ticket is no longer open"
+    if (fresh.get("updated_at") != issue.get("updated_at")
+            or tickets.ticket_state(fresh) in tickets.MERGED_STATES
+            or _rejection_reason(fresh, lane)):
+        return None, "ticket changed before the claim"
+    if _settle_queued_merge(gh, repo, fresh, closed[repo], comments):
+        return None, ""
+    if pr is not None:
+        return None, "branch %s already has pull request #%s" % (branch, pr.get("number", ""))
+    if any(now - at < CLAIM_AGE for _, at, _ in _claims(comments, lane)):
+        return None, "claim active"
+    return _take(gh, repo, fresh, lane, base, now), ""
 
 
 def claim(gh: GitHub, repos: Sequence[str], lane: str = "muse",
@@ -276,28 +327,18 @@ def claim(gh: GitHub, repos: Sequence[str], lane: str = "muse",
     candidates = _candidates(gh, repos, lane)
     skipped: List[str] = []
     claimed_result: Optional[Dict[str, Any]] = None
+    closed: Dict[str, List[Dict[str, Any]]] = {}
 
     if active >= REMOTE_LANES[lane]["slots"]:
-        for _repo, issue in candidates:
+        for _repo, issue, _base in candidates:
             skipped.append("#%s skipped: lane slots full" % issue["number"])
     else:
-        for repo, issue in candidates:
-            branch = tickets.branch_for(int(issue["number"]), str(issue.get("title") or ""))
-            pr = _open_or_merged_pull(gh, repo, branch)
-            if pr is not None:
-                skipped.append("#%s skipped: branch %s already has pull request #%s" %
-                               (issue["number"], branch, pr.get("number", "")))
-                continue
-            recent = [at for _, at, _ in _claims(_comments(gh, repo, int(issue["number"])), lane)
-                      if now - at < CLAIM_AGE]
-            # One claim per ticket, whatever the lane's slot count: with
-            # several slots, a ticket a hand-back left queued while its claim
-            # is fresh would otherwise be claimed again by another run.
-            if recent:
-                skipped.append("#%s skipped: claim active" % issue["number"])
-                continue
-            claimed_result = _take(gh, repo, issue, lane, now)
-            break
+        for repo, issue, base in candidates:
+            claimed_result, reason = _claim_candidate(gh, repo, issue, lane, now, base, closed)
+            if claimed_result is not None:
+                break
+            if reason:
+                skipped.append("#%s skipped: %s" % (issue["number"], reason))
 
     summary = "scanned %d repos, found %d candidates" % (len(repos), len(candidates))
     if skipped:

@@ -68,6 +68,11 @@ lane runs generate their transcripts. Every database connection times out
 after 5 seconds and sets `statement_timeout` to 5 seconds, so a slow or locked
 database fails one read instead of holding a page.
 
+`GET /api/transcripts/coverage` takes the upload token or read-only handoff
+token. It returns `{"slots": [...]}`, the slot names with a finished lane
+transcript in the last 24 hours. The response contains only slot names. The
+server answers 503 when the store cannot be read.
+
 Brain memory (docs/decisions/0002, item 3) lives in the same database, in
 three tables the dashboard creates on first use: `brain_ticks` (one row per
 brain tick, keyed by holder and start: lane, model, end, outcome, and what it
@@ -339,10 +344,16 @@ Each ticket record carries `epic` and `goal` (decision 0003): the issue its
 `Part of` line or sub-issue parent names is its epic when that issue is
 labelled `epic`, and the epic's own `Part of` line or sub-issue parent is the
 goal; a ticket naming a goal home directly has no epic. Each goal card lists
-its open epics against 6, each with its tickets against 15 and a link to
-`/tickets?epic=OWNER/NAME#N`, and its closed epics collapsed. Only epics the
-tickets name are listed. The ticket header reads "epic Y / goal X", and the
-Backlog's "Outside any epic" lists open tickets with no epic.
+its open epics against 6, each with its open tickets against 15 and a link to
+`/tickets?epic=OWNER/NAME#N`. Closed epics are collapsed with their total
+ticket counts. Only epics the tickets name are listed. The ticket header
+reads "epic Y / goal X", and the Backlog's "Outside any epic" lists open
+tickets with no epic.
+
+A goal's unproven work follows the station's proof capacity rules for open
+shipped tickets. Tickets held for a rare live event appear separately.
+Tickets awaiting evidence only use capacity above the allowed exclusion.
+Closed tickets remain in the goal's total and in its proof history.
 
 The dashboard reads repository sources with up to eight concurrent workers.
 `/readyz` stays unavailable until the first snapshot has fetched at least one

@@ -244,6 +244,43 @@ class StationBase(unittest.TestCase):
 
 
 class AcceptanceTest(StationBase):
+    def test_transcript_coverage_names_a_missing_run_slot_on_the_invariant_pass(self):
+        self.settings.transcript_url = "https://dashboard.example.com/api/transcripts?key=example"
+        self.settings.transcript_token_ssm = "/example/upload-token"
+        for slot, age in (("spark", 600), ("spark-2", 600), ("spark-3", DAY_S + 60)):
+            self.write(os.path.join(self.home, "briefs", slot, "done", "example.md"), "# Brief\n", T0 - age)
+        fetch = mock.Mock(return_value={"slots": ["spark"]})
+        st = station.Station(self.gh, self.settings, now=T0, fetch=fetch,
+                             read_secret=lambda name, region: "upload-example")
+
+        with mock.patch.object(station, "_say", self.said.append):
+            st.check_invariants()
+
+        fetch.assert_called_once_with("https://dashboard.example.com/api/transcripts/coverage?key=example",
+                                      "upload-example")
+        self.assertEqual([line for line in self.said if line.startswith("transcript coverage:")],
+                         ["transcript coverage: no stored run in the last 24 hours for spark-2"])
+
+    def test_transcript_coverage_reports_an_unreadable_store_as_unknown(self):
+        self.settings.transcript_url = "https://dashboard.example.com/api/transcripts"
+        self.settings.transcript_token_ssm = "/example/upload-token"
+        self.write(os.path.join(self.home, "briefs", "spark-2", "done", "example.md"), "# Brief\n", T0 - 600)
+        opener = mock.Mock()
+        opener.open.side_effect = OSError("example transport detail")
+        st = station.Station(self.gh, self.settings, now=T0,
+                             read_secret=lambda name, region: "upload-example")
+
+        with (mock.patch.object(station, "_say", self.said.append),
+              mock.patch.object(station.brain_memory, "opener_for", return_value=opener),
+              mock.patch.object(station.time, "sleep") as sleep):
+            st.check_invariants()
+
+        opener.open.assert_called_once()
+        self.assertLessEqual(opener.open.call_args.kwargs["timeout"], 6)
+        sleep.assert_not_called()
+        self.assertEqual([line for line in self.said if line.startswith("transcript coverage:")],
+                         ["transcript coverage: dashboard read unavailable"])
+
     def test_event_log_hashes_inputs_and_ignores_untrusted_rows(self):
         st = station.Station(self.gh, self.settings, now=T0)
         private_value = "private-host.example.invalid"

@@ -5,6 +5,7 @@ import argparse
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -243,7 +244,7 @@ def _limit_hold(home: str, lane: str, now: float) -> Optional[Dict[str, Any]]:
     return {"reason": why[:300], "until": until, "at": _epoch(beat.get("at")) or now}
 
 
-def _remember(home: str, lane: str, hold: Dict[str, Any]) -> Dict[str, Any]:
+def _remember(home: str, lane: str, hold: Dict[str, Any], *, persist: bool = True) -> Dict[str, Any]:
     """Keep the hold as the lane's last limit; the same hold keeps the time it
     was first seen."""
     path = Path(home) / "state" / "usage" / (lane + ".last-limit.json")
@@ -251,6 +252,8 @@ def _remember(home: str, lane: str, hold: Dict[str, Any]) -> Dict[str, Any]:
     if last and last.get("until") == hold["until"] and last.get("reason") == hold["reason"]:
         return last
     row = {"lane": lane, "reason": hold["reason"], "until": hold["until"], "seen": hold["at"]}
+    if not persist:
+        return row
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + ".tmp")
@@ -273,14 +276,16 @@ def _iso(at: Optional[float]) -> Optional[str]:
     return datetime.fromtimestamp(at, timezone.utc).isoformat() if at is not None else None
 
 
-def limit_records(provider: str) -> Callable[[str, List[str], Dict[str, str], float], List[Dict[str, Any]]]:
+def limit_records(
+    provider: str, *, persist: bool = True,
+) -> Callable[[str, List[str], Dict[str, str], float], List[Dict[str, Any]]]:
     """A "limit" reading per lane: limited until the reset while the lane is
     held, else the last limit seen and when it lifted, else none seen."""
     def adapter(home: str, slots: List[str], _env: Dict[str, str], now: float) -> List[Dict[str, Any]]:
         records = []
         for slot in slots:
             hold = _limit_hold(home, slot, now)
-            last = _remember(home, slot, hold) if hold else _last_limit(home, slot)
+            last = _remember(home, slot, hold, persist=persist) if hold else _last_limit(home, slot)
             if hold:
                 note = "limited: %s" % hold["reason"]
             elif last:
@@ -296,11 +301,12 @@ def limit_records(provider: str) -> Callable[[str, List[str], Dict[str, str], fl
     return adapter
 
 
-def _cli_meter_records(provider: str, home: str, slots: List[str], now: float) -> List[Dict[str, Any]]:
+def _cli_meter_records(provider: str, home: str, slots: List[str], now: float, *,
+                       persist: bool = True) -> List[Dict[str, Any]]:
     """Use a lane's latest CLI /usage reading; retain limit history if absent."""
     meter = _newest_meter(home, slots)
     if meter is None:
-        rows = limit_records(provider)(home, slots, {}, now)
+        rows = limit_records(provider, persist=persist)(home, slots, {}, now)
         for row in rows:
             if row.get("note") == "no limit seen":
                 row["note"] = "no CLI /usage reading yet; no limit seen"
@@ -372,6 +378,16 @@ def _meter_note(window: Dict[str, Any]) -> Optional[str]:
     return ("%s of %s %s used" % (_amount(used), _amount(limit), window.get("unit") or "")).strip()
 
 
+def _daily_amount(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        amount = float(value)
+    except OverflowError:
+        return None
+    return amount if math.isfinite(amount) and amount >= 0 else None
+
+
 def _meter_records(provider: str, home: str, slots: List[str], now: float) -> List[Dict[str, Any]]:
     """The meter the lane read with its own key (bus/meter.py writes
     state/usage/<slot>.meter.json): the newest file among the slots, one
@@ -390,8 +406,12 @@ def _meter_records(provider: str, home: str, slots: List[str], now: float) -> Li
                          window.get("remaining"), window.get("unit"),
                          _utc_epoch(window.get("resets_at"), now, relative=False),
                          source, now, _meter_note(window))
+        if record["window"] == "daily":
+            record.update(used=_daily_amount(window.get("used")), limit=_daily_amount(window.get("limit")))
         record["window_minutes"] = window.get("window_minutes")
-        record["observed_at"] = _utc_epoch(window.get("at"), now, relative=False) or observed
+        # Legacy meters omitted the window timestamp and used the file's time.
+        # An explicit null or invalid timestamp means the observation time is unknown.
+        record["observed_at"] = _utc_epoch(window["at"], now, relative=False) if "at" in window else observed
         records.append(record)
     if records:
         return records
@@ -616,6 +636,11 @@ def _parse(value: Any) -> Optional[float]:
     return moment.timestamp() if moment.tzinfo else None
 
 
+def observation_time(row: Dict[str, Any]) -> Optional[float]:
+    """Use the collection time only for legacy rows with no observation field."""
+    return _parse(row.get("observed_at", row.get("as_of")))
+
+
 def stale_reason(row: Dict[str, Any], now: float) -> Optional[str]:
     """Why a reading's figure cannot be taken as current, or None."""
     if row.get("used_pct") is None:
@@ -623,7 +648,9 @@ def stale_reason(row: Dict[str, Any], now: float) -> Optional[str]:
     reset = _parse(row.get("resets_at"))
     if reset is not None and reset <= now and row.get("window") not in ("credit",):
         return "its window reset after this reading"
-    observed = _parse(row.get("observed_at")) or _parse(row.get("as_of"))
+    observed = observation_time(row)
+    if observed is None and "observed_at" in row:
+        return "observation time is unknown"
     if observed is not None and now - observed > STALE_AFTER:
         return "read %dh ago" % ((now - observed) // 3600)
     return None

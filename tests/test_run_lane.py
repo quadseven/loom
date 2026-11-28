@@ -7608,6 +7608,74 @@ exit %d
         self.assertFalse(self.beat()["available"])
         self.assertTrue((self.inbox / "T049-next.md").exists())
 
+    # A slot the operator holds (LOOM_<SLOT>_HELD): deployed and beating, it
+    # takes no ticket until the setting is cleared.
+    HELD_WHY = "held: LOOM_CODEX_2_HELD is set; the slot takes no tickets until it is cleared"
+
+    def slot_brief(self, slot, name="T042-fix-the-thing"):
+        inbox = self.loom / "briefs" / slot
+        inbox.mkdir(parents=True, exist_ok=True)
+        (inbox / (name + ".md")).write_text(BRIEF.replace("T042-fix-the-thing", name))
+        return inbox
+
+    def assert_ran(self, slot, inbox, name="T042-fix-the-thing"):
+        self.assertTrue(any(c.startswith("codex ") for c in self.calls()), (slot, self.calls()))
+        self.assertTrue((inbox / "done" / (name + ".md")).exists(), slot)
+        self.assertNotEqual(self.beat(slot).get("state"), "parked", self.beat(slot))
+
+    def test_a_held_slot_beats_held_every_pass_and_runs_nothing(self):
+        inbox = self.slot_brief("codex-2")
+        for _ in range(2):
+            (self.loom / "state" / "usage" / "codex-2.json").unlink(missing_ok=True)
+            result = self.run_lane("codex-2", LOOM_CODEX_2_HELD="1")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            beat = self.beat("codex-2")
+            self.assertIs(beat["available"], False)
+            self.assertEqual(beat["reason"], self.HELD_WHY)
+            self.assertNotIn("retry_at", beat)
+            self.assertEqual((beat["state"], beat["state_reason"]),
+                             ("parked", "Held by the operator (LOOM_<SLOT>_HELD)"))
+        self.assertEqual(self.calls(), [])
+        # The brief waits where it is: neither run nor parked.
+        self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
+        self.assertEqual(list((inbox / "done").iterdir()), [])
+        self.assertEqual(list((inbox / "failed").iterdir()), [])
+
+    def test_a_cleared_hold_runs_the_slot_as_before(self):
+        for n, value in enumerate(("", "0", "false", "No", "OFF")):
+            with self.subTest(value=value):
+                name = "T04%d-run" % n
+                inbox = self.slot_brief("codex-2", name)
+                self.log.write_text("")
+                self.run_lane("codex-2", LOOM_CODEX_2_HELD=value)
+                self.assert_ran("codex-2", inbox, name)
+
+    def test_a_mistyped_hold_value_holds_rather_than_releases(self):
+        self.slot_brief("codex-2")
+        for value in ("1", "true", "yes", "flase", " 0", "of", "0 "):
+            with self.subTest(value=value):
+                self.run_lane("codex-2", LOOM_CODEX_2_HELD=value)
+                self.assertEqual(self.beat("codex-2")["reason"], self.HELD_WHY)
+        self.assertEqual(self.calls(), [])
+
+    def test_a_hold_binds_only_its_own_slot(self):
+        # One slot's hold holds no other slot of the lane (as claude-2's must
+        # not hold claude), and the lane-wide name is the first slot's own
+        # setting, never a fallback for the others.
+        inbox = self.slot_brief("codex")
+        self.run_lane("codex", LOOM_CODEX_2_HELD="1")
+        self.assert_ran("codex", inbox)
+        self.log.write_text("")
+        inbox = self.slot_brief("codex-2", "T044-other")
+        self.run_lane("codex-2", LOOM_CODEX_HELD="1")
+        self.assert_ran("codex-2", inbox, "T044-other")
+        self.log.write_text("")
+        self.slot_brief("codex", "T043-next")
+        self.run_lane("codex", LOOM_CODEX_HELD="1")
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.beat("codex")["reason"],
+                         "held: LOOM_CODEX_HELD is set; the slot takes no tickets until it is cleared")
+
     def test_the_agy_sign_in_ask_names_the_lane_user_and_the_command(self):
         # 2026-10-24: the ask said only "sign in the agy lane CLI again"; the
         # operator signed in as themselves, which never reaches the lane user's

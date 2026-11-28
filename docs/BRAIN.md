@@ -1419,6 +1419,11 @@ instead of filing a second one.
   rung, with a `Not a failure` status event. A runaway or `needs-brain` ticket,
   and one the factory already gave up on past the last rung, stays as it is.
 
+The station leaves a past-ladder pull request open when another actor has
+reopened it after the last close. A ticket's claim also keeps the ladder from
+closing its pull request or moving the ticket to failed. The `Claimed ticket
+pull requests` section in `bus.brain status` lists the claim holders.
+
 The station applies the retry labels with its own login, so that login must
 be in `LOOM_BRIEF_AUTHORS`, or the trust rules refuse the retried ticket.
 
@@ -1632,9 +1637,10 @@ the account, the brain included.
   or a brief for it in a lane inbox) is scanned every pass; any other repo
   at most every 10 minutes, so a ticket briefed in an idle repo can wait
   that long to be claimed.
-- Reconciliation reads a repo's pull requests only while it has a `loom:pr`
-  ticket, and then only the open ones and one page of the most recently
-  closed ones.
+- Reconciliation reads open pull requests to match them with tickets. When
+  there are tickets to reconcile, it pages through closed pull requests to
+  find merges that delivered waiting tickets and to recover older outcomes
+  for tickets whose open pull request disappeared.
 - Below 15% of any rate limit (from the `X-RateLimit-*` headers of the last
   response, kept across passes) a pass does claims and reports only; the
   rest (reconciliation, hand-back, lane status, asks, standups, goal
@@ -2987,6 +2993,13 @@ command, the rewrite and a restated Live line are all held to this, so the
 "Verify due" list below stops filling with boxes nobody can prove. The
 restate prompt asks the rewrite command for such a check, never for a quoted
 string alone.
+
+A ticket filed by hand (it carries no `<!-- loom:test-named -->` marker, which
+the `brief` command and the rewrite write) that was created at or after
+2026-11-28T00:00:00Z and names no test in an acceptance box gets no lane: it
+gains `needs-brain` and one note naming the missing box. Add the box, or
+rewrite the ticket. A ticket created before that time is never held by this
+rule.
 
 `resume` also ends with a "Verify due" section: up to 5 open `loom:shipped`
 tickets across the repos, oldest ship first, each with how long ago it

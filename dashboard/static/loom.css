@@ -702,14 +702,13 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
 .um-bar { grid-area: bar; position: relative; height: 8px; border-radius: 4px; background: var(--raised); }
 .um-bar span { display: block; height: 100%; min-width: 2px; border-radius: inherit; background: var(--accent); }
 .um-bad .um-bar span { background: var(--bad); }
-.um-bar.um-stale span { background: repeating-linear-gradient(135deg, var(--line-strong) 0 4px, transparent 4px 7px); }
 .um-bar.um-unknown { border: 1px dashed var(--line-strong); background: transparent; }
 .um-proj { position: absolute; top: -3px; width: 2px; height: 14px; margin-left: -1px; border-radius: 1px; background: var(--text); }
 .um-fig { grid-area: fig; margin: 0; color: var(--muted); font: 12px var(--font-mono); font-variant-numeric: tabular-nums; }
 .um-fig strong { color: var(--text); font-weight: 600; }
 .um-bad .um-fig strong:first-child { color: var(--bad-on-bg); }
 .um-warn .um-fig strong:first-child { color: var(--accent-on-bg); }
-.um-none .um-fig, .um-is-stale .um-fig strong { color: var(--muted); }
+.um-none .um-fig { color: var(--muted); }
 .um-usd { color: var(--body); }
 .um-sep { color: var(--line-strong); }
 .um-detail { grid-area: detail; margin: 0; color: var(--muted); font-size: 12.5px; line-height: 1.45; overflow-wrap: anywhere; }

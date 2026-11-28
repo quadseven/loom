@@ -18,9 +18,9 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 from . import answer, human_claims, proof, status
+from .labels import VERIFY_HANDOFF_LABEL
 from .stale_claims import outside_hold
 
-VERIFY_HANDOFF_LABEL = "loom:verify-handoff"
 VERIFY_HANDOFF_RE = re.compile(r"^Verify handoff for #([1-9][0-9]*)[ \t]*$", re.M)
 
 # The runner's own patterns (lanes/run_lane.sh).

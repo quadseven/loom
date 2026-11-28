@@ -1222,6 +1222,25 @@ def _ticket_prs(repo: str, prs: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any
     return found
 
 
+def _claimed_pr_lines(repo: str, issues: List[Dict[str, Any]],
+                      prs: List[Dict[str, Any]]) -> List[str]:
+    claimants = {int(issue["number"]): claims for issue in issues
+                 if (claims := tickets.claimed_by(issue))}
+    if not claimants:
+        return []
+    rows = []
+    for pr in prs:
+        try:
+            association = _ticket_association(repo, pr)
+        except ValueError:
+            continue
+        if association and association[1] in claimants:
+            number = association[1]
+            rows.append("- PR #%s - ticket #%d - claimed by %s" % (
+                pr["number"], number, ", ".join(claimants[number])))
+    return ["", "### Claimed ticket pull requests", *rows] if rows else []
+
+
 def _refs_ticket_pull(repo: str, pr: Dict[str, Any], tickets: Sequence[Dict[str, Any]]) -> bool:
     """Whether a pull request names one of this repo's open Loom tickets."""
     try:
@@ -1559,13 +1578,18 @@ WAITING_BRAIN_HEADING = "### Waiting on the brain"
 
 
 def _waiting_brain_lines(tickets: List[Dict[str, Any]], pr_of: Dict[int, Dict[str, Any]],
-                         data: Dict[str, Any], now: datetime, bot: str) -> List[str]:
+                         data: Dict[str, Any], now: datetime, bot: str,
+                         repo: str = "", authors: Optional[Sequence[str]] = None) -> List[str]:
     """Every open lane pull request whose ticket carries needs-brain, oldest
     first, with how long it has been open and what blocks its merge. The
     factory marks a ticket needs-brain when its fix rounds run out or a
     change is sensitive; a pull request that is neither sensitive nor green
     appears in no other section, so it sat until the lane-pr-stalled
-    invariant filed it (loom#1411)."""
+    invariant filed it (loom#1411).
+
+    A pull request whose head merge would refuse (a worker/ head by an
+    untrusted lane author) shows blocked instead of READY, using the same
+    _loom_head_ok rule merge applies."""
     rows = []
     for issue in tickets:
         pr = pr_of.get(int(issue["number"]))
@@ -1573,11 +1597,15 @@ def _waiting_brain_lines(tickets: List[Dict[str, Any]], pr_of: Dict[int, Dict[st
             continue
         rows.append((str(pr.get("created_at") or ""), issue, pr))
     lines = [WAITING_BRAIN_HEADING]
+    trusted_env = {"LOOM_BRIEF_AUTHORS": " ".join(authors or ())}
     for _, issue, pr in sorted(rows, key=lambda r: (r[0], int(r[2]["number"]))):
         old = "%dh old" % _age(pr, now) if _stamp(str(pr.get("created_at") or "")) else "age unknown"
+        node = data["prs"].get(int(pr["number"]))
+        text = merge_ready(node, bot)
+        if text == "READY" and not _loom_head_ok(repo, pr, node, trusted_env):
+            text = "blocked: pull request head is not a loom branch"
         lines.append("- #%s %s - ticket #%s - %s - %s" % (
-            pr["number"], pr.get("title", ""), issue["number"], old,
-            merge_ready(data["prs"].get(int(pr["number"])), bot)))
+            pr["number"], pr.get("title", ""), issue["number"], old, text))
     return lines if rows else lines + ["- none"]
 
 
@@ -1659,8 +1687,9 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     lines += [""] + _pull_request_lines(gh, repo, prs, data, bot, authors or (), check, caps,
                                         now, hold)
     lines += [""] + _sensitive_pr_lines(prs, gh, repo)
-    lines += [""] + _waiting_brain_lines(tickets, pr_of, data, now, bot)
+    lines += [""] + _waiting_brain_lines(tickets, pr_of, data, now, bot, repo, authors)
     lines += [""] + _past_rung_lines(past, pr_of, data, bot)
+    lines += _claimed_pr_lines(repo, tickets, prs)
     lines += ["", ADOPT_HEADING]
     lines += [_status_pr_line(gh, repo, pr, data["prs"].get(int(pr["number"])), bot, check)
               for pr in adoptable]
@@ -6070,7 +6099,19 @@ def _merge_stacked(gh: GitHub, repo: str, number: int, sha: str,
             raise ValueError("GitHub's asynchronous merge of #%d did not "
                              "finish" % number)
         _sleep(MERGE_ASYNC_POLL)
-        result = gh.rest("GET", path).data or {}
+        try:
+            result = gh.rest("GET", path).data or {}
+        except GitHubError as err:
+            if unreadable(err) is None:
+                raise
+            # The merge-async attempt cannot be polled (a bare path answers
+            # 404 when the PUT carried no id). Fall back to the pull
+            # request's own merged field before declaring the ticket
+            # unfinished (loom#3674).
+            pull = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
+            if pull.get("merged") is True:
+                return {"merged": True}
+            result = {}
     return result
 
 
@@ -9919,6 +9960,9 @@ def _cmd_brief(gh: GitHub, args: argparse.Namespace) -> None:
     refused = anthropic_floor_refusal(gh, args.lane, getattr(args, "lanes_repo", ""))
     if refused:
         raise ValueError(refused)
+    # The rule was applied here: the ticket says so, and the claim-time hold
+    # for a ticket filed by hand passes it over.
+    body = brief_check.with_test_marker(body)
     print(brief(gh, _repo(args.repo), args.epic, args.title, body,
                 args.lane, args.difficulty, args.model, args.base, args.not_before, args.refs,
                 args.regresses, args.after, args.priority, args.holder,

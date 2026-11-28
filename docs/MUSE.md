@@ -424,7 +424,11 @@ steps on each tick:
    `python3 -m bus.lane heartbeat --lane muse`, then run
    `python3 -m bus.lane claim --lane muse`.
    The command returns the oldest eligible public ticket and its rendered
-   brief. If there is no work, end the tick. The claim command's return is
+   brief. Before claiming, it checks the repo's latest closed pull requests.
+   A merge into the default branch with a `Refs` line naming the ticket
+   moves it to `loom:merged` for verification and logs the reason. A partial
+   merge leaves the remaining work available. If there is no work, end the
+   tick. The claim command's return is
    the run's only source of a ticket: a ticket reference from anywhere else
    (a hand-off, a note, a message) is not work until
    `python3 -m bus.lane confirm-claim OWNER/NAME#N --lane muse` confirms it.
@@ -1050,7 +1054,7 @@ tuple `LANE_ORDER` in bus/factory.py):
   `free-groq`, `free-openrouter`) at its pinned route on the spark-gateway,
   each waiting out its own provider's reset, then openrouter, tinker,
   workersai, zen, zai and copilot; then the subscriptions: opencode-go and its slots,
-  codex, claude, agy, muse (muse runs remotely); then the never-paid
+  codex, claude and claude-2, agy, muse (muse runs remotely); then the never-paid
   anthropic slots last. free-ollama is Ollama Cloud and free-gemma is Gemma,
   both on any repo. These lanes take work on public repos only: zen, zai,
   agy, copilot, opencode-go-4, muse, free-nvidia, free-kilo, free-groq,

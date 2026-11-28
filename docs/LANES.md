@@ -1046,12 +1046,16 @@ the review bot to review it again (`LOOM_REVIEW_AGAIN`, default
 `/grug improve`), and returns the ticket to `loom:pr`. A pull request that
 merges while its ticket waits at `loom:queued` or `loom:briefed` (a fix round
 sent it back and nobody took it yet, or the pull request opened and merged
-between two passes) moves the ticket to `loom:merged` with a one-line note,
-under the same author and trust rules as an open pull request, unless the
-ticket went back to queued or briefed after the merge. Before a fix brief's
-agent runs, the runner merges the default branch into the pull request's
-branch (the agent's sandbox cannot fetch): a clean merge is pushed even when
-the agent changes nothing, and a conflict is handed to the agent with the
+between two passes) moves the ticket to `loom:merged` with a one-line log
+entry. The station checks the paginated closed pull list and rereads the
+ticket before moving it. The same author and trust rules apply as for an
+open pull request. A ticket sent back to the queue after the merge stays
+eligible for its next attempt. A merge without a checklist goes on to
+verification.
+
+Before a fix brief's agent runs, the runner merges the default branch into
+the pull request's branch (the agent's sandbox cannot fetch): a clean merge
+is pushed even when the agent changes nothing, and a conflict is handed to the agent with the
 file list, its markers in the tree; the runner completes the merge, or parks
 the brief with "conflict markers left in FILES".
 A lane at a limit (its heartbeat reason starts `limit:`, as the spark lane's
@@ -1646,6 +1650,12 @@ after 5 failures the run is given up with one line in `station.log`. Errors
 name only their type, never the URL or the token. The first pass after
 uploads are turned on records the runs already finished without sending
 them, and one pass sends at most 10 and stops at its first failure.
+
+The invariant pass compares its finished lane runs in the last 24 hours with
+the dashboard's authenticated transcript coverage read. `station.log` names
+the slots with recent runs and no stored transcript. An unavailable read or
+missing upload configuration is reported separately. The read has one attempt
+with a six-second socket timeout.
 
 A brain tick is finished when `state/brain.json` has `outcome` `ok` or
 `failed` and a numeric `started` (when `lanes/mac/brain.sh` started the
@@ -2402,6 +2412,39 @@ cannot query the viewer or any other local service.
   --codex-sessions`), so a station that cannot see that Codex home still
   records Codex usage (loom#3630).
 
+### Holding a slot out of dispatch
+
+`LOOM_<SLOT>_HELD` keeps one slot of any lane from taking tickets, so a new
+slot can be deployed and checked before it works:
+
+```sh
+LOOM_CLAUDE_2_HELD=1 lanes/mac/install.sh claude-2
+```
+
+While it holds, every pass of `lanes/run_lane.sh` writes an unavailable
+heartbeat and runs nothing: no brief is read, no agent starts, and a brief
+already in the slot's inbox stays there. The reason names the setting:
+
+```
+held: LOOM_CLAUDE_2_HELD is set; the slot takes no tickets until it is cleared
+```
+
+The station reads a `held:` reason as parked, `Held by the operator
+(LOOM_<SLOT>_HELD)` in the lane status table, so the slot shows as present
+and held, not stale. It routes the slot no ticket and moves a ticket already
+briefed to it to another lane, as for a down lane. A hold is not a limit: it
+has no retry time and raises no lane-held invariant.
+
+Unset, empty, `0`, `false`, `no` or `off` (any case) mean not held; any other
+value holds, so a mistyped value holds rather than releases. To clear it,
+unset the setting or set it to `0` in the slot's environment (reinstall the
+slot's job, or edit the pod's env) and the next pass works as before.
+
+The setting is read for the slot's own name only, with no lane-wide
+fallback: `LOOM_CLAUDE_HELD` holds the `claude` slot alone, never
+`claude-2`, and `LOOM_CLAUDE_2_HELD` never holds `claude`. To hold every
+slot of a lane, set each slot's own name.
+
 ### One slot on opencode 2.0
 
 opencode 2.0's installer overwrites the one binary every opencode lane runs,
@@ -3075,7 +3118,13 @@ before.
   statement that needs the lease row at the station's epoch. A fed slot is
   never held by the station host's load, and is not a cluster runner slot
   (a slot in both settings is refused). Pod clocks are trusted as runner
-  clocks are.
+  clocks are. Each offer records the epoch that wrote it. With two station
+  replicas, a replica that takes the lease at another epoch finds the
+  offered brief missing from its own inbox (the old holder's disk) and
+  writes it back from the offer row, restamping the offer, so a run in
+  flight finishes and lands on its ticket instead of being withdrawn and
+  re-run. An offer with no recorded epoch, or a brief that left the inbox
+  under the same epoch, is withdrawn as before.
 - Needs the operator: a database role per lane pod with the grants above.
 
 ## Lanes on cluster runners

@@ -75,8 +75,16 @@ for one more slot than the provider's slots running now (fresh
 heartbeats), up to its most: the registry's slots of that provider, or
 `LOOM_PACE_MAX_<PROVIDER>`. On or ahead of pace it asks for none. A
 reading that is stale or from a window that has reset gives no verdict.
-The plan is written to `state/usage/pace.json` and shown as the `Pace`
-line of the lane status comment. It is data only: a lane container runs
+The plan is written to `state/usage/pace.json`. The lane status comment
+shows each subscription's longest window, used and elapsed percentages,
+UTC reset, pace, and running and allowed slots. Each Claude subscription
+has its own read-only row from its slot's meter. The lane status and Usage
+count slots with a fresh heartbeat or runner keepalive, including runners
+that are held or limited, and exclude jobs the station knows are absent.
+Usage shows the running count as unknown once its runner evidence expires.
+The meter shows no reading when it is missing, stale, or reset. A current
+slot request appears when its plan agrees with the displayed counts. The
+plan itself is data only: a lane container runs
 the slots its deployment names, so the request is what a pod that can
 start slots at runtime would read.
 
@@ -84,6 +92,17 @@ Subscription meters in `state/usage/<lane>.meter.json` carry the observed
 time, percent used, and reset time when the provider supplies them. A
 figure over two hours old or from a window that has reset is marked stale.
 The Usage board shows the reset time and countdown for each window.
+
+The lane status comment and the Usage board show OpenRouter requests and
+Workers AI Neurons used out of their daily allowances. The station's daily
+meter windows reset at midnight UTC. Missing, stale, and reset figures show
+no reading. To display pace, set `LOOM_DAILY_PACE_TARGET_HOUR` to a UTC hour
+from 1 to 24 and `LOOM_DAILY_PACE_TARGET_SHARE` to the percentage of the
+allowance to use by then. For example, `18` and `90` target 90% by 18:00 UTC.
+Pace compares against a straight line from midnight to that target, then
+holds at the target through reset. Spending less than the curve by more
+than `LOOM_PACE_SLACK` is behind pace. The counts are visible without a target.
+This view leaves dispatch and slot requests to the existing plan.
 
 `python3 -m bus.usage` collects on the lane machine only: on a machine with
 no lane heartbeat in the last 10 minutes it says so and prints no figures,
