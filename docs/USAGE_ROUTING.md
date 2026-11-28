@@ -45,9 +45,11 @@ Each reading names the machine that collected it (`host`).
   recent local session logs, configurable with `LOOM_CODEX_SESSIONS`.
   The station fills a missing window from `state/usage/<slot>.meter.json`,
   which each codex lane writes from its `CODEX_HOME/sessions` on an idle
-  pass (at most every five minutes) and after each run. A station that has
-  only a local 5-hour reading can still show the forwarded weekly reading.
-  With neither source, it reports the reason no reading is available.
+  pass (at most every five minutes) and after each run. The status comment
+  and dashboard can recover a missing or expired weekly reading from any
+  configured Codex lane meter, even when a newer meter file has only the
+  short window. A current local reading takes precedence for its window.
+  With neither source, the views report that no reading is available.
 - claude: 5-hour and weekly readings from rate-limit events in ordinary
   lane runs. The lane saves the figures and reset times in its CLI meter.
 - opencode-go: rolling, weekly, and monthly readings from the plan check

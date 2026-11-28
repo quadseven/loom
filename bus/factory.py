@@ -206,7 +206,7 @@ from urllib.parse import quote
 
 from . import human_claims, no_change
 from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, closing, comment_findings, converge, criteria_gate, flake, history, hold_boxes, hunk_overlap, hunt_plan, labels, landing, merge_tier, merge_verdict, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets, vacuous
-from .github import GitHub, GitHubError, RateLimited, ShadowHeld, rest_login
+from .github import GitHub, GitHubError, GitHubOutage, RateLimited, ShadowHeld, rest_login
 from .labels import HUMAN_LABELS, NEEDS_HUMAN, REMOTE_LANES, needs_human
 from . import runners
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
@@ -4467,6 +4467,8 @@ class Factory:
             names = flake.flaky_names(self.gh, repo, runs, (self.review_check, self.plan_check))
             if not names or not flake.rerun_once(self.gh, repo, runs, names):
                 return False
+        except GitHubOutage:
+            raise
         except GitHubError as err:
             _say("could not re-run infra-failed jobs on %s#%d (%s); judged as usual"
                  % (repo, number, err))
@@ -6516,10 +6518,11 @@ class Factory:
 
     @staticmethod
     def _guarded(step: Callable[..., None], repo: str, item: Dict[str, Any], *rest: Any) -> bool:
-        """One item's failure is logged and never stops the others; False
-        when the step failed."""
+        """Log item failures and return False. A GitHub outage stops the pass."""
         try:
             step(repo, item, *rest)
+        except GitHubOutage:
+            raise
         except (GitHubError, ValueError, KeyError, TypeError) as err:
             _say("%s on %s#%s failed: %s" % (getattr(step, "__name__", "step"), repo,
                                              item.get("number"), err))
