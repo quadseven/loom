@@ -84,6 +84,9 @@ _ATTEMPTS = "SELECT id, ticket, slot, model, outcome, started_at, finished_at, b
 _LATEST = ("SELECT DISTINCT ON (ticket) id, ticket, slot, model, outcome, started_at, finished_at, bytes, uploaded_at "
            "FROM transcripts ORDER BY ticket, started_at DESC")
 _GET = "SELECT id, ticket, slot, model, outcome, started_at, finished_at, events, bytes FROM transcripts WHERE id=%s"
+_COVERED_SLOTS = ("SELECT DISTINCT slot FROM transcripts "
+                  "WHERE finished_at BETWEEN now() - interval '24 hours' AND now() "
+                  "AND outcome IN ('done', 'failed') AND left(ticket, 6) <> 'brain/'")
 # Run outcomes per lane and model over the last 7 days and the last 24 hours,
 # with the median run time, for the Tiers and allowances page (loom#968). A
 # numbered slot counts with its lane (codex-2 with codex), and the slots are
@@ -136,6 +139,17 @@ class MemoryBackend:
 
     def get(self, id_: int):
         return next((dict(r) for r in self.rows if r["id"] == id_), None)
+
+    def covered_slots(self):
+        now = datetime.now(timezone.utc)
+        slots = set()
+        for row in self.rows:
+            if row["ticket"].startswith("brain/") or row["outcome"] not in ("done", "failed"):
+                continue
+            ended = datetime.fromisoformat(row["finished_at"].replace("Z", "+00:00"))
+            if 0 <= (now - ended).total_seconds() <= 86400:
+                slots.add(row["slot"])
+        return slots
 
     def outcomes(self, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
         """What _OUTCOMES answers, from the rows in memory."""
@@ -259,6 +273,15 @@ class PostgresBackend:
         finally:
             conn.close()
 
+    def covered_slots(self):
+        conn = self._connect()
+        try:
+            cur = conn.cursor()
+            cur.execute(_COVERED_SLOTS)
+            return [slot for (slot,) in cur.fetchall()]
+        finally:
+            conn.close()
+
     def get(self, id_):
         conn = self._connect()
         try:
@@ -331,6 +354,10 @@ class Store:
 
     def get(self, id_):
         return plain(self.backend.get(id_))
+
+    def covered_slots(self) -> List[str]:
+        """The slots with a finished transcript in the last 24 hours."""
+        return sorted(self.backend.covered_slots())
 
     def model_outcomes(self, now=None):
         """[{lane, model, outcome, slots, runs_24h, runs_7d, p50_24h_s,
