@@ -204,7 +204,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import quote
 
-from . import human_claims, no_change
+from . import bug_refs, human_claims, no_change
 from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, closing, comment_findings, converge, criteria_gate, flake, history, hold_boxes, hunk_overlap, hunt_plan, labels, landing, merge_tier, merge_verdict, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets, vacuous
 from .github import GitHub, GitHubError, GitHubOutage, RateLimited, ShadowHeld, rest_login
 from .labels import HUMAN_LABELS, NEEDS_HUMAN, REMOTE_LANES, needs_human
@@ -684,9 +684,8 @@ LEAK_HIT_RE = re.compile(r"^\s*\S+:(\d+)\s+\[([\w-]+)\]\s")
 LEAK_REF_RULE = "private-issue-ref"
 CRITERION_RE = re.compile(r"^-\s+\[([ xX])\]\s+(.+?)\s*$")
 NOT_BUILT_RE = re.compile(r"\s*;\s*not built:\s*\S.+$", re.I)
-# The scanner's cross-repo reference shape: [owner/]name#N.
-SCAN_REF_RE = re.compile(r"(?<![\w/-])(?:([a-z0-9][a-z0-9._-]*)/)?"
-                         r"([a-z][a-z0-9_]*(?:-[a-z0-9]+)*[a-z0-9])#(\d+)\b", re.I)
+# The scanner's cross-repo reference shape (bus/bug_refs.py).
+SCAN_REF_RE = bug_refs.SCAN_REF_RE
 BODY_LEAK_MARKER = "<!-- loom:body-leak-repaired %s -->"
 BODY_LEAK_HOLD_MARKER = "<!-- loom:body-leak-hold %s -->"
 # On the ticket: the station put it under an epic for this head commit.
