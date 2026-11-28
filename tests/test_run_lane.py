@@ -7817,6 +7817,59 @@ exit %d
         self.assertTrue(any(c.startswith("claude ") for c in self.calls()), result.stderr)
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists(), result.stderr)
 
+    # loom#3660: a claude slot keeps to a share of its weekly allowance.
+    def run_capped_claude(self, slot, percent, resets_in, **env):
+        self.write_tool(self.bin / "claude", FAKE_AGENT)
+        inbox = self.loom / "briefs" / slot
+        inbox.mkdir(parents=True, exist_ok=True)
+        (inbox / "T042-fix-the-thing.md").write_text(BRIEF.replace("Lane: codex", "Lane: claude"))
+        usage_dir = self.loom / "state" / "usage"
+        usage_dir.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        if percent is not None:
+            (usage_dir / (slot + ".meter.json")).write_text(json.dumps({
+                "at": now, "source": "Claude CLI", "windows": [
+                    {"window": "weekly", "window_minutes": 10080, "unit": "percent",
+                     "used_pct": percent, "resets_at": now + resets_in, "at": now}]}))
+        result = self.run_lane(slot, **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        beat = json.loads((usage_dir / (slot + ".json")).read_text())
+        ran = any(c.startswith("claude ") for c in self.calls())
+        return beat, ran, now
+
+    def test_a_claude_slot_at_its_weekly_stop_holds_until_the_reset(self):
+        beat, ran, now = self.run_capped_claude("claude", 94.0, 3 * 3600)
+        self.assertFalse(ran)
+        self.assertFalse(beat["available"])
+        self.assertTrue(beat["reason"].startswith("limit: weekly usage 94% is at its 90% stop"),
+                        beat["reason"])
+        self.assertAlmostEqual(beat["retry_at"], now + 3 * 3600, delta=5)
+
+    def test_a_claude_slot_ahead_of_its_pace_holds_until_the_pace_catches_up(self):
+        beat, ran, now = self.run_capped_claude("claude", 50.0, 6 * 86400)
+        self.assertFalse(ran)
+        self.assertIn("ahead of its", beat["reason"])
+        self.assertGreater(beat["retry_at"], now + 900)
+        self.assertLess(beat["retry_at"], now + 6 * 86400)
+
+    def test_a_claude_slot_under_its_pace_runs_and_names_the_verdict(self):
+        beat, ran, _ = self.run_capped_claude("claude", 10.0, 86400)
+        self.assertTrue(ran)
+        self.assertNotIn("limit:", beat.get("reason", ""))
+
+    def test_a_claude_slot_with_no_meter_runs(self):
+        _, ran, _ = self.run_capped_claude("claude", None, 0)
+        self.assertTrue(ran)
+
+    def test_each_claude_slot_keeps_its_own_stop(self):
+        # A second account on claude-2 stops at 60%; the first slot keeps 90%.
+        env = {"LOOM_CLAUDE_2_USAGE_STOP": "60"}
+        beat, ran, _ = self.run_capped_claude("claude-2", 70.0, 86400, **env)
+        self.assertFalse(ran)
+        self.assertIn("at its 60% stop", beat["reason"])
+        _, ran, _ = self.run_capped_claude("claude", 70.0, 86400, **env)
+        self.assertTrue(ran)
+
     def test_a_recorded_pid_that_is_not_this_lanes_runner_is_left_alone(self):
         # The recorded pid may have been recycled by an unrelated process.
         self.drop_brief()
