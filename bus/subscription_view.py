@@ -96,10 +96,7 @@ def _codex_meter_windows(home, slots, now):
             continue
 
 
-def _with_forwarded_codex(home, records, slots, now):
-    """Supply the display's missing or unusable Codex windows from the lane meters."""
-    if not slots:
-        return records
+def _codex_windows_needing_meter(records, now):
     missing = dict.fromkeys(window for _, window in usage._CODEX_WINDOWS)
     for index, row in enumerate(records):
         window = row.get("window")
@@ -109,8 +106,10 @@ def _with_forwarded_codex(home, records, slots, now):
             missing[window] = index
         else:
             del missing[window]
-    if not missing:
-        return records
+    return missing
+
+
+def _matching_codex_meters(home, records, slots, now, missing):
     available = {}
     for row in _codex_meter_windows(home, slots, now):
         window = row["window"]
@@ -124,6 +123,17 @@ def _with_forwarded_codex(home, records, slots, now):
         observed = usage.observation_time(row)
         if window not in available or observed > available[window][0]:
             available[window] = (observed, row)
+    return available
+
+
+def _with_forwarded_codex(home, records, slots, now):
+    """Supply the display's missing or unusable Codex windows from the lane meters."""
+    if not slots:
+        return records
+    missing = _codex_windows_needing_meter(records, now)
+    if not missing:
+        return records
+    available = _matching_codex_meters(home, records, slots, now, missing)
     if not available:
         return records
     result = list(records)
