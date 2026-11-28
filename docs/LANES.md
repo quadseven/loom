@@ -3112,7 +3112,13 @@ before.
   statement that needs the lease row at the station's epoch. A fed slot is
   never held by the station host's load, and is not a cluster runner slot
   (a slot in both settings is refused). Pod clocks are trusted as runner
-  clocks are.
+  clocks are. Each offer records the epoch that wrote it. With two station
+  replicas, a replica that takes the lease at another epoch finds the
+  offered brief missing from its own inbox (the old holder's disk) and
+  writes it back from the offer row, restamping the offer, so a run in
+  flight finishes and lands on its ticket instead of being withdrawn and
+  re-run. An offer with no recorded epoch, or a brief that left the inbox
+  under the same epoch, is withdrawn as before.
 - Needs the operator: a database role per lane pod with the grants above.
 
 ## Lanes on cluster runners
