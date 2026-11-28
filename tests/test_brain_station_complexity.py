@@ -17,6 +17,10 @@ TARGETS = (
     ("bus/brain.py", "_status_pass"),
     ("bus/brain.py", "_split_packed_header_line"),
     ("bus/brain.py", "external_hold"),
+    # AI-REVIEW 2026-11-25 [gpt-6-luna/subscription] 3f4c05d3 (PR #3574):
+    # Keep evidence filtering out of the verify handoff loop.
+    ("bus/brain.py", "_verify_resume_lines"),
+    ("bus/brain.py", "_verify_resume_criterion"),
     ("bus/station.py", "Station._deliver_unlinked"),
     ("bus/station.py", "Station._claim"),
     # AI-REVIEW 2026-11-12 [gpt-6-luna/subscription] 3026-Elder-complexity (PR #3026):
