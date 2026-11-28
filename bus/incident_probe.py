@@ -38,6 +38,11 @@ DELIVERABLE = "base-check"
 # in its own repo (loom#2983).
 CAUSE_AFTER = 3
 CAUSE_TITLE = "Fix the failing base check named by a factory incident"
+# An open incident this old with no claim, and no commit on its repo's
+# default branch for as long, is escalated once (loom#3538): a factory
+# incident held one repo for six days with no owner and no notice.
+ESCALATE_AFTER = 12 * 3600
+_ESCALATED_RE = re.compile(r"^Escalated:[ \t]*\S", re.M)
 _COUNT_RE = re.compile(r"^Still failing: (\d+) times since ", re.M)
 _CAUSE_RE = re.compile(r"^Cause:[ \t]*\S", re.M)
 _REPO_RE = re.compile(r"^Repo:[ \t]*([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)[ \t]*$", re.M)
@@ -185,6 +190,26 @@ def has_cause(body: Any) -> bool:
     return _CAUSE_RE.search(str(body or "")) is not None
 
 
+def unowned(issue: Dict[str, Any], now: float) -> bool:
+    """Whether an open incident is due its one escalation: filed at least
+    ESCALATE_AFTER ago, no claim label, and no Escalated line yet."""
+    opened = epoch(issue.get("created_at"))
+    claimed = any(str((label or {}).get("name") or "").lower().startswith("claim:")
+                  for label in issue.get("labels") or () if isinstance(label, dict))
+    return (issue.get("state") == "open" and opened is not None
+            and now - opened >= ESCALATE_AFTER and not claimed
+            and _ESCALATED_RE.search(str(issue.get("body") or "")) is None)
+
+
+def with_line(body: Any, key: str, line: str) -> str:
+    """The incident body with a `<key>: <line>` line after its `Ticket:` line
+    (at the end when it has none)."""
+    lines = str(body or "").rstrip("\n").split("\n")
+    at = next((i + 1 for i, text in enumerate(lines) if text.startswith("Ticket:")), len(lines))
+    lines.insert(at, "%s: %s" % (key, line))
+    return "\n".join(lines) + "\n"
+
+
 def incident_repo(body: Any) -> str:
     """The repo an incident names on its `Repo:` line, empty for a private
     repo, whose incident names a withheld alias instead."""
@@ -213,10 +238,7 @@ def cause_ticket(ref: str, body: Any) -> Tuple[str, str]:
 def with_cause(body: Any, line: str) -> str:
     """The incident body with a `Cause:` line after its `Ticket:` line (at the
     end when it has none)."""
-    lines = str(body or "").rstrip("\n").split("\n")
-    at = next((i + 1 for i, text in enumerate(lines) if text.startswith("Ticket:")), len(lines))
-    lines.insert(at, "Cause: " + line)
-    return "\n".join(lines) + "\n"
+    return with_line(body, "Cause", line)
 
 
 def main(argv: Sequence[str]) -> int:

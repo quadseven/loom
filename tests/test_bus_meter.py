@@ -306,6 +306,44 @@ class CodexMeterTests(unittest.TestCase):
         self.assertNotIn("no codex session logs on this machine",
                          [r["note"] for r in rows if r["provider"] == "codex"])
 
+    def test_an_empty_station_sessions_directory_still_uses_the_lane_meter(self):
+        self.write_session(weekly_used=7)
+        self.run_meter()
+        station_sessions = Path(self.home) / "station-sessions"
+        station_sessions.mkdir()
+
+        rows = usage.collect(self.home, env={}, now=NOW + 60, lane_names=["codex"],
+                             sessions=station_sessions)
+        readings = {row["window"]: row["used_pct"] for row in rows if row["provider"] == "codex"}
+
+        self.assertEqual(readings, {"5-hour": 4.0, "weekly": 7.0})
+
+    def test_the_lane_meter_supplies_the_weekly_window_missing_from_station_logs(self):
+        self.write_session(weekly_used=7)
+        self.run_meter()
+        station_sessions = Path(self.home) / "station-sessions"
+        station_sessions.mkdir()
+        (station_sessions / "rollout.jsonl").write_text(json.dumps({
+            "timestamp": "2026-10-18T12:00:00Z", "payload": {"rate_limits": {
+                "primary": {"used_percent": 24, "window_minutes": 300,
+                            "resets_at": NOW + 3600}}}}) + "\n")
+
+        rows = usage.collect(self.home, env={}, now=NOW + 60, lane_names=["codex"],
+                             sessions=station_sessions)
+        readings = {row["window"]: row["used_pct"] for row in rows if row["provider"] == "codex"}
+
+        self.assertEqual(readings, {"5-hour": 24.0, "weekly": 7.0})
+
+    def test_an_unavailable_lane_meter_keeps_the_station_diagnostic(self):
+        self.run_meter()
+
+        rows = usage.collect(self.home, env={}, now=NOW + 60, lane_names=["codex"],
+                             sessions=self.sessions)
+        codex = [row for row in rows if row["provider"] == "codex"]
+
+        self.assertEqual([(row["used_pct"], row["note"]) for row in codex],
+                         [(None, "rate-limit fields not found")])
+
     def test_a_fresh_meter_is_not_read_again_unless_refreshed(self):
         self.write_session(weekly_used=7)
         self.run_meter()

@@ -9086,8 +9086,8 @@ class Station:
         _write_json(path, ledger)
         return free
 
-    def _default_head(self, repo: str) -> str:
-        """The head of the repo's default branch, or "" when it cannot be read."""
+    def _default_commit(self, repo: str) -> Dict[str, Any]:
+        """The head commit of the repo's default branch, {} when it cannot be read."""
         try:
             branch = self._default_branch(repo)
             commit = self.gh.rest(
@@ -9096,8 +9096,19 @@ class Station:
         except RateLimited:
             raise
         except GitHubError:
-            return ""
-        return str(commit.get("sha") or "") if isinstance(commit, dict) else ""
+            return {}
+        return commit if isinstance(commit, dict) else {}
+
+    def _default_head(self, repo: str) -> str:
+        """The head of the repo's default branch, or "" when it cannot be read."""
+        return str(self._default_commit(repo).get("sha") or "")
+
+    def _default_commit_at(self, repo: str) -> Optional[float]:
+        """When the default branch's head was committed, None when unread."""
+        commit = self._default_commit(repo).get("commit")
+        committer = commit.get("committer") if isinstance(commit, dict) else None
+        return self._epoch(str((committer or {}).get("date") or "")) \
+            if isinstance(committer, dict) else None
 
     def _read_probed_incident(self, ref: str, entry: Dict[str, Any], keys: List[str]) -> bool:
         """Read one held incident into its ledger entry and release its fix
@@ -9126,6 +9137,7 @@ class Station:
         for key in keys:
             self._release_fix(ref, key, comments)
         self._file_cause(ref, issue, comments)
+        self._escalate_incident(ref, issue, entry, keys)
         return True
 
     def _file_cause(self, ref: str, issue: Dict[str, Any], comments: List[Any]) -> None:
@@ -9142,28 +9154,99 @@ class Station:
                 {a.lower() for a in self.s.authors}):
             return
         try:
-            goal = next((int(g["number"]) for r, g in self._goal_homes() if r == repo), None)
-            line = self._causes_filed.get(ref) or "none filed, %s has no goal home" % repo
-            if goal is not None and ref not in self._causes_filed:
-                title, text = incident_probe.cause_ticket(ref, body)
-                try:
-                    url = brain.brief_intake(self.gh, repo, goal, title, text,
-                                             difficulty="medium")
-                    line = "%s#%s" % (repo, str(url).rstrip("/").rpartition("/")[2])
-                    # Kept so a failed write of the line below retries only
-                    # the write, not a second ticket.
-                    self._causes_filed[ref] = line
-                except ValueError as err:
-                    line = "none filed, no intake epic could take it (%s)" % err
-            self.gh.rest("PATCH", "/repos/%s/issues/%s" % (incident_repo, raw),
-                         {"body": incident_probe.with_cause(body, line)})
+            line = self._cause_line(ref, repo, body, "medium", public=True)
+            written = incident_probe.with_cause(body, line)
+            self.gh.rest("PATCH", "/repos/%s/issues/%s" % (incident_repo, raw), {"body": written})
             self._causes_filed.pop(ref, None)
         except RateLimited:
             raise
         except GitHubError as err:
             _say("incident probe: could not file a cause for incident %s: %s" % (ref, err))
             return
+        # The escalation reads this body next, and must not file a second ticket.
+        issue["body"] = written
         _say("incident probe: incident %s names its cause: %s" % (ref, line))
+
+    def _cause_line(self, ref: str, repo: str, body: Any, difficulty: str, public: bool) -> str:
+        """File one cause ticket for the incident in `repo` and return the
+        incident's Cause line. The incident is on the public factory repo, so
+        a private repo and its ticket are named in words. A ticket filed on
+        an earlier pass whose line was not written is not filed again."""
+        if ref in self._causes_filed:
+            return self._causes_filed[ref]
+        where = repo if public else "the held private repo"
+        goal = next((int(g["number"]) for r, g in self._goal_homes() if r == repo), None)
+        if goal is None:
+            return "none filed, %s has no goal home" % where
+        title, text = incident_probe.cause_ticket(ref, body)
+        try:
+            url = brain.brief_intake(self.gh, repo, goal, title, text, difficulty=difficulty)
+        except ValueError as err:
+            return "none filed, no intake epic could take it (%s)" % (
+                err if public else "the intake refused it")
+        number = str(url).rstrip("/").rpartition("/")[2]
+        line = "%s#%s" % (repo, number) if public else "issue %s of %s" % (number, where)
+        # Kept so a failed write of the line retries only the write.
+        self._causes_filed[ref] = line
+        return line
+
+    # -- unowned incident escalation (loom#3538) ---------------------------
+    def _escalate_incident(self, ref: str, issue: Dict[str, Any], entry: Dict[str, Any],
+                           keys: List[str]) -> None:
+        """Escalate an open incident nobody owns, once: filed at least
+        ESCALATE_AFTER ago, no claim label, and no commit on the held repo's
+        default branch for as long (no probe runs on an unchanged base). It
+        files a hard-difficulty fix ticket in the held repo when no cause is
+        named, so the strongest model of the lane that claims it works it,
+        writes an Escalated line on the incident, and pages the operator
+        with the held count. A page that did not go out is sent again on a
+        later read; the Escalated line stops a second escalation."""
+        self._send_escalation_page(entry)
+        repo = keys[0].rpartition("#")[0] if keys else ""
+        if (not repo or not incident_probe.unowned(issue, self.now)
+                or tickets._login(issue.get("user")).lower()
+                not in {a.lower() for a in self.s.authors}):
+            return
+        committed = self._default_commit_at(repo)
+        if committed is None or self.now - committed < incident_probe.ESCALATE_AFTER:
+            return
+        body = str(issue.get("body") or "")
+        public = incident_probe.incident_repo(body) == repo
+        hours = int((self.now - (incident_probe.epoch(issue.get("created_at")) or self.now))
+                    // 3600)
+        _, _, raw = ref.rpartition("#")
+        try:
+            if not incident_probe.has_cause(body):
+                body = incident_probe.with_cause(
+                    body, self._cause_line(ref, repo, body, "hard", public))
+            body = incident_probe.with_line(
+                body, "Escalated", "%s, %d tickets held, no claim and no base commit for "
+                "%d hours" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.now)),
+                              len(keys), incident_probe.ESCALATE_AFTER // 3600))
+            self.gh.rest("PATCH", "/repos/%s/issues/%s" % (FACTORY_REPO, raw), {"body": body})
+            self._causes_filed.pop(ref, None)
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("incident escalation: could not escalate incident %s: %s" % (ref, err))
+            return
+        issue["body"] = body
+        cause = next((line[len("Cause: "):] for line in body.splitlines()
+                      if line.startswith("Cause: ")), "none named")
+        entry["page"] = ("Factory incident %s has held %d tickets of %s for %d hours with no "
+                         "owner and no new base commit. Escalated; cause: %s. %s" % (
+                             ref, len(keys), repo if public else "a private repo", hours,
+                             cause, issue.get("html_url") or ""))
+        _say("incident escalation: escalated incident %s (%d tickets held)" % (ref, len(keys)))
+        self._send_escalation_page(entry)
+
+    def _send_escalation_page(self, entry: Dict[str, Any]) -> None:
+        """Page the operator with an escalation's line once; kept in the
+        ledger entry until it goes out (or no webhook is set)."""
+        line = entry.get("page")
+        if isinstance(line, str) and line and self._page_operator(line) is False:
+            return
+        entry.pop("page", None)
 
     def _release_fix(self, ref: str, key: str, comments: List[Any]) -> None:
         """Re-queue a held ticket that is the open incident's fix, with a

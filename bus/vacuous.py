@@ -18,6 +18,7 @@ from urllib.parse import quote
 
 BUILTIN_CONTAINERS = frozenset(("dict", "list", "set", "tuple"))
 LOOKUP_METHODS = frozenset(("__getitem__", "__contains__", "__missing__", "get"))
+FIXTURE_FINDING_PREFIX = "changes a fixture used by test "
 
 
 class BaseTestResults(NamedTuple):
@@ -192,6 +193,24 @@ def diff_findings(code_sources: Dict[str, str], test_sources: Dict[str, str],
             for name in fixture_users(source, patch):
                 findings.append("changes a fixture used by test %s" % name)
     return findings
+
+
+def repeated_fixture_findings(findings: Sequence[str],
+                              earlier: Sequence[Tuple[int, str]],
+                              rung: int) -> List[str]:
+    """Fixture findings also reported on a lower model rung.
+
+    A finding that changes on the next rung is new information and leaves the
+    ticket on the ordinary send-back path. Only an exact repeat across two
+    ladder rungs belongs with the brain for a possible fixture exemption.
+    """
+    if rung < 2:
+        # Rung 1 has no earlier model-ladder rung; the default run is rung 0.
+        return []
+    previous = {finding for previous_rung, finding in earlier
+                if 0 < previous_rung < rung and finding.startswith(FIXTURE_FINDING_PREFIX)}
+    return [finding for finding in dict.fromkeys(findings)
+            if finding.startswith(FIXTURE_FINDING_PREFIX) and finding in previous]
 
 
 def _filename(item: Dict[str, object]) -> str:

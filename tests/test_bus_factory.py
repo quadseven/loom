@@ -514,6 +514,57 @@ class PullRequests(Base):
         self.assertEqual(self.merged, [])
         self.assertIn("_MonitorMap.__getitem__", f.notes)
 
+    def test_the_same_fixture_gate_finding_on_two_rungs_holds_for_the_brain(self):
+        finding = "changes a fixture used by test test_expected"
+        self.gh.ticket(5, "pr", lane="codex",
+                       body="Difficulty: medium\nModel: gpt-6-luna\n\n## Why\nx\n")
+        self.gh.pull(50, 5, created=factory.STUCK_AGE + 3600,
+                     body=footer("codex", "gpt-6-luna"))
+        claim = "Claimed for lane %s (body sha256 %s)"
+        self.gh.comments[5] = [
+            {"body": factory.RUNG_MARKER % 1, "user": ME},
+            {"body": claim % ("claude", "0" * 12), "user": ME},
+            {"body": FIX_MARKER + "\nPull request: %s#50, branch loom/5-test\n\n"
+                              "Factory finding: " % REPO + finding, "user": ME},
+            {"body": factory.RUNG_MARKER % 2, "user": ME},
+            {"body": claim % ("codex", "0" * 12), "user": ME},
+        ]
+
+        with mock.patch.object(factory.vacuous, "pull_findings", return_value=[finding]):
+            self.go()
+
+        names = [label["name"] for label in self.gh.issues[5]["labels"]]
+        self.assertIn("needs-brain", names)
+        self.assertIn("loom:pr", names)
+        self.assertEqual((self.fixed, factory.rung_of(self.gh.comments[5])), ([], 2))
+        self.assertTrue(any(('"%s"' % finding) in str(comment.get("body") or "")
+                            for comment in self.gh.comments[5]))
+
+    def test_a_different_fixture_gate_finding_still_climbs_to_the_next_rung(self):
+        earlier = "changes a fixture used by test test_previous"
+        current = "changes a fixture used by test test_current"
+        self.gh.ticket(5, "pr", lane="codex",
+                       body="Difficulty: medium\nModel: gpt-6-luna\n\n## Why\nx\n")
+        self.gh.pull(50, 5, created=factory.STUCK_AGE + 3600,
+                     body=footer("codex", "gpt-6-luna"))
+        claim = "Claimed for lane %s (body sha256 %s)"
+        self.gh.comments[5] = [
+            {"body": factory.RUNG_MARKER % 1, "user": ME},
+            {"body": claim % ("claude", "0" * 12), "user": ME},
+            {"body": FIX_MARKER + "\nPull request: %s#50, branch loom/5-test\n\n"
+                              "Factory finding: " % REPO + earlier, "user": ME},
+            {"body": factory.RUNG_MARKER % 2, "user": ME},
+            {"body": claim % ("codex", "0" * 12), "user": ME},
+        ]
+
+        with mock.patch.object(factory.vacuous, "pull_findings", return_value=[current]):
+            self.go()
+
+        self.assertNotIn("needs-brain", factory._labels(self.gh.issues[5]))
+        self.assertEqual(factory.rung_of(self.gh.comments[5]), 3)
+        self.assertEqual(self.model(5), "claude-opus-5-5")
+        self.assertTrue(self.fixed)
+
     def test_a_pull_request_with_unbuilt_non_live_criteria_goes_back(self):
         criteria = ["A%d" % n for n in range(1, 6)] + ["Live: observed after deploy"]
         ticket_body = ("Difficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n" +

@@ -43,11 +43,11 @@ Each reading names the machine that collected it (`host`).
 
 - codex: the newest reading for each of the 5-hour and weekly windows from
   recent local session logs, configurable with `LOOM_CODEX_SESSIONS`.
-  Where the station cannot see those logs (in the cluster they live in the
-  codex lane's own Codex home), it reads `state/usage/<slot>.meter.json`,
+  The station fills a missing window from `state/usage/<slot>.meter.json`,
   which each codex lane writes from its `CODEX_HOME/sessions` on an idle
-  pass (at most every five minutes) and after each run.
-  With neither, it says "no codex session logs on this machine."
+  pass (at most every five minutes) and after each run. A station that has
+  only a local 5-hour reading can still show the forwarded weekly reading.
+  With neither source, it reports the reason no reading is available.
 - claude: 5-hour and weekly readings from rate-limit events in ordinary
   lane runs. The lane saves the figures and reset times in its CLI meter.
 - opencode-go: rolling, weekly, and monthly readings from the plan check
