@@ -6304,6 +6304,22 @@ class ClaimTest(Base):
         self.assertIn("loom:running", self.fake.names(12))
         self.assertIn("Update the total calculation", Path(self.inbox("codex", self.listing()[0])).read_text())
 
+    def test_a_live_only_ticket_with_a_proof_request_is_claimed(self):
+        # The buildable brief (the fix, a regression test, a proof request) lifts
+        # the hold with no person: its criteria stay live, and the lane builds.
+        self.settings.factory_on = True
+        body = ("## What\n\nFix the total.\n\nProof: throwaway environment shows the total\n\n"
+                + self.LIVE_ONLY)
+        self.fake.add(12, body=body, state="queued")
+        self.fake.issues[12]["labels"].pop()
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.assign_queued()
+        st.claim_new()
+        self.assertIn("loom:running", self.fake.names(12))
+        self.assertFalse(any("require live evidence" in c["body"] for c in self.fake.comments[12]))
+        brief = Path(self.inbox("codex", self.listing()[0])).read_text()
+        self.assertIn("## Buildable deliverable", brief)
+
     def test_a_beat_stamped_ahead_of_the_wall_clock_is_not_fresh(self):
         self.heartbeat("spark", age=-120)
         st = station.Station(GitHub("token", transport=self.fake), self.settings)
