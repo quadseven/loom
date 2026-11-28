@@ -16676,6 +16676,56 @@ class PaceTest(Base):
         self.assertEqual(missing["running_until"], station.usage._iso(now - 5 + station.ALIVE_MAX_AGE))
         self.assertEqual(station.usage.read_snapshot(self.home), records)
 
+    def daily_reading(self, now, age=60):
+        return station.usage._record(
+            "openrouter", ["openrouter"], "daily", 0, 1000, "requests",
+            "2026-10-19T00:00:00+00:00", "fixture", now, "",
+        ) | {"used": 0, "limit": 1000, "observed_at": station.usage._iso(now - age),
+             "window_minutes": 1440}
+
+    def test_usage_upload_carries_daily_allowances_without_changing_local_snapshot(self):
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        runner.now = datetime(2026, 10, 18, 14, tzinfo=timezone.utc).timestamp()
+        records = [self.daily_reading(runner.now)]
+        with mock.patch.object(station.usage, "collect", return_value=records), \
+                mock.patch.object(runner, "_refresh_model_catalogue"), \
+                mock.patch.object(runner, "post_chain"), \
+                mock.patch.object(runner, "upload_usage_limits") as upload, \
+                mock.patch.dict(os.environ, LOOM_DAILY_PACE_TARGET_HOUR="18",
+                                LOOM_DAILY_PACE_TARGET_SHARE="90", LOOM_PACE_SLACK="10"):
+            runner._tend_usage()
+        payload = upload.call_args.args[0]
+        summaries = {row["provider"]: row["daily_allowance"] for row in payload
+                     if "daily_allowance" in row}
+        self.assertEqual(set(summaries), {"openrouter", "workersai"})
+        row = summaries["openrouter"]
+        self.assertEqual((row["used"], row["limit"], row["verdict"]), (0, 1000, "behind"))
+        self.assertEqual((row["target_hour"], row["target_share"]), (18, 90))
+        self.assertIsNone(summaries["workersai"]["used"])
+        self.assertEqual(station.usage.read_snapshot(self.home), records)
+
+    def test_daily_status_republishes_on_expiry_but_not_as_the_clock_ticks(self):
+        self.settings.status_repo = REPO
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        runner.now = datetime(2026, 10, 18, 14, tzinfo=timezone.utc).timestamp()
+        station.usage.write(self.home, [self.daily_reading(runner.now, age=7190)])
+        with mock.patch.object(runner, "_lane_rows", return_value=[]), \
+                mock.patch.object(runner, "_lanes_issue", return_value=1), \
+                mock.patch.object(runner, "_remote_claim_count", return_value=0), \
+                mock.patch.object(runner, "_upsert_lanes_comment", return_value=2) as post, \
+                mock.patch.dict(os.environ, LOOM_DAILY_PACE_TARGET_HOUR="18",
+                                LOOM_DAILY_PACE_TARGET_SHARE="90", LOOM_PACE_SLACK="10"):
+            runner.publish_lanes(refresh_pr_counts=False)
+            self.assertIn("| OpenRouter | 0 of 1000 requests | 2026-10-19T00:00:00+00:00 | "
+                          "behind pace, target 90% by 18:00 UTC |", post.call_args.args[2])
+            runner.now += 5
+            runner.publish_lanes(refresh_pr_counts=False)
+            self.assertEqual(post.call_count, 1)
+            runner.now += 10
+            runner.publish_lanes(refresh_pr_counts=False)
+        self.assertEqual(post.call_count, 2)
+        self.assertIn("| OpenRouter | no reading |", post.call_args.args[2])
+
     def test_a_pass_writes_the_pace_plan_and_the_status_shows_it(self):
         from bus import pace
         now = time.time()
@@ -16808,6 +16858,11 @@ class PaceTest(Base):
                 store = usage_page.Store()
                 store.upload(upload.call_args.args[0])
                 rows = store.snapshot()["readings"]
+                self.assertEqual(len(rows), 4)
+                self.assertEqual({row["provider"]: row["daily_allowance"]["used"]
+                                  for row in rows if "daily_allowance" in row},
+                                 {"openrouter": None, "workersai": None})
+                rows = [row for row in rows if "daily_allowance" not in row]
                 self.assertEqual({row["provider"]: row["used_pct"] for row in rows},
                                  {"claude": 3, "claude-2": expected})
                 self.assertEqual({row["provider"]: row["lanes"] for row in rows},
