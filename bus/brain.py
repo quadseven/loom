@@ -6099,7 +6099,19 @@ def _merge_stacked(gh: GitHub, repo: str, number: int, sha: str,
             raise ValueError("GitHub's asynchronous merge of #%d did not "
                              "finish" % number)
         _sleep(MERGE_ASYNC_POLL)
-        result = gh.rest("GET", path).data or {}
+        try:
+            result = gh.rest("GET", path).data or {}
+        except GitHubError as err:
+            if unreadable(err) is None:
+                raise
+            # The merge-async attempt cannot be polled (a bare path answers
+            # 404 when the PUT carried no id). Fall back to the pull
+            # request's own merged field before declaring the ticket
+            # unfinished (loom#3674).
+            pull = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
+            if pull.get("merged") is True:
+                return {"merged": True}
+            result = {}
     return result
 
 
