@@ -2,8 +2,10 @@
 the once-only re-run of them (loom#1962)."""
 
 import unittest
+from unittest.mock import Mock
 
 from bus import flake
+from bus.github import GitHub, GitHubError, GitHubOutage
 from tests.test_bus_factory import REPO, FakeGitHub
 
 INSTALL = ("##[error]The action 'Install what the core's own Dockerfile installs' "
@@ -105,6 +107,44 @@ class FlakyNamesAndRerun(unittest.TestCase):
         run = dict(actions_run(1, 10), output={"title": "x", "summary": INSTALL})
         run.pop("id")
         self.assertEqual(flake.flaky_names(self.gh, REPO, [run]), ["adapter"])
+
+    def test_an_unavailable_job_log_keeps_the_check_output_fallback(self):
+        run = dict(actions_run(1, 10), output={"summary": INSTALL})
+        for status_code in (301, 403, 404):
+            with self.subTest(status_code=status_code):
+                gh = FakeGitHub()
+                gh.fail_request("/actions/jobs/1/logs", status_code)
+                self.assertEqual(flake.flaky_names(gh, REPO, [run]), ["adapter"])
+
+    def test_an_unavailable_signed_download_keeps_the_check_output_fallback(self):
+        run = dict(actions_run(1, 10), output={"summary": INSTALL})
+        for status_code in (301, 403, 404):
+            with self.subTest(status_code=status_code):
+                transport = Mock(side_effect=[
+                    (302, {"Location": "https://logs.example.com/job"}, b""),
+                    (status_code, {"X-RateLimit-Remaining": "0"}, b"rate limit"),
+                ])
+                gh = GitHub("test", transport=transport)
+                gh.outage_aware = True
+                self.assertEqual(flake.flaky_names(gh, REPO, [run]), ["adapter"])
+                self.assertIsNone(gh.limited_until)
+                self.assertEqual(transport.call_count, 2)
+
+    def test_a_dropped_signed_download_retries_without_exposing_its_url(self):
+        signed = "https://logs.example.com/job?signature=fixture"
+
+        def transport(method, url, headers, body):
+            if url == signed:
+                raise GitHubError("connection dropped for %s" % signed, 0)
+            return 302, {"Location": signed}, b""
+
+        sleep = Mock()
+        gh = GitHub("test", transport=transport, sleep=sleep)
+        gh.outage_aware = True
+        with self.assertRaises(GitHubOutage) as raised:
+            flake.flaky_names(gh, REPO, [actions_run(1, 10)])
+        sleep.assert_called()
+        self.assertNotIn(signed, str(raised.exception))
 
     def test_timeout_cancelled_job_is_rerunnable_without_a_log(self):
         run = actions_run(1, 10, "unittest", conclusion="cancelled")

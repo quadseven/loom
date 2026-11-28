@@ -25,7 +25,7 @@ from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from . import brain
-from .github import GitHub, GitHubError
+from .github import GitHub, GitHubError, GitHubOutage
 
 ACTIONS_RUN_RE = re.compile(r"/actions/runs/(\d+)(?:/|$)")
 # A step that only fetches or installs what the job needs. A test or build
@@ -154,6 +154,8 @@ def flaky_names(gh: GitHub, repo: str, runs: Sequence[Dict[str, Any]],
         if run.get("id") is not None:
             try:
                 text = brain._job_log_tail(gh, repo, int(run["id"]))
+            except GitHubOutage:
+                raise
             except (GitHubError, TypeError, ValueError):
                 text = None
         if (failure_kind(run) == "timeout" or infra_flake(text)
