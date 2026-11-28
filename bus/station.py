@@ -10924,14 +10924,15 @@ class Station:
                   for run in sorted(entry.get("runs", {}))]
         for ticket, run in listed:
             # Each attempt writes the budget file through its own read, so
-            # the step is read afresh and stamped before the attempt: a raise
-            # inside it still restarts the window, and no stale copy is saved.
+            # the step is read afresh and stamped before the attempt. An outage
+            # restores the previous stamp so the next healthy pass can retry.
             data = self._no_change_data()
             step = data.get(ticket, {}).get("runs", {}).get(run, {})
             if step.get("done") or not step.get("waiting"):
                 continue
             if self.now - step.get("tried_at", 0) < NO_CHANGE_RETRY_EVERY:
                 continue
+            previous_stamp = step.get("tried_at")
             step["tried_at"] = self.now
             self._save_no_change(data)
             repo, _, number = ticket.rpartition("#")
@@ -10942,8 +10943,23 @@ class Station:
                     self._nothing_to_fix(repo, int(number), step["fix"], lane, name, brief)
                 else:
                     self._settle_no_change(repo, int(number), lane, name, brief)
+            except GitHubOutage:
+                self._restore_no_change_retry_stamp(ticket, run, previous_stamp)
+                raise
             except (GitHubError, OSError, StateError) as err:
                 _say("could not retry the no-change plan for %s: %s" % (ticket, err))
+
+    def _restore_no_change_retry_stamp(self, ticket: str, run: str,
+                                      previous_stamp: Optional[float]) -> None:
+        data = self._no_change_data()
+        step = data.get(ticket, {}).get("runs", {}).get(run, {})
+        if step.get("done") or not step.get("waiting") or step.get("tried_at") != self.now:
+            return
+        if previous_stamp is None:
+            step.pop("tried_at", None)
+        else:
+            step["tried_at"] = previous_stamp
+        self._save_no_change(data)
 
     def _reset_no_change(self, repo: str, number: int, lane: str, name: str) -> None:
         if not self._pushed(lane, name):
