@@ -27,8 +27,8 @@
 #
 # The call: codex runs `codex exec` read-only on the lane's model
 # (LOOM_CODEX_MODEL); claude runs `claude -p` on LOOM_SIGNIN_PROBE_CLAUDE_MODEL
-# (default haiku) with the token file LOOM_CLAUDE_AUTH_FILE names, as a lane
-# run does. Each answers one short prompt.
+# (default haiku) with the first slot's token file (LOOM_<SLOT>_AUTH_FILE, else
+# LOOM_CLAUDE_AUTH_FILE), as a lane run does. Each answers one short prompt.
 set -uo pipefail
 
 [ "$#" -ge 1 ] || { echo "usage: signin_probe.sh <slot>..." >&2; exit 2; }
@@ -100,6 +100,10 @@ until take_all "$@"; do
 done
 draining "$@" && exit 0
 
+# The failure patterns a lane run is classed by, and the sign-in file of a
+# claude slot (lanes/agent_cli.sh).
+# shellcheck source=lanes/agent_cli.sh
+. "$LOOM_ROOT/lanes/agent_cli.sh"
 SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/signin-probe.XXXXXX")" || exit 2
 probe_cli() {
   case "$LANE" in
@@ -108,22 +112,20 @@ probe_cli() {
         codex exec --skip-git-repo-check --sandbox read-only \
         ${LOOM_CODEX_MODEL:+--model "$LOOM_CODEX_MODEL"} "$PROMPT" < /dev/null) ;;
     claude)
-      local model="${LOOM_SIGNIN_PROBE_CLAUDE_MODEL:-haiku}"
-      if [ -n "${LOOM_CLAUDE_AUTH_FILE:-}" ] && [ -f "$LOOM_CLAUDE_AUTH_FILE" ]; then
-        (cd "$SCRATCH" && CLAUDE_CODE_OAUTH_TOKEN="$(cat "$LOOM_CLAUDE_AUTH_FILE")" \
+      local model="${LOOM_SIGNIN_PROBE_CLAUDE_MODEL:-haiku}" auth
+      auth="$(claude_auth_file "$1")"
+      if [ -n "$auth" ] && [ -f "$auth" ]; then
+        (cd "$SCRATCH" && CLAUDE_CODE_OAUTH_TOKEN="$(cat "$auth")" \
           timeout "$LIMIT" claude -p --model "$model" "$PROMPT" < /dev/null)
       else
         (cd "$SCRATCH" && timeout "$LIMIT" claude -p --model "$model" "$PROMPT" < /dev/null)
       fi ;;
   esac
 }
-out="$(probe_cli 2>&1)"
+out="$(probe_cli "$1" 2>&1)"
 status=$?
 release
 
-# The failure patterns a lane run is classed by (lanes/agent_cli.sh).
-# shellcheck source=lanes/agent_cli.sh
-. "$LOOM_ROOT/lanes/agent_cli.sh"
 result=fail
 shopt -s nocasematch
 if [ "$status" -eq 0 ]; then

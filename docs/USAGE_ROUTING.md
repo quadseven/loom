@@ -90,6 +90,23 @@ plan itself is data only: a lane container runs
 the slots its deployment names, so the request is what a pod that can
 start slots at runtime would read.
 
+## The Claude lane's weekly cap (bus/usage_cap.py)
+
+The pace plan above only asks for slots. A claude slot also stops itself
+short of its weekly allowance: before each run it reads its own meter and
+holds at `LOOM_<SLOT>_USAGE_STOP` percent of the week (default 90), or while
+it is ahead of an even pace to that stop (the stop times the share of the
+week gone, plus `LOOM_<SLOT>_USAGE_SLACK` points, default 5). Both fall back
+to the `LOOM_CLAUDE_` settings. The rule is the OpenCode Go plan's
+(`plan_stop` and `pace_catches_up` in `bus/model_pick.py`). The hold is a
+`limit:` heartbeat whose retry time is the weekly reset for the stop, or the
+time the pace catches up for the pace. A missing meter, or one from a week
+that has reset, holds nothing; an older reading of the current week holds as
+a floor. Each slot has its own sign-in (`LOOM_<SLOT>_AUTH_FILE`) and meter,
+so a second account on `claude-2` with `LOOM_CLAUDE_2_USAGE_STOP=60` is
+capped at 60% while the first slot keeps 90% (docs/LANES.md, "A second
+Claude account").
+
 Subscription meters in `state/usage/<lane>.meter.json` carry the observed
 time, percent used, and reset time when the provider supplies them. A
 figure over two hours old or from a window that has reset is marked stale.
