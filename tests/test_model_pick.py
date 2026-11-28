@@ -270,6 +270,24 @@ class ModelPickTest(unittest.TestCase):
         until, _ = model_pick.plan_stop(dict(usage, monthly=(percent, monthly)), NOW)
         self.assertEqual(until, NOW + model_pick.RETRY_NOTHING)
 
+    def test_a_caller_may_name_its_own_windows_stops_and_slack(self):
+        # loom#3660: a lane cap checks only its weekly window, at its own stop
+        # and slack, through the same rule.
+        weekly = NOW + 3.5 * 86400
+        stops, slack = {"weekly": 60.0}, 2.0
+        allowed = 60.0 * 0.5 + slack
+        self.assertIsNone(model_pick.plan_stop({"weekly": (allowed - 1, weekly)}, NOW,
+                                               stops=stops, slack=slack))
+        ahead = {"weekly": (allowed + 3, weekly)}
+        until, why = model_pick.plan_stop(ahead, NOW, stops=stops, slack=slack)
+        self.assertIn("ahead of its 32% pace", why)
+        self.assertEqual(until, model_pick.pace_catches_up(allowed + 3, 60.0, weekly,
+                                                           7 * 86400.0, NOW, slack))
+        self.assertIsNone(model_pick.plan_stop(ahead, until + 1, stops=stops, slack=slack))
+        until, why = model_pick.plan_stop({"weekly": (60.0, weekly)}, NOW, stops=stops, slack=slack)
+        self.assertEqual(until, weekly)
+        self.assertIn("is at its 60% stop", why)
+
     def test_usage_that_cannot_be_read_fails_closed(self):
         broken = ((500, {}, b"down"), (200, {}, b"not json"), (200, {}, b'{"usage":{}}'),
                   (200, {}, json.dumps({"usage": {"rolling": {"percent": "x"}}}).encode()))

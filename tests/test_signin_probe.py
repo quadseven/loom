@@ -320,6 +320,24 @@ class ProbeWaitsForTheLaneLockTest(ProbeCase):
         self.assertEqual(signin.read(str(self.home))["codex"].result, "pass")
 
 
+class ClaudeSlotSignInTest(ProbeCase):
+    # loom#3660: a second Claude account on its own slot is probed on its own
+    # token file, the one its lane runs use.
+    def test_the_probe_signs_in_with_the_slots_own_token_file(self):
+        claude = self.bin / "claude"
+        claude.write_text('#!/usr/bin/env bash\nprintf "token=%s\\n" "${CLAUDE_CODE_OAUTH_TOKEN:-}"'
+                          ' >> "$FAKE_LOG"\necho ok\n')
+        claude.chmod(0o755)
+        lane_token, own_token = self.home / "lane-token", self.home / "own-token"
+        lane_token.write_text("lane-account")
+        own_token.write_text("second-account")
+        result = self.probe("pass", slots=("claude-2",), LOOM_CLAUDE_AUTH_FILE=str(lane_token),
+                            LOOM_CLAUDE_2_AUTH_FILE=str(own_token))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls(), ["token=second-account"])
+        self.assertEqual(signin.read(str(self.home))["claude-2"].result, "pass")
+
+
 class OffLaneAskTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
