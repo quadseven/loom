@@ -5,6 +5,7 @@ import argparse
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -377,6 +378,16 @@ def _meter_note(window: Dict[str, Any]) -> Optional[str]:
     return ("%s of %s %s used" % (_amount(used), _amount(limit), window.get("unit") or "")).strip()
 
 
+def _daily_amount(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        amount = float(value)
+    except OverflowError:
+        return None
+    return amount if math.isfinite(amount) and amount >= 0 else None
+
+
 def _meter_records(provider: str, home: str, slots: List[str], now: float) -> List[Dict[str, Any]]:
     """The meter the lane read with its own key (bus/meter.py writes
     state/usage/<slot>.meter.json): the newest file among the slots, one
@@ -395,6 +406,8 @@ def _meter_records(provider: str, home: str, slots: List[str], now: float) -> Li
                          window.get("remaining"), window.get("unit"),
                          _utc_epoch(window.get("resets_at"), now, relative=False),
                          source, now, _meter_note(window))
+        if record["window"] == "daily":
+            record.update(used=_daily_amount(window.get("used")), limit=_daily_amount(window.get("limit")))
         record["window_minutes"] = window.get("window_minutes")
         # Legacy meters omitted the window timestamp and used the file's time.
         # An explicit null or invalid timestamp means the observation time is unknown.

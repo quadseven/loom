@@ -117,6 +117,14 @@ class MeterReadTests(unittest.TestCase):
         record = meter.read("workersai", "t", "acct", NOW, {}, fetch=FakeFetch(body))
         self.assertEqual((record["windows"][0]["used"], record["windows"][0]["used_pct"]), (0.0, 0.0))
 
+    def test_workersai_with_an_invalid_neuron_total_reports_no_reading(self):
+        for group in ({}, {"sum": {"totalNeurons": None}}, {"sum": {"totalNeurons": -1}}):
+            with self.subTest(group=group):
+                body = {"data": {"viewer": {"accounts": [{"aiInferenceAdaptiveGroups": [group]}]}}}
+                record = meter.read("workersai", "t", "acct", NOW, {}, fetch=FakeFetch(body))
+                self.assertEqual(record["windows"], [])
+                self.assertIn("neuron total", record["error"])
+
     def test_workersai_token_without_analytics_read_says_which_permission(self):
         record = meter.read("workersai", "t", "acct", NOW, {}, fetch=FakeFetch(NOT_AUTHORIZED))
         self.assertEqual(record["windows"], [])

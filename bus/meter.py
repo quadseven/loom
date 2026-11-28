@@ -90,9 +90,11 @@ def openrouter_windows(payload: Any, now: float) -> List[Dict[str, Any]]:
         raise MeterError("the key endpoint answered without a data object")
     windows = []
     daily = data.get("free_model_daily_requests")
-    if isinstance(daily, dict) and _number(daily.get("limit")) is not None:
-        windows.append(_window("daily", _number(daily.get("used")), _number(daily.get("limit")),
-                               "requests", next_utc_midnight(now), _number(daily.get("remaining")), 1440))
+    limit = usage._daily_amount(daily.get("limit")) if isinstance(daily, dict) else None
+    if limit is not None:
+        windows.append(_window("daily", usage._daily_amount(daily.get("used")), limit,
+                               "requests", next_utc_midnight(now),
+                               usage._daily_amount(daily.get("remaining")), 1440))
     limit = _number(data.get("limit"))
     if limit is not None:
         remaining = _number(data.get("limit_remaining"))
@@ -132,9 +134,10 @@ def _neuron_groups(payload: Dict[str, Any]) -> List[Any]:
 
 def _neurons(group: Any) -> float:
     total = group.get("sum") if isinstance(group, dict) else None
-    if not isinstance(total, dict):
-        return 0.0
-    return _number(total.get("totalNeurons")) or 0.0
+    count = usage._daily_amount(total.get("totalNeurons")) if isinstance(total, dict) else None
+    if count is None:
+        raise MeterError("the analytics API returned an invalid neuron total")
+    return count
 
 
 def workersai_windows(payload: Any, now: float, allowance: float) -> List[Dict[str, Any]]:
