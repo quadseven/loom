@@ -334,8 +334,7 @@ def _public_refs(text: str, home: str) -> str:
     form, and the App-boundary scrub rewrites only owner/name#N refs to
     private repos, so a journal named private repos' issues on a public goal
     home (loom#1750)."""
-    # bus.factory imports bus.brain, which imports this module.
-    from .factory import SCAN_REF_RE
+    from .bug_refs import SCAN_REF_RE
     owner, _, name = home.lower().partition("/")
 
     def words(m: "re.Match[str]") -> str:

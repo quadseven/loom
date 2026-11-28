@@ -52,6 +52,17 @@ class ImportGraphTest(unittest.TestCase):
                 self.assertIn(module, found)
                 self.assertEqual([m for m in absent if m in found], [])
 
+    def test_public_refs_does_not_load_the_factory(self):
+        # The runner rewrites a public PR body's cross-repo refs once a pass;
+        # the scanner's ref shape is bus.bug_refs', so the call needs no factory.
+        # The other repo's ref is built here, so this file holds no ref
+        # literal the leak scan flags (tests/test_fixture_ref_literals.py).
+        other = "other-repo" + "#1"
+        out = run("import sys; from bus.pr_repair import public_refs; "
+                  "print(public_refs(%r, 'quadseven/loom')); "
+                  "print('bus.factory' in sys.modules)" % (other + " and loom#2")).split("\n")
+        self.assertEqual(out[:2], ["issue 1 of another repo and loom#2", "False"])
+
     def test_lazy_imports_resolve_when_called(self):
         for code in CALLS:
             with self.subTest(code=code):

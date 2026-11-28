@@ -248,13 +248,12 @@ def public_refs(text: str, repo: str) -> str:
     "issue N of another repo"; refs to `repo` itself stay. A public repo's
     pull request body passes the leak scan's cross-repo rule this way. The
     runner's first build (lanes/run_lane.sh) and every fix round use it."""
-    from .factory import SCAN_REF_RE  # the factory imports this module
     owner, name = repo.lower().split("/", 1)
 
     def word(m: "re.Match[str]") -> str:
         own = m.group(2).lower() == name and (m.group(1) or owner).lower() == owner
         return m.group(0) if own else "issue %s of another repo" % m.group(3)
-    return SCAN_REF_RE.sub(word, text)
+    return bug_refs.SCAN_REF_RE.sub(word, text)
 
 
 def _render_generated(brief: str, lane: str, model: str, ticket: str,
